@@ -1,4 +1,4 @@
-
+cd 
 import mne
 
 #from source.universal_plots import get_tit_and_unit #for terminal
