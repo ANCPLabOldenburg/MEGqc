@@ -223,7 +223,7 @@ def attach_dummy_data(raw: mne.io.Raw, attach_seconds: int = 5):
 
 
 
-def calculate_muscle_NO_threshold(raw_muscle_path, m_or_g_decided, muscle_params, threshold_muscle, muscle_freqs, cut_dummy, attach_sec, min_distance_between_different_muscle_events, muscle_str_joined, dataset_path):
+def calculate_muscle_NO_threshold(raw_muscle_path, m_or_g_decided, muscle_params, threshold_muscle, muscle_freqs, cut_dummy, attach_sec, min_distance_between_different_muscle_events, muscle_str_joined, dataset_path, orig_meg_type):
 
     """
     Calculate muscle artifacts without thresholding by user.
@@ -271,7 +271,7 @@ def calculate_muscle_NO_threshold(raw_muscle_path, m_or_g_decided, muscle_params
 
         annot_muscle, scores_muscle = annotate_muscle_zscore(
         raw_muscle_path,dataset_path, ch_type=m_or_g, threshold=threshold_muscle, min_length_good=muscle_params['min_length_good'],
-        filter_freq=muscle_freqs,)
+        filter_freq=muscle_freqs,orig_meg_type=orig_meg_type)
         gc.collect()
 
         # Load raw muscle stage signal
@@ -351,7 +351,7 @@ def save_muscle_to_csv(file_name_prefix: str, raw: mne.io.Raw, scores_muscle: np
     return df_deriv
 
 
-def MUSCLE_meg_qc(muscle_params: dict, psd_params: dict, psd_params_internal: dict, channels: dict, data_path: str, noisy_freqs_global: dict, m_or_g_chosen:list, dataset_path: str, attach_dummy:bool = True, cut_dummy:bool = True):
+def MUSCLE_meg_qc(muscle_params: dict, psd_params: dict, psd_params_internal: dict, channels: dict, data_path: str, noisy_freqs_global: dict, m_or_g_chosen:list, dataset_path: str, attach_dummy:bool = True, cut_dummy:bool = True, orig_meg_type=None):
 
     """
     Detect muscle artifacts in MEG data. 
@@ -452,7 +452,7 @@ def MUSCLE_meg_qc(muscle_params: dict, psd_params: dict, psd_params_internal: di
     min_distance_between_different_muscle_events = muscle_params['min_distance_between_different_muscle_events']  # seconds
 
     time.sleep(3)
-    simple_metric, scores_muscle, df_deriv = calculate_muscle_NO_threshold(raw_muscle_path, m_or_g_decided, muscle_params, threshold_muscle_list[0], muscle_freqs, cut_dummy, attach_sec, min_distance_between_different_muscle_events, muscle_str_joined,dataset_path)
+    simple_metric, scores_muscle, df_deriv = calculate_muscle_NO_threshold(raw_muscle_path, m_or_g_decided, muscle_params, threshold_muscle_list[0], muscle_freqs, cut_dummy, attach_sec, min_distance_between_different_muscle_events, muscle_str_joined,dataset_path, orig_meg_type)
 
     os.remove(raw_muscle_path)
     return df_deriv, simple_metric, muscle_str_joined, scores_muscle

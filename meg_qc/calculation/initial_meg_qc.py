@@ -422,23 +422,24 @@ def check_chosen_ch_types(m_or_g_chosen: List, channels_objs: dict):
 
     skipped_str = ''
 
-    if not any(ch in m_or_g_chosen for ch in ['mag', 'grad']):
+    if not any(ch in m_or_g_chosen for ch in ['mag', 'grad', 'eeg']):
         skipped_str = "No channels to analyze. Check parameter ch_types in config file."
         raise ValueError(skipped_str)
 
     skipped_msgs = {
         'mag': "There are no magnetometers in this data set: check parameter ch_types in config file. Analysis will be done only for gradiometers.",
-        'grad': "There are no gradiometers in this data set: check parameter ch_types in config file. Analysis will be done only for magnetometers."
+        'grad': "There are no gradiometers in this data set: check parameter ch_types in config file. Analysis will be done only for magnetometers.",
+        'eeg': "There are no EEG electrodes in this data set: check parameter ch_types in config file."
     }
 
-    for ch in ['mag', 'grad']:
+    for ch in ['mag', 'grad', 'eeg']:
         if len(channels_objs[ch]) == 0 and ch in m_or_g_chosen:
             skipped_str = skipped_msgs[ch]
             print(f'___MEGqc___: {skipped_str}')
             m_or_g_chosen.remove(ch)
 
-    if not any(channels_objs[ch] for ch in ['mag', 'grad']):
-        skipped_str = "There are no magnetometers nor gradiometers in this data set. Analysis will not be done."
+    if not any(channels_objs[ch] for ch in ['mag', 'grad', 'eeg']):
+        skipped_str = "There are no magnetometers, no gradiometers, no EEG electrodes in this data set. Analysis will not be done."
         raise ValueError(skipped_str)
 
     # Now m_or_g_chosen contain only those channel types which are present in the data set and were chosen by the user.
@@ -463,13 +464,17 @@ def choose_channels(raw: mne.io.Raw):
 
     """
 
-    channels = {'mag': [], 'grad': []}
+    channels = {'mag': [], 'grad': [], 'eeg': []}
 
     # Loop over all channel indexes
     for ch_idx, ch_name in enumerate(raw.info['ch_names']):
         ch_type = mne.channel_type(raw.info, ch_idx)
         if ch_type in channels:
-            channels[ch_type].append(ch_name)
+            if ch_type == 'eeg':
+                #ATTENTION: here assigning EEG as MAG
+                channels['mag'].append(ch_name)
+            else:
+                channels[ch_type].append(ch_name)
 
     return channels
 
@@ -541,15 +546,134 @@ def load_data(file_path):
         print("___MEGqc___: ", "Loading FIF data...")
         try:
             raw = mne.io.read_raw_fif(file_path, on_split_missing='ignore', verbose='ERROR')
-        except:
+        except Exception: # noqa
             raw = mne.io.read_raw_fif(file_path, allow_maxshield=True, on_split_missing='ignore', verbose='ERROR')
             shielding_str = ''' <p>This fif file contains Internal Active Shielding data. Quality measurements calculated on this data should not be compared to the measuremnts calculated on the data without active shileding, since in the current case invironmental noise reduction was already partially performed by shileding, which normally should not be done before assesing the quality.</p>'''
 
-    else:
-        raise ValueError(
-            "Unsupported file format or file does not exist. The pipeline works with CTF data directories and FIF files.")
+    elif os.path.isfile(file_path) and file_path.endswith('.edf'):
+        # print("___MEGqc___: ", "Loading EEG data...")
+        raw = load_eeg_meg(file_path)
+        meg_system = 'EEG'
 
     return raw, shielding_str, meg_system
+
+# def load_data(file_path):
+#     """
+#     Load MEG data from a file. It can be a CTF data or a FIF file.
+#
+#     Parameters
+#     ----------
+#     file_path : str
+#         Path to the fif file with MEG data.
+#
+#     Returns
+#     -------
+#     raw : mne.io.Raw
+#         MEG data.
+#     shielding_str : str
+#         String with information about active shielding.
+#
+#     """
+#
+#     shielding_str = ''
+#
+#     meg_system = None
+#
+#     if os.path.isdir(file_path) and file_path.endswith('.ds'):
+#         # It's a CTF data directory
+#         print("___MEGqc___: ", "Loading CTF data...")
+#         raw = mne.io.read_raw_ctf(file_path, preload=True, verbose='ERROR')
+#         meg_system = 'CTF'
+#
+#     elif os.path.isfile(file_path) and file_path.endswith('.fif'):
+#         # It's a FIF file
+#         meg_system = 'Triux'
+#
+#         print("___MEGqc___: ", "Loading FIF data...")
+#         try:
+#             raw = mne.io.read_raw_fif(file_path, on_split_missing='ignore', verbose='ERROR')
+#         except:
+#             raw = mne.io.read_raw_fif(file_path, allow_maxshield=True, on_split_missing='ignore', verbose='ERROR')
+#             shielding_str = ''' <p>This fif file contains Internal Active Shielding data. Quality measurements calculated on this data should not be compared to the measuremnts calculated on the data without active shileding, since in the current case invironmental noise reduction was already partially performed by shileding, which normally should not be done before assesing the quality.</p>'''
+#
+#     elif os.path.isfile(file_path) and file_path.endswith('.edf'):
+#         # print("___MEGqc___: ", "Loading EEG data...")
+#         raw = load_eeg_meg(file_path)
+#         meg_system = 'EEG'
+#
+#     return raw, shielding_str, meg_system
+
+
+import mne
+# import pyxdf
+from mne_bids import BIDSPath, read_raw_bids
+def load_eeg_meg(file_path, bids_root=None, ses=None, task=None, run=None, datatype=None):
+    """
+    Load EEG/MEG data from a file, supporting multiple formats including BIDS and XDF.
+
+    Parameters:
+    - file_path (str): Path to the EEG/MEG file.
+    - bids_root (str, optional): Path to the root BIDS directory (for BIDS-EEG).
+
+    Returns:
+    - raw (mne.io.Raw or dict): Loaded EEG/MEG data or XDF streams.
+    """
+    try:
+        # Handle BIDS dataset
+        if bids_root:
+            # Define subject, session, and task (use None if not applicable)
+            bids_path = BIDSPath(subject=file_path,  # Subject ID (without 'sub-')
+                     session=ses,  # Session ID (None if not applicable)
+                     task=task,  # Task name
+                     run=run,  # Task name
+                     datatype=datatype,  # Specify EEG/MEG data type
+                     root=bids_root)
+            # Load the dataset
+            raw = read_raw_bids(bids_path)
+            # bids_path = BIDSPath(root=bids_root, subject=file_path)
+            # raw = read_raw_bids(bids_path)
+
+        else:
+            # Detect file extension
+            ext = file_path.split('.')[-1].lower()
+
+            # Load based on extension
+            if ext in ['edf']:  # EDF
+                raw = mne.io.read_raw_edf(file_path, preload=True)
+            elif ext in ['bdf']:  # BDF (Biosemi)
+                raw = mne.io.read_raw_bdf(file_path, preload=True)
+            elif ext in ['vhdr']:  # BrainVision format. Includes .vmrk and .eeg
+                raw = mne.io.read_raw_brainvision(file_path, preload=True)
+            elif ext in ['cnt']:  # Neuroscan CNT
+                raw = mne.io.read_raw_cnt(file_path, preload=True)
+            elif ext in ['mff']:  # EGI MFF
+                raw = mne.io.read_raw_egi(file_path, preload=True)
+            elif ext in ['set']:  # EEGLAB .set files
+                raw = mne.io.read_raw_eeglab(file_path, preload=True)
+            elif ext in ['fif']:  # MEG FIF format (Neuromag)
+                raw = mne.io.read_raw_fif(file_path, preload=True)
+            elif ext in ['nxe']:  # Nicolet EEG
+                raw = mne.io.read_raw_nicolet(file_path, preload=True)
+            elif ext in ['eeg']:  # Nihon Kohden
+                raw = mne.io.read_raw_nihon(file_path, preload=True)
+            elif ext in ['mef', 'mefd']:  # MEF (Multi-Scale EEG Format)
+                raw = mne.io.read_raw_mef(file_path, preload=True)
+            elif ext in ['snirf']:  # fNIRS format
+                raw = mne.io.read_raw_snirf(file_path, preload=True)
+            elif ext in ['xdf']:  # LabRecorder / mBrainTrain .xdf files
+                streams, header = pyxdf.load_xdf(file_path)
+                raw = {"streams": streams, "header": header}  # Return raw XDF data
+            elif file_path.endswith('.ds'):  # CTF MEG directory
+                raw = mne.io.read_raw_ctf(file_path, preload=True)
+            else:
+                raise ValueError(f"Unsupported file format: {ext}")
+
+            print(f"Successfully loaded {file_path}")
+            return raw
+
+    except Exception as e:
+        print(f"Error loading {file_path}: {e}")
+        return None
 
 
 def add_3d_ch_locations(raw, channels_objs):
@@ -849,23 +973,86 @@ def assign_channels_properties(channels_short: dict, meg_system: str):
                 ch.system = 'CTF'
 
     else:
-        lobes_color_coding_str = 'For MEG systems other than MEGIN Triux or CTF color coding by lobe is not applied.'
-        lobe_colors = ['#1f77b4', '#ff7f0e', '#2ca02c', '#9467bd', '#e377c2', '#d62728', '#bcbd22', '#17becf']
-        print('___MEGqc___: ' + lobes_color_coding_str)
-
+        channels_full, lobes_color_coding_str = map_channels_to_lobes_and_colors(channels_full)
+        # assign 'EEG' to all channels:
         for key, value in channels_full.items():
             for ch in value:
-                ch.lobe = 'All channels'
-                # take random color from lobe_colors:
-                ch.lobe_color = random.choice(lobe_colors)
-                ch.system = 'OTHER'
+                ch.system = 'EEG'
 
     # sort channels by name:
     for key, value in channels_full.items():
-        channels_full[key] = sorted(value, key=lambda x: x.name)
+        if key != 'eeg':
+            channels_full[key] = sorted(value, key=lambda x: x.name)
 
     return channels_full, lobes_color_coding_str
 
+# def assign_channels_properties(channels_short: dict, meg_system: str):
+#     """
+#     Assign lobe area to each channel according to the lobe area dictionary + the color for plotting + channel location.
+#
+#     Can later try to make this function a method of the MEG_channels class.
+#     At the moment not possible because it needs to know the total number of channels to figure which meg system to use for locations. And MEG_channels class is created for each channel separately.
+#
+#     Parameters
+#     ----------
+#     channels : dict
+#         dict with channels names like: {'mag': [...], 'grad': [...]}
+#     meg_system: str
+#         CTF, Triux, None...
+#
+#     Returns
+#     -------
+#     channels_objs : dict
+#         Dictionary with channel names for each channel type: mag, grad. Each channel has assigned lobe area and color for plotting + channel location.
+#     lobes_color_coding_str : str
+#         A string with information about the color coding of the lobes.
+#
+#     """
+#
+#     channels_full = copy.deepcopy(channels_short)
+#
+#     # for understanding how the locations are obtained. They can be extracted as:
+#     # mag_locs = raw.copy().pick('mag').info['chs']
+#     # mag_pos = [ch['loc'][:3] for ch in mag_locs]
+#     # (XYZ locations are first 3 digit in the ch['loc']  where ch is 1 sensor in raw.info['chs'])
+#
+#     # Assign lobe labels to the channels:
+#
+#     if meg_system.upper() == 'TRIUX' and len(channels_full['mag']) == 102 and len(channels_full['grad']) == 204:
+#         # for 306 channel data in Elekta/Neuromag Treux system
+#         channels_full, lobes_color_coding_str = add_Triux_lobes(channels_full)
+#
+#         # assign 'TRIUX' to all channels:
+#         for key, value in channels_full.items():
+#             for ch in value:
+#                 ch.system = 'TRIUX'
+#
+#     elif meg_system.upper() == 'CTF':
+#         channels_full, lobes_color_coding_str = add_CTF_lobes(channels_full)
+#
+#         # assign 'CTF' to all channels:
+#         for key, value in channels_full.items():
+#             for ch in value:
+#                 ch.system = 'CTF'
+#
+#     else:
+#         lobes_color_coding_str = 'For MEG systems other than MEGIN Triux or CTF color coding by lobe is not applied.'
+#         lobe_colors = ['#1f77b4', '#ff7f0e', '#2ca02c', '#9467bd', '#e377c2', '#d62728', '#bcbd22', '#17becf']
+#         print('___MEGqc___: ' + lobes_color_coding_str)
+#
+#         for key, value in channels_full.items():
+#             for ch in value:
+#                 ch.lobe = 'All channels'
+#                 # take random color from lobe_colors:
+#                 ch.lobe_color = random.choice(lobe_colors)
+#                 ch.system = 'OTHER'
+#
+#     # sort channels by name:
+#     for key, value in channels_full.items():
+#         channels_full[key] = sorted(value, key=lambda x: x.name)
+#
+#     return channels_full, lobes_color_coding_str
+#
 
 def sort_channels_by_lobe(channels_objs: dict):
     """ Sorts channels by lobes.
@@ -981,7 +1168,7 @@ def save_meg_with_suffix(file_path: str, dataset_path: str, raw, final_suffix: s
     filename = os.path.basename(file_path)
     name, ext = os.path.splitext(filename)
 
-    if ext.lower() == '.ds':
+    if ext.lower() != '.fif':
         ext = '.fif'
 
     new_filename = f"{name}_{final_suffix}{ext}"
@@ -1093,7 +1280,8 @@ def initial_processing(default_settings: dict, filtering_settings: dict, epochin
     channels_objs, lobes_color_coding_str = assign_channels_properties(channels_objs, meg_system)
 
     # Add channel locations:
-    channels_objs = add_3d_ch_locations(raw, channels_objs)
+    if meg_system != 'EEG':
+        channels_objs = add_3d_ch_locations(raw, channels_objs)
 
     # Check if there are channels to analyze according to info in config file:
     m_or_g_chosen, m_or_g_skipped_str = check_chosen_ch_types(m_or_g_chosen=default_settings['m_or_g_chosen'],
@@ -1119,7 +1307,7 @@ def initial_processing(default_settings: dict, filtering_settings: dict, epochin
     # Data filtering:
     raw_cropped_filtered = raw_cropped.copy()
     if filtering_settings['apply_filtering'] is True:
-        raw_cropped.load_data()  # Data has to be loaded into mememory before filetering:
+        raw_cropped.load_data()  # Data has to be loaded into memory before filtering:
         # Save raw_cropped
         raw_cropped_path = save_meg_with_suffix(file_path, dataset_path, raw_cropped, final_suffix="CROPPED")
 
@@ -1191,6 +1379,7 @@ def initial_processing(default_settings: dict, filtering_settings: dict, epochin
     gc.collect()
 
     # Load data
+    orig_meg_system = meg_system
     raw_cropped_filtered, shielding_str, meg_system = load_data(raw_cropped_filtered_path)
 
     # Apply epoching: USE NON RESAMPLED DATA. Or should we resample after epoching?
@@ -1208,7 +1397,7 @@ def initial_processing(default_settings: dict, filtering_settings: dict, epochin
 
     raw_path = file_path
 
-    return meg_system, dict_epochs_mg, chs_by_lobe, channels, raw_cropped_filtered_path, raw_cropped_filtered_resampled_path, raw_cropped_path, raw_path, info_derivs, stim_deriv, shielding_str, epoching_str, sensors_derivs, m_or_g_chosen, m_or_g_skipped_str, lobes_color_coding_str, resample_str
+    return meg_system, dict_epochs_mg, chs_by_lobe, channels, raw_cropped_filtered_path, raw_cropped_filtered_resampled_path, raw_cropped_path, raw_path, info_derivs, stim_deriv, shielding_str, epoching_str, sensors_derivs, m_or_g_chosen, m_or_g_skipped_str, lobes_color_coding_str, resample_str,orig_meg_system
 
 
 def chs_dict_to_csv(chs_by_lobe: dict, file_name_prefix: str):
@@ -1261,3 +1450,135 @@ def chs_dict_to_csv(chs_by_lobe: dict, file_name_prefix: str):
     df_deriv = [QC_derivative(content=df_fin, name=file_name_prefix, content_type='df')]
 
     return df_deriv
+
+import re
+
+# Color mapping based on CTF lobe convention
+lobe_colors = {
+    'Left Frontal': '#1f77b4',
+    'Right Frontal': '#ff7f0e',
+    'Left Temporal': '#2ca02c',
+    'Right Temporal': '#9467bd',
+    'Left Parietal': '#e377c2',
+    'Right Parietal': '#d62728',
+    'Left Occipital': '#bcbd22',
+    'Right Occipital': '#17becf',
+    'Left Central': '#8c564b',
+    'Right Central': '#8c564b',
+    'Central': '#8c564b',
+    'Reference': '#7f7f7f',
+    'EEG/EOG/ECG': '#bcbd22',
+    'Extra': '#d3d3d3'
+}
+
+# Electrode to lobe mapping for 10-5 system
+electrode_to_lobe = {
+    'FP1': 'Left Frontal', 'FP2': 'Right Frontal',
+    'AF3': 'Left Frontal', 'AF4': 'Right Frontal', 'AF7': 'Left Frontal', 'AF8': 'Right Frontal',
+    'F1': 'Left Frontal', 'F2': 'Right Frontal', 'F3': 'Left Frontal', 'F4': 'Right Frontal',
+    'F5': 'Left Frontal', 'F6': 'Right Frontal', 'F7': 'Left Frontal', 'F8': 'Right Frontal',
+    'F9': 'Left Frontal', 'F10': 'Right Frontal',
+    'FT7': 'Left Frontal', 'FT8': 'Right Frontal',
+    'FC1': 'Left Frontal', 'FC2': 'Right Frontal', 'FC3': 'Left Frontal', 'FC4': 'Right Frontal',
+    'FC5': 'Left Frontal', 'FC6': 'Right Frontal',
+    'FZ': 'Central',
+    'C1': 'Left Central', 'C2': 'Right Central',
+    'C3': 'Left Central', 'C4': 'Right Central',
+    'C5': 'Left Central', 'C6': 'Right Central',
+    'CZ': 'Central',
+    'P1': 'Left Parietal', 'P2': 'Right Parietal',
+    'P3': 'Left Parietal', 'P4': 'Right Parietal',
+    'P5': 'Left Parietal', 'P6': 'Right Parietal',
+    'T5': 'Left Parietal', 'T6': 'Right Parietal',
+    'P7': 'Left Parietal', 'P8': 'Right Parietal',
+    'P9': 'Left Parietal', 'P10': 'Right Parietal',
+    'CP1': 'Left Parietal', 'CP2': 'Right Parietal',
+    'CP3': 'Left Parietal', 'CP4': 'Right Parietal',
+    'CP5': 'Left Parietal', 'CP6': 'Right Parietal',
+    'PZ': 'Central',
+    'T3': 'Left Temporal', 'T4': 'Right Temporal',
+    'T7': 'Left Temporal', 'T8': 'Right Temporal',
+    'T9': 'Left Temporal', 'T10': 'Right Temporal',
+    'TP7': 'Left Temporal', 'TP8': 'Right Temporal',
+    'FT9': 'Left Temporal', 'FT10': 'Right Temporal',
+    'TP9': 'Left Temporal', 'TP10': 'Right Temporal',
+    'O1': 'Left Occipital', 'O2': 'Right Occipital',
+    'OZ': 'Central',
+    'PO3': 'Left Occipital', 'PO4': 'Right Occipital',
+    'PO7': 'Left Occipital', 'PO8': 'Right Occipital',
+    'I1': 'Left Occipital', 'I2': 'Right Occipital',
+    'A1': 'Reference', 'A2': 'Reference', 'M1': 'Reference', 'M2': 'Reference',
+    'EOG': 'EEG/EOG/ECG', 'ECG': 'EEG/EOG/ECG', 'EMG': 'EEG/EOG/ECG',
+    'LOC': 'EEG/EOG/ECG', 'ROC': 'EEG/EOG/ECG', 'EKG1': 'EEG/EOG/ECG'
+}
+
+def extract_base_electrode(name):
+    """Extracts base electrode name from noisy EEG channel labels."""
+    name = name.upper()
+    name = re.sub(r'(EEG|CH|ECOG|REF|AUX|POL|TRIG|EMG|EKG|ROC|LOC|PHOTIC)[:\-_ ]*', '', name)
+    parts = re.split(r'[-_:\s]', name)
+    for part in parts:
+        if part in electrode_to_lobe:
+            return part
+    return None
+
+def assign_lobe_color_location(channel_names, mni_coord_dict):
+    """
+    Assigns lobe, color, and MNI coordinates to each EEG channel in-place.
+
+    Parameters:
+    - channel_names: dict with 'eeg' key mapping to list of EEG channel objects
+    - mni_coord_dict: dict mapping electrode name → [X, Y, Z] list in mm
+
+    Returns:
+    - Updated channel_names dict
+    """
+    # for ch in channel_names.get('eeg', []):
+    # ATTENTION: here treating EEG as MAG channels
+    for ch in channel_names.get('mag', []):
+        base = extract_base_electrode(ch.name)
+        lobe = electrode_to_lobe.get(base, 'Extra') if base else 'Extra'
+        color = lobe_colors.get(lobe, '#000000')
+        coords = mni_coord_dict.get(base, None)
+        ch.lobe_area = lobe
+        ch.lobe = lobe
+        ch.color_code = color
+        ch.lobe_color = color
+        ch.location = coords
+        ch.loc = coords
+    return channel_names
+
+import mne
+import pandas as pd
+
+def load_10_5_montage_info():
+    # Load the standard 10-5 montage
+    montage = mne.channels.make_standard_montage('standard_1005')
+
+    # Get electrode positions in meters (we'll convert to millimeters)
+    positions = montage.get_positions()['ch_pos']
+
+    # Convert to DataFrame and filter only desired electrodes (optional)
+    mni_coords = pd.DataFrame([
+        {'Electrode': name.upper(), 'X': pos[0] * 1000, 'Y': pos[1] * 1000, 'Z': pos[2] * 1000}
+        for name, pos in positions.items()
+    ])
+
+    # Round coordinates and build location list
+    mni_coords['location'] = mni_coords[['X', 'Y', 'Z']].round(2).values.tolist()
+
+    # Optionally filter to electrodes you care about
+    # from your 10-5 list, e.g.:
+    # mni_coords_filtered = mni_coords[mni_coords['Electrode'].isin(ten_five_electrodes)]
+    mni_coords_filtered = mni_coords.reset_index(drop=True)
+
+    # Create the dictionary required by assign_lobe_color_location
+    mni_coord_dict = dict(zip(mni_coords_filtered['Electrode'], mni_coords_filtered['location']))
+    return mni_coord_dict
+
+def map_channels_to_lobes_and_colors(channel_names):
+    # Round coordinates and build dict once
+    mni_coord_dict = load_10_5_montage_info()
+    channel_names = assign_lobe_color_location(channel_names, mni_coord_dict)
+    lobes_color_coding_str = 'Color coding by lobe is applied as per CTF system.'
+    return channel_names, lobes_color_coding_str

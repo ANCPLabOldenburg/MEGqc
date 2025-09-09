@@ -40,6 +40,7 @@ def annotate_muscle_zscore(
     filter_freq=(110, 140),
     n_jobs=None,
     verbose=None,
+    orig_meg_type='EEG'
 ):
     """Create annotations for segments that likely contain muscle artifacts.
 
@@ -105,6 +106,9 @@ def annotate_muscle_zscore(
         logger.info("Using %s sensors for muscle artifact detection" % (ch_type))
 
     if ch_type in ("mag", "grad"):
+        if orig_meg_type == 'EEG':
+            if ch_type == 'mag':
+                ch_type = 'all'
         raw_copy.pick(ch_type)
     else:
         ch_type = {"meg": False, ch_type: True}

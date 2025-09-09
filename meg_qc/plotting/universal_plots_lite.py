@@ -45,12 +45,18 @@ def get_tit_and_unit(m_or_g: str, psd: bool = False):
             unit='Tesla'
         elif psd is True:
             unit='Tesla/Hz'
-    elif m_or_g=='grad':
-        m_or_g_tit='Gradiometers'
+    elif m_or_g == 'grad':
+        m_or_g_tit = 'Gradiometers'
         if psd is False:
-            unit='Tesla/m'
+            unit = 'Tesla/m'
         elif psd is True:
-            unit='Tesla/m / Hz'
+            unit = 'Tesla/m / Hz'
+    elif m_or_g=='eeg':
+        m_or_g_tit='Electrodes'
+        if psd is False:
+            unit='MicroV'
+        elif psd is True:
+            unit='microV / Hz'
     elif m_or_g == 'ECG':
         m_or_g_tit = 'ECG channel'
         unit = 'V'

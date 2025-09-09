@@ -5,15 +5,23 @@ from meg_qc.calculation.meg_qc_pipeline import make_derivative_meg_qc
 # Parameters:
 # ------------------------------------------------------------------
 # Path to the root of your BIDS MEG dataset.
-data_directory = '/home/karelo/Desktop/Development/MEGQC_workshop/datasets/ds003483/'
-# Path to a INI config file with user-defined parameters.
-config_file_path = '/home/karelo/PycharmProjects/megqc_update/.venv/lib/python3.10/site-packages/meg_qc/settings/settings.ini'
-# Path to a INI config file of internal parameters.
-internal_config_file_path = '/home/karelo/PycharmProjects/megqc_update/.venv/lib/python3.10/site-packages/meg_qc/settings/settings_internal.ini'
+data_directory = "H:/_VIP/Python/MyWork/MEGqc/dataset/ds003483"
 # List of subject IDs to run the pipeline on
 # sub_list = 'all'
 sub_list = ['009']
 # sub_list = ['009','012','013','014','015']
+
+# # Path to the root of your EEG dataset.
+data_directory = "H:/Datos/MNI/BIDS_EEG/BIDS_Artifacts_Example"
+# # List of subject IDs to run the pipeline on
+# # sub_list = 'all'
+sub_list = ['00000254']
+# # sub_list = ['009','012','013','014','015']
+
+# Path to a INI config file with user-defined parameters.
+config_file_path = "H:/_VIP/Python/MyWork/megqcjul25/MEGqc/meg_qc/settings/settings.ini"
+# Path to a INI config file of internal parameters.
+internal_config_file_path = "H:/_VIP/Python/MyWork/megqcjul25/MEGqc/meg_qc/settings/settings_internal.ini"
 
 # Number of CPU cores you want to use (for example, 4). Use -1 to utilize all available CPU cores:
 n_jobs_to_use = 1

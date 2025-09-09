@@ -89,6 +89,7 @@ def get_files_list(sid: str, dataset_path: str, dataset):
 
     has_fif = False
     has_ctf = False
+    probably_eeg = False
 
     for root, dirs, files in os.walk(dataset_path):
 
@@ -108,6 +109,9 @@ def get_files_list(sid: str, dataset_path: str, dataset):
         # If both are found, no need to continue walking
         if has_fif and has_ctf:
             raise ValueError('Both fif and ctf files found in the dataset. Can not define how to read the ds.')
+
+        if any(file.endswith('.edf') for file in files):
+            probably_eeg = True
 
     if has_fif:
         list_of_files = sorted(
@@ -131,6 +135,14 @@ def get_files_list(sid: str, dataset_path: str, dataset):
         # sort list_of_sub_jsons by name key to get same order as list_of_files
         entities_per_file = sorted(entities_per_file, key=lambda k: k['name'])
 
+    elif probably_eeg:
+        list_of_files = sorted(
+            list(dataset.query(suffix='eeg', extension='.edf', return_type='filename', subj=sid, scope='raw')))
+
+        entities_per_file = dataset.query(subj=sid, suffix='eeg', extension='.edf', scope='raw')
+        # sort list_of_sub_jsons by name key to get same order as list_of_files
+        entities_per_file = sorted(entities_per_file, key=lambda k: k['name'])
+
     else:
         list_of_files = []
         raise ValueError('No fif or ctf files found in the dataset.')
@@ -146,8 +158,12 @@ def get_files_list(sid: str, dataset_path: str, dataset):
 
     # Check if the names in list_of_files and entities_per_file are the same:
     for i in range(len(list_of_files)):
-        file_name_in_path = os.path.basename(list_of_files[i]).split('_meg.')[0]
-        file_name_in_obj = entities_per_file[i]['name'].split('_meg.')[0]
+        if probably_eeg:
+            file_name_in_path = os.path.basename(list_of_files[i]).split('_eeg.')[0]
+            file_name_in_obj = entities_per_file[i]['name'].split('_eeg.')[0]
+        else:
+            file_name_in_path = os.path.basename(list_of_files[i]).split('_meg.')[0]
+            file_name_in_obj = entities_per_file[i]['name'].split('_meg.')[0]
 
         if file_name_in_obj not in file_name_in_path:
             raise ValueError('Different names in list_of_files and entities_per_file')
@@ -591,7 +607,9 @@ def process_one_subject(
          m_or_g_chosen,
          m_or_g_skipped_str,
          lobes_color_coding_str,
-         resample_str) = initial_processing(
+         resample_str,
+         orig_meg_system
+         ) = initial_processing(
             default_settings=all_qc_params['default'],
             filtering_settings=all_qc_params['Filtering'],
             epoching_params=all_qc_params['Epoching'],
@@ -628,6 +646,12 @@ def process_one_subject(
                 raw_cropped_filtered_resampled,
                 m_or_g_chosen
             )
+            if orig_meg_system == 'EEG':
+                # 1. Chanmge the value of measurement_unit_mag
+                simple_metrics_std['measurement_unit_mag'] = 'microV'
+                # 2. remove measurement_unit_grad
+                del simple_metrics_std['measurement_unit_grad']
+
             print('___MEGqc___: ',
                   "Finished STD. --- Execution %s seconds ---"
                   % (time.time() - start_time))
@@ -648,6 +672,13 @@ def process_one_subject(
                 m_or_g_chosen,
                 helper_plots=False
             )
+            if orig_meg_system == 'EEG':
+                del noisy_freqs_global['grad']
+                # 1. Chanmge the value of measurement_unit_mag
+                simple_metrics_psd['measurement_unit_mag'] = '(microV)^2/Hz'
+                # 2. remove measurement_unit_grad
+                del simple_metrics_psd['measurement_unit_grad']
+
             print('___MEGqc___: ',
                   "Finished PSD. --- Execution %s seconds ---"
                   % (time.time() - start_time))
@@ -675,6 +706,11 @@ def process_one_subject(
                 raw_cropped_filtered_resampled,
                 m_or_g_chosen
             )
+            if orig_meg_system == 'EEG':
+                # 1. Chanmge the value of measurement_unit_mag
+                simple_metrics_pp_manual['measurement_unit_mag'] = 'microV'
+                # 2. remove measurement_unit_grad
+                del simple_metrics_pp_manual['measurement_unit_grad']
 
             print('___MEGqc___: ',
                   "Finished Peak‑to‑Peak manual. --- Execution %s seconds ---"
@@ -709,7 +745,8 @@ def process_one_subject(
                 raw_cropped,
                 channels,
                 chs_by_lobe,
-                m_or_g_chosen
+                m_or_g_chosen,
+                orig_meg_system
             )
             print('___MEGqc___: ',
                   "Finished ECG. --- Execution %s seconds ---"
@@ -730,8 +767,12 @@ def process_one_subject(
                 raw_cropped,
                 channels,
                 chs_by_lobe,
-                m_or_g_chosen
+                m_or_g_chosen,
+                orig_meg_system
             )
+            if orig_meg_system == 'EEG':
+                # 2. remove measurement_unit_grad
+                del simple_metrics_eog['all_channels_ranked_by_EOG_contamination_level']['grad']
             print('___MEGqc___: ',
                   "Finished EOG. --- Execution %s seconds ---"
                   % (time.time() - start_time))
@@ -767,8 +808,12 @@ def process_one_subject(
                 m_or_g_chosen,
                 dataset_path,
                 attach_dummy=True,
-                cut_dummy=True
-            )
+                cut_dummy=True,
+                orig_meg_type=orig_meg_system,
+             )
+            if orig_meg_system == 'EEG':
+                # 1. Chanmge the value of measurement_unit_mag
+                simple_metrics_muscle['muscle_calculated_using'] = 'electrode'
             # Store the total number of events analyzed so we can later express
             # the number of detected artifacts as a percentage.  The first
             # derivative contains a TSV table where each row corresponds to one
@@ -901,7 +946,7 @@ def process_one_subject(
         print('___MEGqc___: ', 'No data files could be processed for subject:', sub)
 
     # You can return whatever you want from here
-    return all_taken_raw_files
+    return all_taken_raw_files, orig_meg_system
 
 
 def process_one_subject_safe(
@@ -916,18 +961,18 @@ def process_one_subject_safe(
     The function returns a tuple ``(sub, result)`` where ``result`` is
     ``None`` if the processing failed for this subject.
     """
-    try:
-        result = process_one_subject(
-            sub=sub,
-            dataset=dataset,
-            dataset_path=dataset_path,
-            all_qc_params=all_qc_params,
-            internal_qc_params=internal_qc_params,
-        )
-        return sub, result
-    except Exception as e:  # Catch any error so the parallel job continues
-        print(f"___MEGqc___: Error processing subject {sub}: {e}")
-        return sub, None
+#    try:
+    result, orig_meg_system = process_one_subject(
+        sub=sub,
+        dataset=dataset,
+        dataset_path=dataset_path,
+        all_qc_params=all_qc_params,
+        internal_qc_params=internal_qc_params,
+    )
+    return sub, result, orig_meg_system
+    # except Exception as e:  # Catch any error so the parallel job continues
+    #     print(f"___MEGqc___: Error processing subject {sub}: {e}")
+    #     return sub, None
 
 
 def _parse_count_percent(val: str):
@@ -965,8 +1010,14 @@ def flatten_summary_metrics(js: dict) -> dict:
 
     for item in js.get("STD_time_series", []):
         metric = item.get("Metric", "").replace(" ", "_").lower()
-        num_mag, pct_mag = _parse_count_percent(item.get("MAGNETOMETERS", ""))
-        num_grad, pct_grad = _parse_count_percent(item.get("GRADIOMETERS", ""))
+        stype = list(item.keys())[1]
+        if stype == 'ELECTRODES':
+            num_mag, pct_mag = _parse_count_percent(item.get(stype, ""))
+            num_grad = []
+            pct_grad = []
+        else:
+            num_mag, pct_mag = _parse_count_percent(item.get("MAGNETOMETERS", ""))
+            num_grad, pct_grad = _parse_count_percent(item.get("GRADIOMETERS", ""))
         row[f"STD_ts_{metric}_mag_num"] = num_mag
         row[f"STD_ts_{metric}_mag_percentage"] = pct_mag
         row[f"STD_ts_{metric}_grad_num"] = num_grad
@@ -974,24 +1025,51 @@ def flatten_summary_metrics(js: dict) -> dict:
 
     for item in js.get("PTP_time_series", []):
         metric = item.get("Metric", "").replace(" ", "_").lower()
-        num_mag, pct_mag = _parse_count_percent(item.get("MAGNETOMETERS", ""))
-        num_grad, pct_grad = _parse_count_percent(item.get("GRADIOMETERS", ""))
+        if stype == 'ELECTRODES':
+            num_mag, pct_mag = _parse_count_percent(item.get(stype, ""))
+            num_grad = []
+            pct_grad = []
+        else:
+            num_mag, pct_mag = _parse_count_percent(item.get("MAGNETOMETERS", ""))
+            num_grad, pct_grad = _parse_count_percent(item.get("GRADIOMETERS", ""))
         row[f"PTP_ts_{metric}_mag_num"] = num_mag
         row[f"PTP_ts_{metric}_mag_percentage"] = pct_mag
         row[f"PTP_ts_{metric}_grad_num"] = num_grad
         row[f"PTP_ts_{metric}_grad_percentage"] = pct_grad
 
     for item in js.get("STD_epoch_summary", []):
-        sensor = "mag" if item.get("Sensor Type") == "MAGNETOMETERS" else "grad"
-        num_noisy, pct_noisy = _parse_count_percent(item.get("Noisy Epochs", ""))
-        num_flat, pct_flat = _parse_count_percent(item.get("Flat Epochs", ""))
+        st = item.get("Sensor Type")
+        if st is None:
+            sensor = None
+            num_noisy = []; pct_noisy = []; num_flat = []; pct_flat = []
+        else:
+            if st == "MAGNETOMETERS":
+                nm = "mag"
+            elif st == "GRADIOMETERS":
+                nm = "grad"
+            elif st == "ELECTRODES":
+                nm = "eeg"
+            else:
+                nm = None
+            sensor = nm
+            num_noisy, pct_noisy = _parse_count_percent(item.get("Noisy Epochs", ""))
+            num_flat, pct_flat = _parse_count_percent(item.get("Flat Epochs", ""))
         row[f"STD_ep_{sensor}_noisy_num"] = num_noisy
         row[f"STD_ep_{sensor}_noisy_percentage"] = pct_noisy
         row[f"STD_ep_{sensor}_flat_num"] = num_flat
         row[f"STD_ep_{sensor}_flat_percentage"] = pct_flat
 
     for item in js.get("PTP_epoch_summary", []):
-        sensor = "mag" if item.get("Sensor Type") == "MAGNETOMETERS" else "grad"
+        st = item.get("Sensor Type")
+        if st == "MAGNETOMETERS":
+            nm = "mag"
+        elif st == "GRADIOMETERS":
+            nm = "eeg"
+        elif st == "ELECTRODES":
+            nm = "eeg"
+        else:
+            nm = "None"
+        sensor = nm
         num_noisy, pct_noisy = _parse_count_percent(item.get("Noisy Epochs", ""))
         num_flat, pct_flat = _parse_count_percent(item.get("Flat Epochs", ""))
         row[f"PTP_ep_{sensor}_noisy_num"] = num_noisy
@@ -1000,7 +1078,16 @@ def flatten_summary_metrics(js: dict) -> dict:
         row[f"PTP_ep_{sensor}_flat_percentage"] = pct_flat
 
     for item in js.get("ECG_correlation_summary", []):
-        sensor = "mag" if item.get("Sensor Type") == "MAGNETOMETERS" else "grad"
+        st = item.get("Sensor Type")
+        if st == "MAGNETOMETERS":
+            nm = "mag"
+        elif st == "GRADIOMETERS":
+            nm = "eeg"
+        elif st == "ELECTRODES":
+            nm = "eeg"
+        else:
+            nm = "None"
+        sensor = nm
         num, pct = _parse_count_percent(item.get("# |High Correlations| > 0.8", ""))
         total = item.get("Total Channels")
         row[f"ECG_{sensor}_high_corr_num"] = num
@@ -1008,7 +1095,16 @@ def flatten_summary_metrics(js: dict) -> dict:
         row[f"ECG_{sensor}_total_channels"] = total
 
     for item in js.get("EOG_correlation_summary", []):
-        sensor = "mag" if item.get("Sensor Type") == "MAGNETOMETERS" else "grad"
+        st = item.get("Sensor Type")
+        if st == "MAGNETOMETERS":
+            nm = "mag"
+        elif st == "GRADIOMETERS":
+            nm = "eeg"
+        elif st == "ELECTRODES":
+            nm = "eeg"
+        else:
+            nm = "None"
+        sensor = nm
         num, pct = _parse_count_percent(item.get("# |High Correlations| > 0.8", ""))
         total = item.get("Total Channels")
         row[f"EOG_{sensor}_high_corr_num"] = num
@@ -1016,8 +1112,18 @@ def flatten_summary_metrics(js: dict) -> dict:
         row[f"EOG_{sensor}_total_channels"] = total
 
     for item in js.get("PSD_noise_summary", []):
-        row["PSD_noise_mag_percentage"] = _parse_percent(item.get("MAGNETOMETERS", "0"))
-        row["PSD_noise_grad_percentage"] = _parse_percent(item.get("GRADIOMETERS", "0"))
+        st = item.get("Sensor Type")
+        if st == "MAGNETOMETERS":
+            nm = "mag"
+        elif st == "GRADIOMETERS":
+            nm = "eeg"
+        elif st == "ELECTRODES":
+            nm = "eeg"
+        else:
+            nm = "None"
+        sensor = nm
+        row["PSD_noise_mag_percentage"] = _parse_percent(item.get(nm, "0"))
+        row["PSD_noise_grad_percentage"] = _parse_percent(item.get(nm, "0"))
 
     muscle = js.get("Muscle_events", {})
     row["Muscle_events_num"] = muscle.get("# Muscle Events")
@@ -1103,6 +1209,9 @@ def make_derivative_meg_qc(
         #         global_avg_ecg += ecg_data
         #         global_avg_eog += eog_data
 
+        dum1, dum2, data_type = results[0]
+        results = [item[:2] for item in results]
+
         # Collect results and log subjects that failed
         excluded_subjects = [sub for sub, files in results if files is None]
 
@@ -1138,7 +1247,7 @@ def make_derivative_meg_qc(
 
         # Generate Global Quality Index reports and group table
         try:
-            generate_gqi_summary(dataset_path, config_file_path)
+            generate_gqi_summary(dataset_path, config_file_path, data_type)
         except Exception as e:
             print("___MEGqc___: Failed to create global quality reports", e)
 

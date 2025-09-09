@@ -158,7 +158,7 @@ def detect_noisy_ecg(raw: mne.io.Raw, ecg_ch: str,  ecg_or_eog: str, n_breaks_bu
     peaks = []
 
     ch_data = raw.get_data(picks=ecg_ch)[0] #here ch_data will be the RAW DATA
-    # get_data creates list inside of a list becausee expects to create a list for each channel. this is why [0]
+    # get_data creates list inside of a list because expects to create a list for each channel. this is why [0]
 
     ecg_eval, peaks = check_3_conditions(ch_data, sfreq, ecg_or_eog, n_breaks_bursts_allowed_per_10min, allowed_range_of_peaks_stds, height_multiplier)
     print(f'___MEGqc___: {ecg_ch} satisfied conditions for a good channel: ', ecg_eval)
@@ -1471,9 +1471,10 @@ def make_simple_metric_ECG_EOG(channels_ranked: dict, m_or_g_chosen: List, ecg_o
 
     return simple_metric
 
+import re
 
 
-def get_ECG_data_choose_method(raw: mne.io.Raw, ecg_params: dict):
+def get_ECG_data_choose_method(raw: mne.io.Raw, ecg_params: dict, orig_meg_system):
 
     """
     Choose the method of finding affected channels based on the presense and quality of ECG channel.
@@ -1505,8 +1506,11 @@ def get_ECG_data_choose_method(raw: mne.io.Raw, ecg_params: dict):
         Indexes of the ECG events.
 
     """
-
     picks_ECG = mne.pick_types(raw.info, ecg=True)
+
+    if len(picks_ECG) == 0:
+        pattern = re.compile(r'EKG|ECG', re.IGNORECASE)
+        picks_ECG = [i for i, ch_name in enumerate(raw.info['ch_names']) if pattern.search(ch_name)]
 
     ecg_ch_name = [raw.info['chs'][name]['ch_name'] for name in picks_ECG]
 
@@ -1520,6 +1524,9 @@ def get_ECG_data_choose_method(raw: mne.io.Raw, ecg_params: dict):
         ecg_ch_name = ecg_ch_name[0]
 
         bad_ecg_eog, ecg_data, event_indexes, ecg_eval_str = detect_noisy_ecg(raw, ecg_ch_name,  ecg_or_eog = 'ECG', n_breaks_bursts_allowed_per_10min = ecg_params['n_breaks_bursts_allowed_per_10min'], allowed_range_of_peaks_stds = ecg_params['allowed_range_of_peaks_stds'], height_multiplier = ecg_params['height_multiplier'])
+
+        if orig_meg_system == 'EEG':
+            bad_ecg_eog[ecg_ch_name] = 'good'
 
         if bad_ecg_eog[ecg_ch_name] == 'bad': #ecg channel present but noisy:
             ecg_str = 'ECG channel data is too noisy, cardio artifacts were reconstructed. ECG channel was dropped from the analysis. Consider checking the quality of ECG channel on your recording device. \n'
@@ -1559,8 +1566,7 @@ def get_ECG_data_choose_method(raw: mne.io.Raw, ecg_params: dict):
 
     return use_method, ecg_str_total, ecg_ch_name, ecg_data, event_indexes
 
-
-def get_EOG_data(raw: mne.io.Raw):
+def get_EOG_data(raw: mne.io.Raw, orig_meg_system):
 
     """
     Find if the EOG channel is present anfd get its data.
@@ -1590,6 +1596,12 @@ def get_EOG_data(raw: mne.io.Raw):
     # Select the EOG channels
     eog_channels = mne.pick_types(raw.info, meg=False, eeg=False, stim=False, eog=True)
 
+    if len(eog_channels) == 0:
+        pattern = re.compile(r'EOG|ROC|LOC', re.IGNORECASE)
+        eog_channels = [i for i, ch_name in enumerate(raw.info['ch_names']) if pattern.search(ch_name)]
+
+
+
     # Get the names of the EOG channels
     eog_channel_names = [raw.ch_names[ch] for ch in eog_channels]
 
@@ -1598,7 +1610,8 @@ def get_EOG_data(raw: mne.io.Raw):
 
     #TODO: WHY AM I DOING THIS CHECK??
     try:
-        eog_events = mne.preprocessing.find_eog_events(raw)
+        eog_events, eog_channel_names = find_eog_events_custom(raw, eog_channel_names)
+        #eog_events = mne.preprocessing.find_eog_events(raw)
         #eog_events_times  = (eog_events[:, 0] - raw.first_samp) / raw.info['sfreq']
 
         #even if 2 EOG channels are present, MNE can only detect blinks!
@@ -1623,7 +1636,19 @@ def get_EOG_data(raw: mne.io.Raw):
 
     return eog_str, eog_data, event_indexes_all, eog_channel_names
 
+def find_eog_events_custom(raw, eog_channel_names):
+    # try with each EOG channels
+    for eog_ch in eog_channel_names:
+        try:
+            print(f"Extracting EOG events from : {eog_ch}")
+            eog_events = mne.preprocessing.find_eog_events(raw, ch_name=eog_ch)
+            print(f"✓ Found  {len(eog_events)} EOG events with {eog_ch}")
+            return eog_events, eog_ch
 
+        except Exception as e:
+            print(f"✗ Error with {eog_ch}: {e}")
+            continue
+    raise ValueError("No EOG events found in any channel")
 
 
 def reconstruct_ecg_and_check(raw: mne.io.Raw, n_breaks_bursts_allowed_per_10min: int, allowed_range_of_peaks_stds: float, height_multiplier: float):
@@ -2007,8 +2032,8 @@ def align_mean_rwave(mean_rwave: np.ndarray, artif_per_ch: List, tmin: float, tm
 
 
 #%%
-def ECG_meg_qc(ecg_params: dict, ecg_params_internal: dict, data_path:str, channels: List, chs_by_lobe_orig: dict, m_or_g_chosen: List):
-    
+def ECG_meg_qc(ecg_params: dict, ecg_params_internal: dict, data_path:str, channels: List, chs_by_lobe_orig: dict, m_or_g_chosen: List, orig_meg_system):
+
     """
     Main ECG function. Calculates average ECG artifact and finds affected channels.
     
@@ -2060,7 +2085,7 @@ def ECG_meg_qc(ecg_params: dict, ecg_params_internal: dict, data_path:str, chann
     thresh_lvl_peakfinder=ecg_params['thresh_lvl_peakfinder']
 
     ecg_derivs = []
-    use_method, ecg_str, ecg_ch_name, ecg_data, event_indexes = get_ECG_data_choose_method(raw, ecg_params)
+    use_method, ecg_str, ecg_ch_name, ecg_data, event_indexes = get_ECG_data_choose_method(raw, ecg_params, orig_meg_system)
 
     n_events = len(event_indexes)
     minutes_in_data = len(ecg_data) / sfreq / 60
@@ -2231,7 +2256,7 @@ def ECG_meg_qc(ecg_params: dict, ecg_params_internal: dict, data_path:str, chann
 
 
 #%%
-def EOG_meg_qc(eog_params: dict, eog_params_internal: dict, data_path: str, channels: dict, chs_by_lobe_orig: dict, m_or_g_chosen: List):
+def EOG_meg_qc(eog_params: dict, eog_params_internal: dict, data_path: str, channels: dict, chs_by_lobe_orig: dict, m_or_g_chosen: List, orig_meg_system):
     
     """
     Main EOG function. Calculates average EOG artifact and finds affected channels.
@@ -2278,7 +2303,7 @@ def EOG_meg_qc(eog_params: dict, eog_params_internal: dict, data_path: str, chan
     gaussian_sigma=eog_params['gaussian_sigma']
     thresh_lvl_peakfinder=eog_params['thresh_lvl_peakfinder']
 
-    eog_str, eog_data, event_indexes, eog_ch_name = get_EOG_data(raw)
+    eog_str, eog_data, event_indexes, eog_ch_name = get_EOG_data(raw, orig_meg_system)
 
     eog_derivs = []
     if len(eog_data) == 0:
@@ -2290,7 +2315,8 @@ def EOG_meg_qc(eog_params: dict, eog_params_internal: dict, data_path: str, chan
     # Now choose the channel with blinks only (if there are several):
     #(TODO: NEED TO FIGURE OUT HOW. For now just take the first one)
     eog_data = eog_data[0]
-    eog_ch_name = eog_ch_name[0]
+    if orig_meg_system != 'EEG':
+        eog_ch_name = eog_ch_name[0]
     event_indexes = event_indexes[0]
     print('___MEG_QC___: Blinks will be detected based on channel: ', eog_ch_name)
 
@@ -2336,7 +2362,10 @@ def EOG_meg_qc(eog_params: dict, eog_params_internal: dict, data_path: str, chan
     
     for m_or_g  in m_or_g_chosen:
 
-        eog_epochs = mne.preprocessing.create_eog_epochs(raw, picks=channels[m_or_g], tmin=tmin, tmax=tmax)
+        if orig_meg_system == 'EEG':
+            eog_epochs = mne.preprocessing.create_eog_epochs(raw, ch_name=eog_ch_name, picks=channels[m_or_g], tmin=tmin, tmax=tmax)
+        else:
+            eog_epochs = mne.preprocessing.create_eog_epochs(raw, picks=channels[m_or_g], tmin=tmin, tmax=tmax)
 
         # eog_derivs += plot_ecg_eog_mne(eog_epochs, m_or_g, tmin, tmax)
 
