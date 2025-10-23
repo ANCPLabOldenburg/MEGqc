@@ -415,6 +415,9 @@ def MUSCLE_meg_qc(muscle_params: dict, psd_params: dict, psd_params_internal: di
    
     raw = raw_orig # make a copy of the raw data, to make sure the original data is not changed while filtering for this metric.
 
+    if muscle_freqs[1] > raw.info['sfreq']/2-5:
+        muscle_freqs[1] = raw.info['sfreq'] / 2 - 5
+
     if 'mag' in m_or_g_chosen:
         m_or_g_decided=['mag']
         muscle_str = 'For this data file artifact detection was performed on magnetometers, they are more sensitive to muscle activity than gradiometers. '

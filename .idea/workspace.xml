@@ -1,0 +1,154 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<project version="4">
+  <component name="AutoImportSettings">
+    <option name="autoReloadType" value="SELECTIVE" />
+  </component>
+  <component name="ChangeListManager">
+    <list default="true" id="995acf5d-d61a-48e2-89b1-26cffedc965a" name="Changes" comment="">
+      <change beforePath="$PROJECT_DIR$/.idea/.gitignore" beforeDir="false" />
+      <change beforePath="$PROJECT_DIR$/.idea/MEGqc.iml" beforeDir="false" afterPath="$PROJECT_DIR$/.idea/MEGqc.iml" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/.idea/misc.xml" beforeDir="false" afterPath="$PROJECT_DIR$/.idea/misc.xml" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/meg_qc/calculation/initial_meg_qc.py" beforeDir="false" afterPath="$PROJECT_DIR$/meg_qc/calculation/initial_meg_qc.py" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/meg_qc/calculation/meg_qc_pipeline.py" beforeDir="false" afterPath="$PROJECT_DIR$/meg_qc/calculation/meg_qc_pipeline.py" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/meg_qc/calculation/metrics/PSD_meg_qc.py" beforeDir="false" afterPath="$PROJECT_DIR$/meg_qc/calculation/metrics/PSD_meg_qc.py" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/meg_qc/calculation/metrics/muscle_meg_qc.py" beforeDir="false" afterPath="$PROJECT_DIR$/meg_qc/calculation/metrics/muscle_meg_qc.py" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/meg_qc/calculation/metrics/summary_report_GQI.py" beforeDir="false" afterPath="$PROJECT_DIR$/meg_qc/calculation/metrics/summary_report_GQI.py" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/meg_qc/miscellaneous/examples/run_calculation_module.py" beforeDir="false" afterPath="$PROJECT_DIR$/meg_qc/miscellaneous/examples/run_calculation_module.py" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/meg_qc/miscellaneous/examples/run_plotting_module.py" beforeDir="false" afterPath="$PROJECT_DIR$/meg_qc/miscellaneous/examples/run_plotting_module.py" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/meg_qc/plotting/meg_qc_plots.py" beforeDir="false" afterPath="$PROJECT_DIR$/meg_qc/plotting/meg_qc_plots.py" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/meg_qc/plotting/universal_plots.py" beforeDir="false" afterPath="$PROJECT_DIR$/meg_qc/plotting/universal_plots.py" afterDir="false" />
+    </list>
+    <option name="SHOW_DIALOG" value="false" />
+    <option name="HIGHLIGHT_CONFLICTS" value="true" />
+    <option name="HIGHLIGHT_NON_ACTIVE_CHANGELIST" value="false" />
+    <option name="LAST_RESOLUTION" value="IGNORE" />
+  </component>
+  <component name="Git.Settings">
+    <option name="RECENT_GIT_ROOT_PATH" value="$PROJECT_DIR$" />
+  </component>
+  <component name="ProjectColorInfo">{
+  &quot;associatedIndex&quot;: 3
+}</component>
+  <component name="ProjectId" id="33KRpEfXMLwHuiLlWb4t1UbkgTU" />
+  <component name="ProjectViewState">
+    <option name="hideEmptyMiddlePackages" value="true" />
+    <option name="showLibraryContents" value="true" />
+  </component>
+  <component name="PropertiesComponent">{
+  &quot;keyToString&quot;: {
+    &quot;ModuleVcsDetector.initialDetectionPerformed&quot;: &quot;true&quot;,
+    &quot;Python.initial_meg_qc.executor&quot;: &quot;Debug&quot;,
+    &quot;Python.run_calculation_module.executor&quot;: &quot;Debug&quot;,
+    &quot;Python.run_plotting_module.executor&quot;: &quot;Debug&quot;,
+    &quot;RunOnceActivity.ShowReadmeOnStart&quot;: &quot;true&quot;,
+    &quot;RunOnceActivity.git.unshallow&quot;: &quot;true&quot;,
+    &quot;git-widget-placeholder&quot;: &quot;main&quot;,
+    &quot;settings.editor.selected.configurable&quot;: &quot;com.jetbrains.python.configuration.PyActiveSdkModuleConfigurable&quot;
+  }
+}</component>
+  <component name="RunManager" selected="Python.run_calculation_module">
+    <configuration name="run_calculation_module" type="PythonConfigurationType" factoryName="Python" temporary="true" nameIsGenerated="true">
+      <module name="MEGqc" />
+      <option name="ENV_FILES" value="" />
+      <option name="INTERPRETER_OPTIONS" value="" />
+      <option name="PARENT_ENVS" value="true" />
+      <envs>
+        <env name="PYTHONUNBUFFERED" value="1" />
+        <env name="PYTHONFAULTHANDLER" value="1" />
+      </envs>
+      <option name="SDK_HOME" value="" />
+      <option name="WORKING_DIRECTORY" value="$PROJECT_DIR$/meg_qc/miscellaneous/examples" />
+      <option name="IS_MODULE_SDK" value="true" />
+      <option name="ADD_CONTENT_ROOTS" value="true" />
+      <option name="ADD_SOURCE_ROOTS" value="true" />
+      <option name="SCRIPT_NAME" value="$PROJECT_DIR$/meg_qc/miscellaneous/examples/run_calculation_module.py" />
+      <option name="PARAMETERS" value="" />
+      <option name="SHOW_COMMAND_LINE" value="false" />
+      <option name="EMULATE_TERMINAL" value="false" />
+      <option name="MODULE_MODE" value="false" />
+      <option name="REDIRECT_INPUT" value="false" />
+      <option name="INPUT_FILE" value="" />
+      <method v="2" />
+    </configuration>
+    <configuration name="run_plotting_module" type="PythonConfigurationType" factoryName="Python" temporary="true" nameIsGenerated="true">
+      <module name="MEGqc" />
+      <option name="ENV_FILES" value="" />
+      <option name="INTERPRETER_OPTIONS" value="" />
+      <option name="PARENT_ENVS" value="true" />
+      <envs>
+        <env name="PYTHONUNBUFFERED" value="1" />
+      </envs>
+      <option name="SDK_HOME" value="" />
+      <option name="WORKING_DIRECTORY" value="$PROJECT_DIR$/meg_qc/miscellaneous/examples" />
+      <option name="IS_MODULE_SDK" value="true" />
+      <option name="ADD_CONTENT_ROOTS" value="true" />
+      <option name="ADD_SOURCE_ROOTS" value="true" />
+      <option name="SCRIPT_NAME" value="$PROJECT_DIR$/meg_qc/miscellaneous/examples/run_plotting_module.py" />
+      <option name="PARAMETERS" value="" />
+      <option name="SHOW_COMMAND_LINE" value="false" />
+      <option name="EMULATE_TERMINAL" value="false" />
+      <option name="MODULE_MODE" value="false" />
+      <option name="REDIRECT_INPUT" value="false" />
+      <option name="INPUT_FILE" value="" />
+      <method v="2" />
+    </configuration>
+    <list>
+      <item itemvalue="Python.run_calculation_module" />
+      <item itemvalue="Python.run_plotting_module" />
+    </list>
+    <recent_temporary>
+      <list>
+        <item itemvalue="Python.run_calculation_module" />
+        <item itemvalue="Python.run_plotting_module" />
+      </list>
+    </recent_temporary>
+  </component>
+  <component name="SharedIndexes">
+    <attachedChunks>
+      <set>
+        <option value="bundled-python-sdk-dfff61a61320-9cdd278e9d02-com.jetbrains.pycharm.community.sharedIndexes.bundled-PC-251.25410.159" />
+      </set>
+    </attachedChunks>
+  </component>
+  <component name="TaskManager">
+    <task active="true" id="Default" summary="Default task">
+      <changelist id="995acf5d-d61a-48e2-89b1-26cffedc965a" name="Changes" comment="" />
+      <created>1759063957714</created>
+      <option name="number" value="Default" />
+      <option name="presentableId" value="Default" />
+      <updated>1759063957714</updated>
+    </task>
+    <servers />
+  </component>
+  <component name="XDebuggerManager">
+    <breakpoint-manager>
+      <breakpoints>
+        <line-breakpoint enabled="true" suspend="THREAD" type="python-line">
+          <url>file://$PROJECT_DIR$/.venv/Lib/site-packages/mne/_fiff/pick.py</url>
+          <line>1408</line>
+          <option name="timeStamp" value="31" />
+        </line-breakpoint>
+        <line-breakpoint enabled="true" suspend="THREAD" type="python-line">
+          <url>file://$PROJECT_DIR$/meg_qc/plotting/meg_qc_plots.py</url>
+          <line>321</line>
+          <option name="timeStamp" value="144" />
+        </line-breakpoint>
+      </breakpoints>
+      <default-breakpoints>
+        <breakpoint type="python-exception">
+          <properties notifyOnTerminate="true" exception="BaseException">
+            <option name="notifyOnTerminate" value="true" />
+          </properties>
+        </breakpoint>
+      </default-breakpoints>
+    </breakpoint-manager>
+    <watches-manager>
+      <configuration name="PythonConfigurationType">
+        <watch expression="raw.info.'sfreq' (1911217497264)" />
+        <watch expression="tsv_path" />
+        <watch expression="std_csv_path" />
+        <watch expression="out_sub" />
+      </configuration>
+    </watches-manager>
+  </component>
+</project>

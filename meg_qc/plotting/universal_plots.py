@@ -51,6 +51,12 @@ def get_tit_and_unit(m_or_g: str, psd: bool = False):
             unit='Tesla/m'
         elif psd is True:
             unit='Tesla/m / Hz'
+    elif m_or_g == 'eeg':
+        m_or_g_tit = 'EEG'
+        if psd is False:
+            unit = 'microV'
+        elif psd is True:
+            unit = '(microV)^2/Hz'
     elif m_or_g == 'ECG':
         m_or_g_tit = 'ECG channel'
         unit = 'V'
@@ -208,6 +214,10 @@ def plot_stim_csv(f_path: str) -> List[QC_derivative]:
     """
 
     df = pd.read_csv(f_path, sep='\t')
+
+    #Check if there was stimulus present
+    if df.empty:
+        return []
 
     # Check if the first column is just indexes and remove it if necessary
     if df.columns[0] == df.index.name or df.iloc[:, 0].equals(pd.Series(df.index)):
@@ -618,6 +628,8 @@ def plot_sensors_3d_csv(sensors_csv_path: str):
 
     if system.upper() == 'TRIUX':
         fig_desc = "Magnetometers names end with '1' like 'MEG0111'. Gradiometers names end with '2' and '3' like 'MEG0112', 'MEG0113'."
+    elif system.upper() == 'EEG':
+        fig_desc = "EEG Channels"
     else:
         fig_desc = ""
 
@@ -924,7 +936,10 @@ def plot_topomap_std_ptp_csv(std_csv_path: str, ch_type: str, what_data: str):
 
     #First, convert scv back into dict with MEG_channel objects:
 
-    df = pd.read_csv(std_csv_path, sep='\t')  
+    df = pd.read_csv(std_csv_path, sep='\t')
+
+    if "_eeg." in std_csv_path:
+        ch_type = ['eeg']
 
     ch_tit, unit = get_tit_and_unit(ch_type)
 
@@ -1068,8 +1083,10 @@ def plot_3d_topomap_std_ptp_csv(sensors_csv_path: str, ch_type: str, what_data: 
             color=mean_metric_values,  # Use the mean metric values for the color scale
             colorscale='Bluered',  # Use the 'Bluered' colorscale
             colorbar=dict(
-                title=f'{metric}, {unit}',
-                titleside='right',
+                title=dict(
+                    text=f'{metric}, {unit}',  # el texto del título
+                    side='right'  # 'right' / 'top' / 'bottom'
+                ),
                 tickmode='array',
                 tickvals=[np.min(mean_metric_values), np.max(mean_metric_values)],
                 ticktext=[f'{np.min(mean_metric_values):.2e}', f'{np.max(mean_metric_values):.2e}'],
@@ -1368,6 +1385,11 @@ def plot_pie_chart_freq_csv(tsv_pie_path: str, m_or_g: str, noise_or_waves: str)
     # Read the data from the TSV file into a DataFrame
     df = pd.read_csv(tsv_pie_path, sep='\t')
 
+    if m_or_g == 'eeg':
+        stype = 'mag'
+    else:
+        stype = m_or_g
+
     if noise_or_waves == 'noise' and 'PSDnoise' in base_name:
         #check that we input tsv file with the right data
 
@@ -1375,11 +1397,11 @@ def plot_pie_chart_freq_csv(tsv_pie_path: str, m_or_g: str, noise_or_waves: str)
         fig_name = 'PSD_SNR_all_channels_'
 
         # Extract the data
-        total_amplitude = df['total_amplitude_'+m_or_g].dropna().iloc[0]  # Get the first non-null value
-        noisy_freqs = df['noisy_freqs_'+m_or_g].tolist()
+        total_amplitude = df['total_amplitude_'+stype].dropna().iloc[0]  # Get the first non-null value
+        noisy_freqs = df['noisy_freqs_'+stype].tolist()
 
-        noise_ampl = df['noise_ampl_'+m_or_g].tolist()
-        amplitudes_relative = df['noise_ampl_relative_to_signal_'+m_or_g].tolist()
+        noise_ampl = df['noise_ampl_'+stype].tolist()
+        amplitudes_relative = df['noise_ampl_relative_to_signal_'+stype].tolist()
 
         amplitudes_abs, amplitudes_relative, bands_names = edit_legend_pie_SNR(noisy_freqs, noise_ampl, total_amplitude, amplitudes_relative)
 
@@ -1393,14 +1415,14 @@ def plot_pie_chart_freq_csv(tsv_pie_path: str, m_or_g: str, noise_or_waves: str)
         df.set_index(df.columns[0], inplace=True)
 
         # Extract total_amplitude into a separate variable
-        total_amplitude = df['total_amplitude'].loc['absolute_'+m_or_g]
+        total_amplitude = df['total_amplitude'].loc['absolute_'+stype]
 
         #drop total ampl:
         df_no_total = copy.deepcopy(df.drop('total_amplitude', axis=1))
 
         # Extract rows into lists
-        amplitudes_abs = df_no_total.loc['absolute_'+m_or_g].tolist()
-        amplitudes_relative = df_no_total.loc['relative_'+m_or_g].tolist()
+        amplitudes_abs = df_no_total.loc['absolute_'+stype].tolist()
+        amplitudes_relative = df_no_total.loc['relative_'+stype].tolist()
 
         # Extract column names into a separate list
         bands_names = df_no_total.columns.tolist()
@@ -1412,7 +1434,7 @@ def plot_pie_chart_freq_csv(tsv_pie_path: str, m_or_g: str, noise_or_waves: str)
     #the lists change in this function and this change is tranfered outside the fuction even when these lists are not returned explicitly. 
     #To keep them in original state outside the function, they are copied here.
     all_mean_abs_values=amplitudes_abs.copy()
-    ch_type_tit, unit = get_tit_and_unit(m_or_g, psd=True)
+    ch_type_tit, unit = get_tit_and_unit(stype, psd=True)
 
     #If mean relative percentages dont sum up into 100%, add the 'unknown' part.
     all_mean_relative_values=[v * 100 for v in amplitudes_relative]  #in percentage

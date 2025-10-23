@@ -145,7 +145,7 @@ def get_files_list(sid: str, dataset_path: str, dataset):
 
     else:
         list_of_files = []
-        raise ValueError('No fif or ctf files found in the dataset.')
+        raise ValueError('No fif, ctf or eeg files found in the dataset.')
 
     # Find if we have crosstalk in list of files and entities_per_file, give notification that they will be skipped:
     # read about crosstalk files here: https://bids-specification.readthedocs.io/en/stable/appendices/meg-file-formats.html
@@ -771,8 +771,11 @@ def process_one_subject(
                 orig_meg_system
             )
             if orig_meg_system == 'EEG':
-                # 2. remove measurement_unit_grad
-                del simple_metrics_eog['all_channels_ranked_by_EOG_contamination_level']['grad']
+                # 2. remove measurement_unit_grad if present
+                try:
+                    del simple_metrics_eog['all_channels_ranked_by_EOG_contamination_level']['grad']
+                except Exception:
+                    None
             print('___MEGqc___: ',
                   "Finished EOG. --- Execution %s seconds ---"
                   % (time.time() - start_time))
@@ -884,7 +887,10 @@ def process_one_subject(
                 print('___MEGqc___: ', 'counter of subject_folder.create_artifact', counter)
 
                 meg_artifact.add_entity('desc', deriv.name)  # file name
-                meg_artifact.suffix = 'meg'
+                if orig_meg_system == 'EEG':
+                    meg_artifact.suffix = 'eeg'
+                else:
+                    meg_artifact.suffix = 'meg'
                 meg_artifact.extension = '.html'
 
                 if deriv.content_type == 'df':
@@ -1250,6 +1256,3 @@ def make_derivative_meg_qc(
             generate_gqi_summary(dataset_path, config_file_path, data_type)
         except Exception as e:
             print("___MEGqc___: Failed to create global quality reports", e)
-
-    return
-

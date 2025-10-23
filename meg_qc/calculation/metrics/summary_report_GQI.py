@@ -51,14 +51,13 @@ def _safe_dataframe(obj):
 # High level helper functions
 # ---------------------------------------------------------------------------
 
-
 def create_summary_report(
-    json_file: Union[str, os.PathLike],
-    html_output: str | None = None,
-    json_output: str = "first_sight_report.json",
-    data_type: str = "",
-    gqi_settings: Optional[Dict[str, Dict[str, float]]] = None,
-):
+        json_file: Union[str, os.PathLike],
+        html_output: str | None = None,
+        json_output: str = "first_sight_report.json",
+        data_type: str = "",
+        gqi_settings: Optional[Dict[str, Dict[str, float]]] = None,
+) -> None:
     """Create a human readable QC summary from the metrics JSON file.
 
     Parameters
@@ -515,8 +514,10 @@ def create_summary_report(
         json.dump(summary_data, f_json, indent=4)
 
     # Inform the user about generated outputs
-    print(f"HTML successfully generated: {html_output}")
-    print(f"JSON summary successfully generated: {json_output}")
+    if html_output:
+        print(f"HTML successfully generated: {html_output}")
+    if json_output:
+        print(f"JSON summary successfully generated: {json_output}")
 
 
 def create_group_metrics_figure(tsv_path: Union[str, os.PathLike], output_png: Union[str, os.PathLike]) -> None:
@@ -618,6 +619,8 @@ def create_group_metrics_figure(tsv_path: Union[str, os.PathLike], output_png: U
 def generate_gqi_summary(dataset_path: str, config_file: str, data_type: str) -> None:
     """Generate Global Quality Index summaries from existing metrics."""
     # Load user configuration to retrieve GQI settings
+    import shutil
+    import re
     qc_params = get_all_config_params(config_file)
     if qc_params is None:
         return
@@ -635,7 +638,10 @@ def generate_gqi_summary(dataset_path: str, config_file: str, data_type: str) ->
     attempt_dir = os.path.join(reports_root, f"global_quality_index_{attempt}")
     os.makedirs(attempt_dir, exist_ok=True)
 
-    pattern = os.path.join(calc_dir, "sub-*", "*SimpleMetrics_meg.json")
+    if data_type == 'EEG':
+        pattern = os.path.join(calc_dir, "sub-*", "*SimpleMetrics_eeg.json")
+    else:
+        pattern = os.path.join(calc_dir, "sub-*", "*SimpleMetrics_meg.json")
     summary_paths = []
     for json_path in glob.glob(pattern):
         sub_dir = os.path.basename(os.path.dirname(json_path))
@@ -643,9 +649,23 @@ def generate_gqi_summary(dataset_path: str, config_file: str, data_type: str) ->
         os.makedirs(out_sub, exist_ok=True)
         base = os.path.basename(json_path).replace("SimpleMetrics", f"GlobalSummaryReport_attempt{attempt}")
         out_json = os.path.join(out_sub, base)
+
+        html_output = None
+        #html_output = out_json.replace(".json", ".html")   #prueba Bosch
         # Generate per-subject summary JSON (no HTML)
-        create_summary_report(json_path, None, out_json, data_type, gqi_params)
+        create_summary_report(json_path, html_output, out_json, data_type, gqi_params)
         summary_paths.append(out_json)
+        #copy the JSON file to the calculation directory
+        json_calculation = os.path.dirname(json_path)
+        # Ensure the target directory exists
+        # os.makedirs(json_calculation, exist_ok=True)
+        # Build full destination path
+        destination_path = os.path.join(json_calculation, os.path.basename(out_json))
+        # Substitute "_attempt" + any number of digits + "_" with a single "_"
+        destination_path = re.sub(r'_attempt\d+_', '_', destination_path)
+        # Copy the file
+        shutil.copy2(out_json, destination_path)
+        print(f"File copied to: {destination_path}")
 
     # Collate per-subject summaries into a group table and figure
     group_dir = os.path.join(reports_root, "group_metrics")

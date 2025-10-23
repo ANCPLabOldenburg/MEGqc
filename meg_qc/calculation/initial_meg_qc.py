@@ -980,9 +980,9 @@ def assign_channels_properties(channels_short: dict, meg_system: str):
                 ch.system = 'EEG'
 
     # sort channels by name:
-    for key, value in channels_full.items():
-        if key != 'eeg':
-            channels_full[key] = sorted(value, key=lambda x: x.name)
+    if meg_system.upper() != 'EEG':
+        for key, value in channels_full.items():
+                channels_full[key] = sorted(value, key=lambda x: x.name)
 
     return channels_full, lobes_color_coding_str
 
@@ -1314,13 +1314,19 @@ def initial_processing(default_settings: dict, filtering_settings: dict, epochin
         raw_cropped_filtered = raw_cropped
 
         # if filtering_settings['h_freq'] is higher than the Nyquist frequency, set it to Nyquist frequency:
-        if filtering_settings['h_freq'] > raw_cropped_filtered.info['sfreq'] / 2 - 1:
-            filtering_settings['h_freq'] = raw_cropped_filtered.info['sfreq'] / 2 - 1
+        if filtering_settings['h_freq'] > raw_cropped_filtered.info['sfreq'] / 2 - 5:
+            filtering_settings['h_freq'] = raw_cropped_filtered.info['sfreq'] / 2 - 5
+            filtering_settings['downsample_to_hz'] = filtering_settings['h_freq']
             print('___MEGqc___: ',
                   'High frequency for filtering is higher than Nyquist frequency. High frequency was set to Nyquist frequency:',
                   filtering_settings['h_freq'])
 
-        raw_cropped_filtered.filter(l_freq=filtering_settings['l_freq'], h_freq=filtering_settings['h_freq'],
+        if meg_system == 'EEG':
+            filtering_settings['downsample_to_hz'] = False
+            raw_cropped_filtered.filter(l_freq=filtering_settings['l_freq'], h_freq=filtering_settings['h_freq'],
+                                    picks='all', method=filtering_settings['method'], iir_params=None)
+        else:
+            raw_cropped_filtered.filter(l_freq=filtering_settings['l_freq'], h_freq=filtering_settings['h_freq'],
                                     picks='meg', method=filtering_settings['method'], iir_params=None)
         print('___MEGqc___: ', 'Data filtered from', filtering_settings['l_freq'], 'to', filtering_settings['h_freq'],
               'Hz.')

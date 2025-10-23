@@ -302,6 +302,8 @@ def csv_to_html_report(raw_info_path: str, metric: str, tsv_paths: List, report_
 
     for tsv_path in tsv_paths: #if we got several tsvs for same metric, like for PSD:
 
+        if "_eeg." in tsv_path:
+            m_or_g_chosen = ['eeg']
         #get the final file name of tsv path:
         basename = os.path.basename(tsv_path)
         if 'desc-stimulus' in basename:
@@ -314,15 +316,16 @@ def csv_to_html_report(raw_info_path: str, metric: str, tsv_paths: List, report_
 
             std_derivs += plot_sensors_3d_csv(tsv_path)
 
+# bosch prueba
             for m_or_g in m_or_g_chosen:
-
-                fig_topomap = plot_topomap_std_ptp_csv(tsv_path, ch_type=m_or_g, what_data='stds')
-                fig_topomap_3d = plot_3d_topomap_std_ptp_csv(tsv_path, ch_type=m_or_g, what_data='stds')
+                #fig_topomap = plot_topomap_std_ptp_csv(tsv_path, ch_type=m_or_g, what_data='stds')
+                #fig_topomap_3d = plot_3d_topomap_std_ptp_csv(tsv_path, ch_type=m_or_g, what_data='stds')
                 fig_all_time = boxplot_all_time_csv(tsv_path, ch_type=m_or_g, what_data='stds')
                 fig_std_epoch0 = boxplot_epoched_xaxis_channels_csv(tsv_path, ch_type=m_or_g, what_data='stds')
                 fig_std_epoch1 = boxplot_epoched_xaxis_epochs_csv(tsv_path, ch_type=m_or_g, what_data='stds')
 
-                std_derivs += fig_topomap + fig_topomap_3d + fig_all_time + fig_std_epoch0 + fig_std_epoch1
+                #std_derivs += fig_topomap + fig_topomap_3d + fig_all_time + fig_std_epoch0 + fig_std_epoch1
+                std_derivs += fig_all_time + fig_std_epoch0 + fig_std_epoch1
 
         if 'PTP' in metric.upper():
 
@@ -331,15 +334,17 @@ def csv_to_html_report(raw_info_path: str, metric: str, tsv_paths: List, report_
 
             ptp_manual_derivs += plot_sensors_3d_csv(tsv_path)
 
+# bosch prueba
             for m_or_g in m_or_g_chosen:
 
-                fig_topomap = plot_topomap_std_ptp_csv(tsv_path, ch_type=m_or_g, what_data='peaks')
-                fig_topomap_3d = plot_3d_topomap_std_ptp_csv(tsv_path, ch_type=m_or_g, what_data='peaks')
+                #fig_topomap = plot_topomap_std_ptp_csv(tsv_path, ch_type=m_or_g, what_data='peaks')
+                #fig_topomap_3d = plot_3d_topomap_std_ptp_csv(tsv_path, ch_type=m_or_g, what_data='peaks')
                 fig_all_time = boxplot_all_time_csv(tsv_path, ch_type=m_or_g, what_data='peaks')
                 fig_ptp_epoch0 = boxplot_epoched_xaxis_channels_csv(tsv_path, ch_type=m_or_g, what_data='peaks')
                 fig_ptp_epoch1 = boxplot_epoched_xaxis_epochs_csv(tsv_path, ch_type=m_or_g, what_data='peaks')
 
-                ptp_manual_derivs += fig_topomap + fig_topomap_3d + fig_all_time + fig_ptp_epoch0 + fig_ptp_epoch1
+                #ptp_manual_derivs += fig_topomap + fig_topomap_3d + fig_all_time + fig_ptp_epoch0 + fig_ptp_epoch1
+                ptp_manual_derivs += fig_all_time + fig_ptp_epoch0 + fig_ptp_epoch1
 
         elif 'PSD' in metric.upper():
 
@@ -380,9 +385,10 @@ def csv_to_html_report(raw_info_path: str, metric: str, tsv_paths: List, report_
 
             eog_derivs += plot_mean_rwave_csv(tsv_path, 'EOG')
 
-            for m_or_g in m_or_g_chosen:
-                eog_derivs += plot_artif_per_ch_3_groups(tsv_path, m_or_g, 'EOG', flip_data=False)
-                #eog_derivs += plot_correlation_csv(tsv_path, 'EOG', m_or_g)
+# bosch prueba
+            #prueba for m_or_g in m_or_g_chosen:
+                #prueba eog_derivs += plot_artif_per_ch_3_groups(tsv_path, m_or_g, 'EOG', flip_data=False)
+                #prueba eog_derivs += plot_correlation_csv(tsv_path, 'EOG', m_or_g)
 
 
         elif 'MUSCLE' in metric.upper():
@@ -588,6 +594,155 @@ class Deriv_to_plot:
 from joblib import Parallel, delayed
 
 
+import json
+import os
+import sys
+from typing import Any, Dict, List
+import pandas as pd
+
+def _df_from_records(records: Any) -> pd.DataFrame:
+    """Return a DataFrame from a list of records (or an empty DF if None/empty)."""
+    if isinstance(records, list) and len(records) > 0:
+        return pd.DataFrame(records)
+    return pd.DataFrame()
+
+
+def create_GQIhtml_from_json(json_path: str, html_output: str) -> None:
+    # ---- Load JSON ----
+    with open(json_path, "r", encoding="utf-8") as f:
+        data: Dict[str, Any] = json.load(f)
+
+    # ---- Extract top-level values ----
+    html_name = data.get("file_name", os.path.basename(json_path))
+    GQI = data.get("GQI", "N/A")
+
+    penalties: Dict[str, float] = data.get("GQI_penalties", {}) or {}
+
+    params: Dict[str, Any] = data.get("parameters", {}) or {}
+    std_lvl = params.get("std_lvl", "N/A")
+    ptp_lvl = params.get("ptp_lvl", "N/A")
+    std_epoch_lvl = params.get("std_epoch_lvl", "N/A")
+    ptp_epoch_lvl = params.get("ptp_epoch_lvl", "N/A")
+
+    # ---- Build DataFrames from lists of records ----
+    general_df   = _df_from_records(data.get("STD_time_series"))
+    ptp_df       = _df_from_records(data.get("PTP_time_series"))
+    std_epoch_df = _df_from_records(data.get("STD_epoch_summary"))
+    ptp_epoch_df = _df_from_records(data.get("PTP_epoch_summary"))
+    ecg_df       = _df_from_records(data.get("ECG_correlation_summary"))
+    eog_df       = _df_from_records(data.get("EOG_correlation_summary"))
+    psd_df       = _df_from_records(data.get("PSD_noise_summary"))
+
+    # ---- Muscle events -> DataFrame ----
+    # JSON example: "Muscle_events": {"# Muscle Events": muscle_events, "total_number_of_events": total_events}
+    muscle_obj = data.get("Muscle_events", {})
+    if isinstance(muscle_obj, dict) and muscle_obj:
+        # render as single-row summary table
+        muscle_df = pd.DataFrame([muscle_obj])
+    else:
+        muscle_df = pd.DataFrame()
+
+    # ---- Style block (as provided) ----
+    style = """
+        <style>
+            body { font-family: Arial, sans-serif; margin: 10px; font-size: 16px; }
+            h1 { color: #003366; font-size: 25px; margin-bottom: 6px; font-weight: bold; }
+            h2 { color: #004d99; font-size: 19px; margin: 12px 0 6px 0; }
+            table { border-collapse: collapse; margin: 0 0 8px 0; font-size: 16px; }
+            th, td { border: 1px solid #ccc; padding: 6px 10px; text-align: center; }
+            th { background-color: #f2f2f2; }
+            .table-flex { display: flex; gap: 12px; flex-wrap: wrap; align-items: flex-start; margin-bottom: 12px; }
+            .table-box { flex: 1; min-width: 300px; }
+            .file-label { font-size: 18px; font-weight: bold; margin: 0 0 2px 12px; }
+            .subtitle { font-size: 19px; font-weight: bold; color: #222; margin: 0 0 12px 12px; }
+            .header-grid { display: grid; grid-template-columns: 1fr 1fr; align-items: start; margin-bottom: 0; }
+        </style>
+    """
+
+    # ---- Render HTML ----
+    with open(html_output, "w", encoding="utf-8") as f:
+        # (Removed a stray initial "</div></div>" which would break markup)
+        f.write("<html><head><meta charset='UTF-8'>" + style + "</head><body>")
+
+        # Header
+        f.write("<div class='header-grid'>")
+        f.write("<div><h1>MEGQC Global Quality Report</h1></div>")
+        f.write(f"<div><div class='file-label'>File: {html_name}</div>")
+        f.write(f"<div class='subtitle'>Global Quality Index (GQI): {GQI}</div></div></div>")
+
+        # Penalties (only if present)
+        if penalties:
+            f.write("<h2>GQI Penalties</h2>")
+            penalties_df = pd.DataFrame([
+                {"Metric": "Bad Channels", "Penalty (%)": f"{penalties.get('ch', 0):.2f}"},
+                {"Metric": "Correlation", "Penalty (%)": f"{penalties.get('corr', 0):.2f}"},
+                {"Metric": "Muscle", "Penalty (%)": f"{penalties.get('mus', 0):.2f}"},
+                {"Metric": "PSD Noise", "Penalty (%)": f"{penalties.get('psd', 0):.2f}"},
+            ])
+            f.write(penalties_df.to_html(index=False, escape=False))
+
+        # Time series tables
+        if not general_df.empty or not ptp_df.empty:
+            f.write("<div class='table-flex'>")
+            f.write(f"<div class='table-box'><h2>STD Time-Series (STD level: {std_lvl})</h2>")
+            if not general_df.empty:
+                f.write(general_df.to_html(index=False))
+            else:
+                f.write("<i>No data</i>")
+            f.write("</div>")
+
+            f.write(f"<div class='table-box'><h2>PTP Time-Series (STD level: {ptp_lvl})</h2>")
+            if not ptp_df.empty:
+                f.write(ptp_df.to_html(index=False))
+            else:
+                f.write("<i>No data</i>")
+            f.write("</div></div>")
+
+        # PSD Noise
+        if not psd_df.empty:
+            f.write("<h2>PSD Noise Summary</h2>")
+            f.write(psd_df.to_html(index=False))
+
+        # Epoch summaries
+        if not std_epoch_df.empty or not ptp_epoch_df.empty:
+            f.write("<div class='table-flex'>")
+            f.write(f"<div class='table-box'><h2>STD Epoch Summary (STD level: {std_epoch_lvl})</h2>")
+            if not std_epoch_df.empty:
+                f.write(std_epoch_df.to_html(index=False))
+            else:
+                f.write("<i>No data</i>")
+            f.write("</div>")
+
+            f.write(f"<div class='table-box'><h2>PTP Epoch Summary (STD level: {ptp_epoch_lvl})</h2>")
+            if not ptp_epoch_df.empty:
+                f.write(ptp_epoch_df.to_html(index=False))
+            else:
+                f.write("<i>No data</i>")
+            f.write("</div></div>")
+
+        # Correlation summaries (ECG/EOG)
+        if not ecg_df.empty or not eog_df.empty:
+            f.write("<div class='table-flex'>")
+            if not ecg_df.empty:
+                f.write("<div class='table-box'><h2>ECG Correlation Summary</h2>")
+                f.write(ecg_df.to_html(index=False))
+                f.write("</div>")
+            if not eog_df.empty:
+                f.write("<div class='table-box'><h2>EOG Correlation Summary</h2>")
+                f.write(eog_df.to_html(index=False))
+                f.write("</div>")
+            f.write("</div>")
+
+        # Muscle events
+        if not muscle_df.empty:
+            f.write("<h2>Muscle Events Summary</h2>")
+            f.write(muscle_df.to_html(index=False))
+        else:
+            f.write("<h2>Muscle Events Summary</h2><i>No data</i>")
+
+        f.write("</body></html>")
+
+
 def process_subject(
         sub: str,
         dataset,
@@ -656,6 +811,22 @@ def process_subject(
             )
 
         if report_str_path and simple_metrics_path:
+
+            # Generate per-subject summary HTML only from the GQI JSON summary
+            json_path = simple_metrics_path.replace('SimpleMetrics', 'GlobalSummaryReport')
+            # Replace 'derivatives/Meg_QC/calculation' by 'derivatives/Meg_QC/reports'
+            path_parts = simple_metrics_path.split(os.path.sep)
+            for i in range(len(path_parts) - 2):  # -2 to ensure that is not going to produce an exception
+                if (path_parts[i] == 'derivatives' and
+                        path_parts[i + 1] == 'Meg_QC' and
+                        path_parts[i + 2] == 'calculation'):
+                    path_parts[i + 2] = 'reports'
+            # Building the path
+            modified_path = os.path.sep.join(path_parts)
+            html_output = modified_path.replace('SimpleMetrics', 'GlobalSummaryReport')
+            html_output = os.path.splitext(html_output)[0] + '.html'
+            create_GQIhtml_from_json(json_path, html_output)
+
             summary_html = make_summary_qc_report(report_str_path, simple_metrics_path)
             meg_artifact = subject_folder.create_artifact(raw=raw_entities_base)
             meg_artifact.add_entity('desc', 'summary_qc_report')
@@ -754,7 +925,7 @@ def make_plots_meg_qc(dataset_path: str, n_jobs: int = 1):
     chosen_entities['METRIC'].append('SimpleMetrics')
 
     # 5) Define a simple plot_settings. Example: always 'mag' and 'grad'
-    plot_settings = {'m_or_g': ['mag', 'grad']}
+    plot_settings = {'m_or_g': ['mag', 'grad']} #at this time I do not know if it is MEG or EEG. I will later madofiy this value
 
     print('___MEGqc___: CHOSEN entities to plot:', chosen_entities)
     print('___MEGqc___: CHOSEN settings:', plot_settings)
@@ -795,6 +966,41 @@ def make_plots_meg_qc(dataset_path: str, n_jobs: int = 1):
 
         tsv_paths = list(dataset.query(**query_args))
         tsvs_to_plot_by_metric[metric] = sorted(tsv_paths)
+
+        if len(tsv_paths) == 0:
+            query_args = {
+                'subj': chosen_entities['subject'],
+                'task': chosen_entities['task'],
+                'suffix': 'eeg',
+                'extension': ['tsv', 'json', 'fif'],
+                'return_type': 'filename',
+                'desc': '',
+                'scope': calculated_derivs_folder,
+            }
+
+            # If the user (now "all") had multiple possible descs for PSDs, ECGs, etc.
+            if metric == 'PSDs':
+                # Include all PSD derivatives (noise and waves) so the PSD report is
+                # generated correctly.
+                query_args['desc'] = ['PSDs', 'PSDnoiseMag', 'PSDnoiseGrad', 'PSDwavesMag', 'PSDwavesGrad']
+            elif metric == 'ECGs':
+                query_args['desc'] = ['ECGchannel', 'ECGs']
+            elif metric == 'EOGs':
+                query_args['desc'] = ['EOGchannel', 'EOGs']
+            else:
+                query_args['desc'] = [metric]
+
+            # Optional session/run
+            if chosen_entities['session']:
+                query_args['session'] = chosen_entities['session']
+            if chosen_entities['run']:
+                query_args['run'] = chosen_entities['run']
+
+            tsv_paths = list(dataset.query(**query_args))
+            tsvs_to_plot_by_metric[metric] = sorted(tsv_paths)
+            suffix = 'eeg'
+        else:
+            suffix = 'meg'
 
         # Now query object form for ancpbids entities
         query_args['return_type'] = 'object'

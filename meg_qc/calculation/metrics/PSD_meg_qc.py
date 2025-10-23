@@ -1049,6 +1049,9 @@ def PSD_meg_qc(psd_params: dict, psd_params_internal: dict, channels:dict, chs_b
 
     chs_by_lobe_psd=copy.deepcopy(chs_by_lobe)
 
+    if psd_params['freq_max'] > raw.info['sfreq'] / 2 - 5:
+        psd_params['freq_max'] = raw.info['sfreq'] / 2 - 5
+
     for m_or_g in m_or_g_chosen:
 
         psds[m_or_g], freqs[m_or_g] = raw.compute_psd(method=method, fmin=psd_params['freq_min'], fmax=psd_params['freq_max'], picks=channels[m_or_g], n_fft=nfft, n_per_seg=nperseg).get_data(return_freqs=True)

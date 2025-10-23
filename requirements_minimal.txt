@@ -1,0 +1,7 @@
+numpy==1.26.4
+scipy==1.14.1
+pandas==2.2.2
+matplotlib==3.9.2
+pillow==10.4.0
+kiwisolver==1.4.7
+mne==1.8.0

@@ -6,12 +6,13 @@ from meg_qc.calculation.meg_qc_pipeline import make_derivative_meg_qc
 # ------------------------------------------------------------------
 # Path to the root of your BIDS MEG dataset.
 data_directory = "H:/_VIP/Python/MyWork/MEGqc/dataset/ds003483"
+
 # List of subject IDs to run the pipeline on
 # sub_list = 'all'
 sub_list = ['009']
 # sub_list = ['009','012','013','014','015']
 
-# # Path to the root of your EEG dataset.
+# # Path to the root of your EEG datas
 data_directory = "H:/Datos/MNI/BIDS_EEG/BIDS_Artifacts_Example"
 # # List of subject IDs to run the pipeline on
 # # sub_list = 'all'
