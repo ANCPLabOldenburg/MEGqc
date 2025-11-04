@@ -1,0 +1,49 @@
+{
+	"AssociatedEmptyRoom": "n/a",
+	"CapManufacturer": "n/a",
+	"CapManufacturersModelName": "n/a",
+	"ContinuousHeadLocalization": true,
+	"DeviceSerialNumber": "3058",
+	"DewarPosition": "upright",
+	"DigitizedHeadPoints": true,
+	"DigitizedLandmarks": true,
+	"ECGChannelCount": 0,
+	"ECOGChannelCount": 0,
+	"EEGChannelCount": 0,
+	"EEGPlacementScheme": "n/a",
+	"EEGReference": "n/a",
+	"EMGChannelCount": 0,
+	"EOGChannelCount": 0,
+	"EpochLength": 9999,
+	"HeadCoilFrequency": [169,176,183,190],
+	"InstitutionAddress": "Parque Cientifico y Tecnologico de la UPM, Crta. M40, Km. 38, 28223 Pozuelo de Alarcon, Madrid.",
+	"InstitutionName": "Centre for Biomedical Technology (CTB) - Technical University of Madrid (UPM)",
+	"InstitutionalDepartmentName": "Cognitive and Computational Neuroscience Laboratory (UPM - UCM)",
+	"Instructions": "induction",
+	"MEGChannelCount": 306,
+	"MEGREFChannelCount": 0,
+	"Manufacturer": "Elekta/Neuromag",
+	"ManufacturersModelName": "ElektaVectorview",
+	"MiscChannelCount": 0,
+	"PowerLineFrequency": 50,
+	"RecordingDuration": 1132,
+	"RecordingType": "continuous",
+	"SEEGChannelCount": 0,
+	"SamplingFrequency": 1000,
+	"SoftwareFilters": {
+		"OnlineLowPass": {
+			"FilterType": "Butterworth IIR via DSP",
+			"FilterOrder": "6th",
+			"LowCutoff": 330
+		},
+		"OnlineHighPass": {
+			"FilterType": "n/a",
+			"HighCutoff": 0.1
+		}
+	},
+	"SoftwareVersions": "Elekta Neuromag Data Acquisition Sofware Release 5.0",
+	"SubjectArtefactDescription": "n/a",
+	"TaskDescription": "induction",
+	"TaskName": "induction",
+	"TriggerChannelCount": 0
+}

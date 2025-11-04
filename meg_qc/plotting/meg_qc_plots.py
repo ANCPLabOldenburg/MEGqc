@@ -12,6 +12,7 @@ import gc
 from ancpbids import DatasetOptions
 import configparser
 from pathlib import Path
+import time
 
 # Get the absolute path of the parent directory of the current script
 parent_dir = os.path.dirname(os.getcwd())
@@ -545,12 +546,10 @@ class Deriv_to_plot:
         self.deriv_entity_obj = deriv_entity_obj
         self.raw_entity_name = raw_entity_name
 
-        # Find the subject ID using regex
-        match = re.search(r'sub-\d+_', self.deriv_entity_obj['name'])
-        if match:
-            self.subject = match.group(0).replace('sub-', '').rstrip('_')
-        else:
-            self.subject = None  # or handle the case where the subject ID is not found
+        # Extract subject ID using a BIDS-compliant regex (alphanumeric labels)
+        name = deriv_entity_obj.get('name', '') or ''
+        match = re.search(r'sub-([A-Za-z0-9]+)_', name)
+        self.subject = match.group(1) if match else None
 
     def __repr__(self):
 
@@ -678,6 +677,9 @@ def make_plots_meg_qc(dataset_path: str, n_jobs: int = 1):
     # Ensure plotting backend and report helpers are available
     _load_plotting_backend()
 
+    start_time = time.time()
+
+
     try:
         dataset = ancpbids.load_dataset(dataset_path, DatasetOptions(lazy_loading=True))
         schema = dataset.get_schema()
@@ -735,7 +737,7 @@ def make_plots_meg_qc(dataset_path: str, n_jobs: int = 1):
     }
     all_metrics = [valid_metrics[m] for m in all_metrics if m in valid_metrics]
     # Preserve order while removing duplicates
-    all_metrics = list(dict.fromkeys(all_metrics))
+    #all_metrics = list(dict.fromkeys(all_metrics))
 
     # Now store it in chosen_entities as a list
     chosen_entities = {
@@ -835,6 +837,13 @@ def make_plots_meg_qc(dataset_path: str, n_jobs: int = 1):
         for sub in chosen_entities['subject']
     )
 
+    end_time = time.time()
+    elapsed_seconds = end_time - start_time
+    print("---------------------------------------------------------------")
+    print("---------------------------------------------------------------")
+    print("---------------------------------------------------------------")
+    print("---------------------------------------------------------------")
+    print(f"PLOTTING MODULE FINISHED. Elapsed time: {elapsed_seconds:.2f} seconds.")
     return
 
 

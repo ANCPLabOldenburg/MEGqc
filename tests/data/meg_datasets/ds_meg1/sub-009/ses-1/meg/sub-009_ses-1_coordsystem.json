@@ -1,0 +1,11 @@
+{
+	"AnatomicalLandmarkCoordinateSystem": "ElektaNeuromag",
+	"AnatomicalLandmarkCoordinateSystemDescription": "Elekta/Neuromag head coordinates: RAS orientation and the origin between the ears.",
+	"AnatomicalLandmarkCoordinateUnits": "m",
+	"HeadCoilCoordinateSystem": "ElektaNeuromag",
+	"HeadCoilCoordinateSystemDescription": "Elekta/Neuromag head coordinates: RAS orientation and the origin between the ears.",
+	"HeadCoilCoordinateUnits": "m",
+	"MEGCoordinateSystem": "ElektaNeuromag",
+	"MEGCoordinateSystemDescription": "Neuromag head coordinates, orientation RAS, origin between the ears",
+	"MEGCoordinateUnits": "m"
+}

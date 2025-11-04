@@ -9,14 +9,12 @@
 # - The "Info" button next to the jobs spinbox shows detailed recommendations for n_jobs.
 
 import sys
-import time
 import os
 import signal
+import json
 import configparser
-import multiprocessing
-import traceback
 from pathlib import Path
-from typing import Dict
+from typing import Dict, Optional
 
 # Attempt to import psutil for accurate RAM info; if unavailable, fallback later
 try:
@@ -32,7 +30,7 @@ from PyQt6.QtWidgets import (
     QGroupBox, QSpinBox, QTabWidget, QScrollArea, QFrame, QMessageBox,
     QMenu               #  ← add this entry
 )
-from PyQt6.QtCore import QThread, pyqtSignal, Qt, QCoreApplication
+from PyQt6.QtCore import QObject, QProcess, pyqtSignal, Qt, QCoreApplication
 from PyQt6.QtGui import QPixmap, QIcon, QPalette, QColor  # for loading images, setting icon, and theme toggling
 
 # Core MEG QC pipeline functions
@@ -61,106 +59,197 @@ ICON_PATH = LOGO_PATH
 # megqcGUI.py
 
 # -----------------------------------------------------------------------------
-# This global function is our child‐process entry point. Because it's defined
-# at module level, it's picklable under Windows's 'spawn' start method.
-# On Unix, we call setsid() to create a new process session so that killpg()
-# can later cleanly terminate the entire group (parent + any joblib children).
-# On Windows, setsid() doesn't exist—so we catch AttributeError and continue.
+# Helper that mirrors the robust shutdown logic used in BIDS-Manager.
+# Given a PID, we terminate the full process tree so that joblib/loky
+# workers disappear alongside the main task.  We try ``killpg`` first to
+# cover POSIX platforms, then fall back to psutil (when available) or a
+# plain SIGTERM as a last resort.  The GUI process itself is never targeted.
 # -----------------------------------------------------------------------------
-# -----------------------------------------------------------------------------
-# Child‐process entry point must live at module level so Windows can pickle it.
-# On Unix, we call os.setsid() to create a new session (so killpg() kills
-# the entire group). On Windows setsid() doesn’t exist—so we catch it.
-# -----------------------------------------------------------------------------
-def _worker_target(func, args):
+def _terminate_process_tree(pid: int) -> None:
+    if pid <= 0:
+        return
+
+    # Avoid killing our own process group, which would close the GUI.
     try:
-        os.setsid()
-    except AttributeError:
-        # Windows: skip session setup
+        pgid = os.getpgid(pid)
+        if pgid != os.getpgid(0):
+            os.killpg(pgid, signal.SIGTERM)
+            return
+    except Exception:
+        # killpg not available (e.g. Windows) or call failed → fall through
         pass
 
+    if has_psutil:
+        try:
+            parent = psutil.Process(pid)
+        except psutil.NoSuchProcess:
+            return
+
+        children = parent.children(recursive=True)
+        for child in children:
+            try:
+                child.terminate()
+            except psutil.NoSuchProcess:
+                pass
+        psutil.wait_procs(children, timeout=3)
+        try:
+            parent.terminate()
+        except psutil.NoSuchProcess:
+            pass
+        return
+
+    # Fallback when psutil is not present: send SIGTERM to the PID.
     try:
-        func(*args)
+        os.kill(pid, signal.SIGTERM)
     except Exception:
-        traceback.print_exc()
-        # Non-zero exit signals error
-        sys.exit(1)
+        pass
 
 
-class Worker(QThread):
+class Worker(QObject):
+    """Run MEG-QC tasks in a detached Python process managed via ``QProcess``.
+
+    The design closely follows the strategy used in the external BIDS-Manager
+    project: each task runs in its own interpreter so the GUI remains
+    responsive, and we keep the process ID handy so we can terminate the
+    entire joblib tree if the user clicks “Stop”.  Signals mirror the previous
+    ``QThread`` API so the rest of the GUI code does not need to change.
     """
-    Runs a blocking function in a separate OS process group.
-    QThread is used only to integrate with Qt’s signal/slot system.
-    """
-    started  = pyqtSignal()
-    finished = pyqtSignal(float)  # elapsed time in seconds
-    error    = pyqtSignal(str)    # error message
+
+    started = pyqtSignal()
+    finished = pyqtSignal()
+    error = pyqtSignal(str)
 
     def __init__(self, func, *args):
         super().__init__()
-        self.func    = func
-        self.args    = args
-        self.process = None  # the multiprocessing.Process
+        self.func = func
+        self.args = args
+        self.process: Optional[QProcess] = None
+        self._stopped_by_user = False
+        self._had_error = False
 
-    def run(self):
-        # 1) notify GUI
+    # ------------------------------------------------------------------
+    # Process lifecycle helpers
+    # ------------------------------------------------------------------
+    def _build_payload(self) -> str:
+        """JSON-encode ``self.args`` converting Paths to strings recursively."""
+
+        def convert(value):
+            if isinstance(value, Path):
+                return str(value)
+            if isinstance(value, (list, tuple)):
+                return [convert(item) for item in value]
+            if isinstance(value, dict):
+                return {str(key): convert(val) for key, val in value.items()}
+            return value
+
+        normalized = [convert(arg) for arg in self.args]
+        return json.dumps(normalized, ensure_ascii=False)
+
+    def _cleanup(self) -> None:
+        """Release the ``QProcess`` instance and reset transient flags."""
+
+        if self.process is not None:
+            try:
+                self.process.finished.disconnect(self._on_finished)
+            except Exception:
+                pass
+            try:
+                self.process.errorOccurred.disconnect(self._on_error)
+            except Exception:
+                pass
+            try:
+                self.process.started.disconnect(self._on_started)
+            except Exception:
+                pass
+            self.process.deleteLater()
+        self.process = None
+        self._stopped_by_user = False
+        self._had_error = False
+
+    # ------------------------------------------------------------------
+    # Slots connected to QProcess signals
+    # ------------------------------------------------------------------
+    def _on_started(self) -> None:
         self.started.emit()
-        start_time = time.time()
 
-        # 2) spawn the subprocess
-        self.process = multiprocessing.Process(
-            target=_worker_target,
-            args=(self.func, self.args),
-        )
-        self.process.start()
-        self.process.join()  # blocks until the child exits
-
-        # 3) interpret exit code
-        if self.process.exitcode == -signal.SIGTERM:
-            # user-requested cancellation; no signal emitted
+    def _on_error(self, error: QProcess.ProcessError) -> None:
+        if self._stopped_by_user:
             return
 
-        if self.process.exitcode != 0:
-            # anything else is an error
-            self.error.emit(f"Process exited with code {self.process.exitcode}")
+        self._had_error = True
+        if error == QProcess.ProcessError.FailedToStart:
+            message = "Failed to start background process"
+        elif error == QProcess.ProcessError.Crashed:
+            message = "Background process crashed"
+        else:
+            message = "Background process encountered an unknown error"
+        self.error.emit(message)
+        self._cleanup()
+
+    def _on_finished(self, exit_code: int, status: QProcess.ExitStatus) -> None:
+        if self._stopped_by_user or self._had_error:
+            self._cleanup()
             return
 
-        # 4) success
-        elapsed = time.time() - start_time
-        self.finished.emit(elapsed)
-
-    def stop(self):
-        """
-        Stop the worker and all its children:
-          • Unix/Linux: send SIGTERM to the entire process group.
-          • Windows: walk the process tree with psutil and terminate each.
-        """
-        if not self.process or not self.process.is_alive():
+        if status != QProcess.ExitStatus.NormalExit:
+            self.error.emit("Background process exited unexpectedly")
+            self._cleanup()
             return
 
-        pid = self.process.pid
-        # --- Unix: kill entire process group at once ---
-        try:
-            os.killpg(os.getpgid(pid), signal.SIGTERM)
-            return
-        except (AttributeError, PermissionError):
-            # Windows (no killpg) or lack of permission → fall through
-            pass
+        if exit_code == 0:
+            self.finished.emit()
+        else:
+            self.error.emit(f"Process exited with code {exit_code}")
+        self._cleanup()
 
-        # --- Windows or fallback: terminate main + children via psutil ---
-        try:
-            parent = psutil.Process(pid)
-            # Recursively find all children, kill them first
-            children = parent.children(recursive=True)
-            for child in children:
-                child.terminate()
-            # Wait briefly for children to exit
-            psutil.wait_procs(children, timeout=3)
-            # Finally kill the parent
-            parent.terminate()
-        except (psutil.NoSuchProcess, psutil.AccessDenied):
-            # If psutil can’t find or can’t kill, fall back to brute-force
-            self.process.terminate()
+    # ------------------------------------------------------------------
+    # Public API used by the GUI
+    # ------------------------------------------------------------------
+    def start(self) -> None:
+        """Launch the worker process using ``python -m ...worker_entry``."""
+
+        if self.process is not None:
+            raise RuntimeError("Worker is already running")
+
+        entry_module = "meg_qc.miscellaneous.GUI.worker_entry"
+        func_path = f"{self.func.__module__}:{self.func.__name__}"
+        payload = self._build_payload()
+
+        process = QProcess(self)
+        process.setProcessChannelMode(QProcess.ProcessChannelMode.ForwardedChannels)
+        process.finished.connect(self._on_finished)
+        process.errorOccurred.connect(self._on_error)
+        process.started.connect(self._on_started)
+        process.setProgram(sys.executable)
+        process.setArguments(["-m", entry_module, "--func", func_path, "--args", payload])
+        self.process = process
+        process.start()
+
+        if process.error() == QProcess.ProcessError.FailedToStart:
+            # ``start()`` is asynchronous, but ``error()`` already knows if
+            # the executable could not be launched.  Trigger the handler
+            # manually so callers receive the signal immediately.
+            self._on_error(QProcess.ProcessError.FailedToStart)
+
+    def stop(self) -> None:
+        """Terminate the running process and its children, mirroring BIDS-Manager."""
+
+        if self.process is None:
+            return
+
+        if self.process.state() == QProcess.ProcessState.NotRunning:
+            self._cleanup()
+            return
+
+        self._stopped_by_user = True
+        pid = int(self.process.processId())
+        if pid > 0:
+            _terminate_process_tree(pid)
+
+        # ``kill`` complements the explicit tree teardown above.  When the
+        # child already exited this is a no-op, otherwise it ensures the GUI
+        # regains control even if the task ignores SIGTERM.
+        self.process.kill()
 
 
 class SettingsEditor(QWidget):
@@ -671,26 +760,26 @@ class MainWindow(QMainWindow):
         self.calc_subs.setPlaceholderText("all or IDs, e.g. 009,012")
         calc_form.addRow("Subjects:", self.calc_subs)
 
-        btn_run = QPushButton("Run Calculation")
-        btn_run.clicked.connect(self.start_calc)
-        btn_stop = QPushButton("Stop Calculation")
-        btn_stop.clicked.connect(self.stop_calc)
+        self.btn_calc_run = QPushButton("Run Calculation")
+        self.btn_calc_run.clicked.connect(self.start_calc)
+        self.btn_calc_stop = QPushButton("Stop Calculation")
+        self.btn_calc_stop.clicked.connect(self.stop_calc)
         row_btns = QWidget()
         btns_lay = QHBoxLayout(row_btns)
         btns_lay.setContentsMargins(0, 0, 0, 0)
-        btns_lay.addWidget(btn_run)
-        btns_lay.addWidget(btn_stop)
+        btns_lay.addWidget(self.btn_calc_run)
+        btns_lay.addWidget(self.btn_calc_stop)
         calc_form.addRow("", row_btns)
 
-        btn_gqi = QPushButton("Run GQI")
-        btn_gqi.clicked.connect(self.start_gqi)
-        btn_gqi_stop = QPushButton("Stop GQI")
-        btn_gqi_stop.clicked.connect(self.stop_gqi)
+        self.btn_gqi_run = QPushButton("Run GQI")
+        self.btn_gqi_run.clicked.connect(self.start_gqi)
+        self.btn_gqi_stop = QPushButton("Stop GQI")
+        self.btn_gqi_stop.clicked.connect(self.stop_gqi)
         row_gqi = QWidget()
         gqi_lay = QHBoxLayout(row_gqi)
         gqi_lay.setContentsMargins(0, 0, 0, 0)
-        gqi_lay.addWidget(btn_gqi)
-        gqi_lay.addWidget(btn_gqi_stop)
+        gqi_lay.addWidget(self.btn_gqi_run)
+        gqi_lay.addWidget(self.btn_gqi_stop)
         calc_form.addRow("", row_gqi)
 
         lay.addWidget(calc_box)
@@ -699,15 +788,15 @@ class MainWindow(QMainWindow):
         plot_box = QGroupBox("Plotting")
         plot_form = QFormLayout(plot_box)
 
-        btn_prun = QPushButton("Run Plotting")
-        btn_prun.clicked.connect(self.start_plot)
-        btn_pstop = QPushButton("Stop Plotting")
-        btn_pstop.clicked.connect(self.stop_plot)
+        self.btn_plot_run = QPushButton("Run Plotting")
+        self.btn_plot_run.clicked.connect(self.start_plot)
+        self.btn_plot_stop = QPushButton("Stop Plotting")
+        self.btn_plot_stop.clicked.connect(self.stop_plot)
         prow2 = QWidget()
         pl2 = QHBoxLayout(prow2)
         pl2.setContentsMargins(0, 0, 0, 0)
-        pl2.addWidget(btn_prun)
-        pl2.addWidget(btn_pstop)
+        pl2.addWidget(self.btn_plot_run)
+        pl2.addWidget(self.btn_plot_stop)
         plot_form.addRow("", prow2)
 
         lay.addWidget(plot_box)
@@ -781,17 +870,38 @@ class MainWindow(QMainWindow):
 
         # 3) Create the Worker, hook up signals → log
         worker = Worker(make_derivative_meg_qc, *args)
-        worker.started.connect(lambda: self.log.appendPlainText("Calculation started"))
-        worker.finished.connect(
-            lambda elapsed: self.log.appendPlainText(f"Calculation finished in {elapsed:.2f}s")
-        )
-        worker.error.connect(
-            lambda err: self.log.appendPlainText(f"Calculation error: {err}")
-        )
+        # Prevent launching the same task multiple times while it is already running.
+        self.btn_calc_run.setEnabled(False)
 
-        # 4) Launch and save
-        worker.start()
+        def on_started():
+            self.log.appendPlainText("Calculation started")
+
+        def on_finished():
+            # Successful completion: log and re-enable button for future runs.
+            self.log.appendPlainText("Calculation finished")
+            self.btn_calc_run.setEnabled(True)
+            self.workers.pop("calc", None)
+
+        def on_error(err: str):
+            # Error path: report and allow the user to retry.
+            self.log.appendPlainText(f"Calculation error: {err}")
+            self.btn_calc_run.setEnabled(True)
+            self.workers.pop("calc", None)
+
+        worker.started.connect(on_started)
+        worker.finished.connect(on_finished)
+        worker.error.connect(on_error)
+
+        # 4) Launch and save. Store the worker before starting to avoid race conditions
+        # where the thread finishes extremely quickly.
         self.workers["calc"] = worker
+        try:
+            worker.start()
+        except Exception as exc:
+            # Starting the worker can fail if the OS denies process creation.
+            self.log.appendPlainText(f"Calculation error: {exc}")
+            self.btn_calc_run.setEnabled(True)
+            self.workers.pop("calc", None)
 
 
     def stop_calc(self):
@@ -804,6 +914,8 @@ class MainWindow(QMainWindow):
         if worker:
             worker.stop()
             self.log.appendPlainText("Calculation stopped")
+            self.btn_calc_run.setEnabled(True)
+            self.workers.pop("calc", None)
 
 
     def start_plot(self):
@@ -827,17 +939,34 @@ class MainWindow(QMainWindow):
 
         # 3) Create Worker and wire signals
         worker = Worker(make_plots_meg_qc, *args)
-        worker.started.connect(lambda: self.log.appendPlainText("Plotting started"))
-        worker.finished.connect(
-            lambda elapsed: self.log.appendPlainText(f"Plotting finished in {elapsed:.2f}s")
-        )
-        worker.error.connect(
-            lambda err: self.log.appendPlainText(f"Plotting error: {err}")
-        )
+        # Prevent duplicate plotting runs until the active one ends.
+        self.btn_plot_run.setEnabled(False)
+
+        def on_started():
+            self.log.appendPlainText("Plotting started")
+
+        def on_finished():
+            self.log.appendPlainText("Plotting finished")
+            self.btn_plot_run.setEnabled(True)
+            self.workers.pop("plot", None)
+
+        def on_error(err: str):
+            self.log.appendPlainText(f"Plotting error: {err}")
+            self.btn_plot_run.setEnabled(True)
+            self.workers.pop("plot", None)
+
+        worker.started.connect(on_started)
+        worker.finished.connect(on_finished)
+        worker.error.connect(on_error)
 
         # 4) Launch and save
-        worker.start()
         self.workers["plot"] = worker
+        try:
+            worker.start()
+        except Exception as exc:
+            self.log.appendPlainText(f"Plotting error: {exc}")
+            self.btn_plot_run.setEnabled(True)
+            self.workers.pop("plot", None)
 
 
     def stop_plot(self):
@@ -850,23 +979,48 @@ class MainWindow(QMainWindow):
         if worker:
             worker.stop()
             self.log.appendPlainText("Plotting stopped")
+            self.btn_plot_run.setEnabled(True)
+            self.workers.pop("plot", None)
 
     def start_gqi(self):
         """Run Global Quality Index calculation only."""
         data_dir = self.data_dir.text().strip()
         args = (data_dir, str(SETTINGS_PATH))
         worker = Worker(generate_gqi_summary, *args)
-        worker.started.connect(lambda: self.log.appendPlainText("GQI started"))
-        worker.finished.connect(lambda e: self.log.appendPlainText(f"GQI finished in {e:.2f}s"))
-        worker.error.connect(lambda err: self.log.appendPlainText(f"GQI error: {err}"))
-        worker.start()
+        # Prevent concurrent GQI runs; enable again once finished or stopped.
+        self.btn_gqi_run.setEnabled(False)
+
+        def on_started():
+            self.log.appendPlainText("GQI started")
+
+        def on_finished():
+            self.log.appendPlainText("GQI finished")
+            self.btn_gqi_run.setEnabled(True)
+            self.workers.pop("gqi", None)
+
+        def on_error(err: str):
+            self.log.appendPlainText(f"GQI error: {err}")
+            self.btn_gqi_run.setEnabled(True)
+            self.workers.pop("gqi", None)
+
+        worker.started.connect(on_started)
+        worker.finished.connect(on_finished)
+        worker.error.connect(on_error)
         self.workers["gqi"] = worker
+        try:
+            worker.start()
+        except Exception as exc:
+            self.log.appendPlainText(f"GQI error: {exc}")
+            self.btn_gqi_run.setEnabled(True)
+            self.workers.pop("gqi", None)
 
     def stop_gqi(self):
         worker = self.workers.get("gqi")
         if worker:
             worker.stop()
             self.log.appendPlainText("GQI stopped")
+            self.btn_gqi_run.setEnabled(True)
+            self.workers.pop("gqi", None)
 
 
     # ──────────────────────────────── #
@@ -876,7 +1030,7 @@ class MainWindow(QMainWindow):
         self.log.appendPlainText(f"Starting {key} …")
         worker = Worker(func, *args)
         worker.finished.connect(
-            lambda t, k=key: self.log.appendPlainText(f"{k.capitalize()} finished in {t:.2f}s")
+            lambda k=key: self.log.appendPlainText(f"{k.capitalize()} finished")
         )
         worker.error.connect(
             lambda e, k=key: self.log.appendPlainText(f"{k.capitalize()} error: {e}")

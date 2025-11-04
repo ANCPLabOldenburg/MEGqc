@@ -11,6 +11,8 @@ import shutil
 import glob
 from typing import List, Union
 from joblib import Parallel, delayed
+import time
+
 
 # Needed to import the modules without specifying the full path, for command line and jupyter notebook
 sys.path.append(os.path.join('.'))
@@ -412,7 +414,17 @@ def check_config_saved_ask_user(dataset):
     #     print('___MEGqc___: ', 'There is already a config file used for this data set. Do you want to use it again?')
     #     #ask user if he wants to use the same config file again
 
-    entities = query_entities(dataset, scope='derivatives')
+    try:
+        entities = query_entities(dataset, scope='derivatives')
+    except TypeError:
+        # ``ancpbids.query.query_entities`` relies on ``query`` returning an iterable.
+        # On Windows, ``query`` can return ``None`` when the derivatives folder does not
+        # exist yet, raising a ``TypeError`` when ``query_entities`` tries to iterate over
+        # the result.  In that situation there are no previous config files to reuse, so
+        # we can safely treat the entity mapping as empty.
+        entities = {}
+    else:
+        entities = entities or {}
 
     # print('___MEGqc___: ', 'entities', entities)
 
@@ -1042,6 +1054,8 @@ def make_derivative_meg_qc(
         sub_list: Union[List[str], str] = 'all',
         n_jobs: int = 5  # Number of parallel jobs
 ):
+    start_time = time.time()
+
     ds_paths = check_ds_paths(ds_paths)
     internal_qc_params = get_internal_config_params(internal_config_file_path)
 
@@ -1141,6 +1155,14 @@ def make_derivative_meg_qc(
             generate_gqi_summary(dataset_path, config_file_path)
         except Exception as e:
             print("___MEGqc___: Failed to create global quality reports", e)
+
+    end_time = time.time()
+    elapsed_seconds = end_time - start_time
+    print("---------------------------------------------------------------")
+    print("---------------------------------------------------------------")
+    print("---------------------------------------------------------------")
+    print("---------------------------------------------------------------")
+    print(f"CALCULATION MODULE FINISHED. Elapsed time: {elapsed_seconds:.2f} seconds.")
 
     return
 
