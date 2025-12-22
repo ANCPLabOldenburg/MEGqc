@@ -31,7 +31,11 @@ import numpy as np
 from meg_qc.miscellaneous.optimizations.artifact_detection_ancp import annotate_muscle_zscore
 from typing import List
 from meg_qc.plotting.universal_plots import QC_derivative
-from meg_qc.calculation.initial_meg_qc import (load_data, save_meg_with_suffix)
+from meg_qc.calculation.initial_meg_qc import (
+    load_data,
+    remove_fif_and_splits,
+    save_meg_with_suffix,
+)
 
 def find_powerline_noise_short(raw, psd_params, psd_params_internal, m_or_g_chosen, channels):
 
@@ -223,7 +227,18 @@ def attach_dummy_data(raw: mne.io.Raw, attach_seconds: int = 5):
 
 
 
-def calculate_muscle_NO_threshold(raw_muscle_path, m_or_g_decided, muscle_params, threshold_muscle, muscle_freqs, cut_dummy, attach_sec, min_distance_between_different_muscle_events, muscle_str_joined, dataset_path):
+def calculate_muscle_NO_threshold(
+    raw_muscle_path,
+    m_or_g_decided,
+    muscle_params,
+    threshold_muscle,
+    muscle_freqs,
+    cut_dummy,
+    attach_sec,
+    min_distance_between_different_muscle_events,
+    muscle_str_joined,
+    derivatives_root,
+):
 
     """
     Calculate muscle artifacts without thresholding by user.
@@ -251,6 +266,8 @@ def calculate_muscle_NO_threshold(raw_muscle_path, m_or_g_decided, muscle_params
         The minimum distance between different muscle events in seconds.
     muscle_str_joined : str
         Notes about muscle detection to use as description.
+    derivatives_root : str
+        Base derivatives directory where temporary files should be stored.
     
     Returns
     -------
@@ -270,8 +287,13 @@ def calculate_muscle_NO_threshold(raw_muscle_path, m_or_g_decided, muscle_params
         z_score_details={}
 
         annot_muscle, scores_muscle = annotate_muscle_zscore(
-        raw_muscle_path,dataset_path, ch_type=m_or_g, threshold=threshold_muscle, min_length_good=muscle_params['min_length_good'],
-        filter_freq=muscle_freqs,)
+            raw_muscle_path,
+            derivatives_root,
+            ch_type=m_or_g,
+            threshold=threshold_muscle,
+            min_length_good=muscle_params['min_length_good'],
+            filter_freq=muscle_freqs,
+        )
         gc.collect()
 
         # Load raw muscle stage signal
@@ -351,7 +373,18 @@ def save_muscle_to_csv(file_name_prefix: str, raw: mne.io.Raw, scores_muscle: np
     return df_deriv
 
 
-def MUSCLE_meg_qc(muscle_params: dict, psd_params: dict, psd_params_internal: dict, channels: dict, data_path: str, noisy_freqs_global: dict, m_or_g_chosen:list, dataset_path: str, attach_dummy:bool = True, cut_dummy:bool = True):
+def MUSCLE_meg_qc(
+    muscle_params: dict,
+    psd_params: dict,
+    psd_params_internal: dict,
+    channels: dict,
+    data_path: str,
+    noisy_freqs_global: dict,
+    m_or_g_chosen: list,
+    derivatives_root: str,
+    attach_dummy: bool = True,
+    cut_dummy: bool = True,
+):
 
     """
     Detect muscle artifacts in MEG data. 
@@ -374,12 +407,15 @@ def MUSCLE_meg_qc(muscle_params: dict, psd_params: dict, psd_params_internal: di
         The parameters for PSD calculation originally defined in the internal config file. 
     channels : dict
         Dictionary with channels names separated by mag/grad
-    raw_orig : mne.io.Raw
-        The raw data.
+    data_path : str
+        The raw data file path.
     noisy_freqs_global : List
         The powerline frequencies found in the data by previously running PSD_meg_qc.
     m_or_g_chosen : List
         The channel types chosen for the analysis: 'mag' or 'grad'.
+    derivatives_root : str
+        Absolute path to the dataset-specific derivatives directory where
+        temporary and output files should be written.
     attach_dummy : bool
         Whether to attach dummy data to the start and end of the recording to avoid filtering artifacts. Default is True.
     cut_dummy : bool
@@ -441,7 +477,12 @@ def MUSCLE_meg_qc(muscle_params: dict, psd_params: dict, psd_params_internal: di
     raw = filter_noise_before_muscle_detection(raw, noisy_freqs_global, muscle_freqs)
 
     # Save filtered
-    raw_muscle_path = save_meg_with_suffix(data_path, dataset_path, raw, final_suffix="MUSCLE_FILTERED")
+    raw_muscle_path = save_meg_with_suffix(
+        data_path,
+        derivatives_root,
+        raw,
+        final_suffix="MUSCLE_FILTERED",
+    )
     # Clean filtered
     del raw
     del raw_orig
@@ -452,7 +493,18 @@ def MUSCLE_meg_qc(muscle_params: dict, psd_params: dict, psd_params_internal: di
     min_distance_between_different_muscle_events = muscle_params['min_distance_between_different_muscle_events']  # seconds
 
     time.sleep(3)
-    simple_metric, scores_muscle, df_deriv = calculate_muscle_NO_threshold(raw_muscle_path, m_or_g_decided, muscle_params, threshold_muscle_list[0], muscle_freqs, cut_dummy, attach_sec, min_distance_between_different_muscle_events, muscle_str_joined,dataset_path)
+    simple_metric, scores_muscle, df_deriv = calculate_muscle_NO_threshold(
+        raw_muscle_path,
+        m_or_g_decided,
+        muscle_params,
+        threshold_muscle_list[0],
+        muscle_freqs,
+        cut_dummy,
+        attach_sec,
+        min_distance_between_different_muscle_events,
+        muscle_str_joined,
+        derivatives_root,
+    )
 
-    os.remove(raw_muscle_path)
+    remove_fif_and_splits(raw_muscle_path)
     return df_deriv, simple_metric, muscle_str_joined, scores_muscle

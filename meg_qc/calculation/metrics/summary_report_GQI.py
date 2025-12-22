@@ -4,6 +4,7 @@
 import os
 import json
 import glob
+import re
 import configparser
 from statistics import mean
 from typing import Union, Optional, Dict
@@ -45,6 +46,59 @@ def _safe_dataframe(obj):
     except ValueError:
         # Fall back to single-row construction for scalar dictionaries
         return pd.DataFrame([{k: v for k, v in obj.items()}])
+
+
+def _format_count_percent(count: Optional[float], percent: Optional[float]) -> str:
+    """Return a human readable string for channel counts and percentages.
+
+    When either ``count`` or ``percent`` is missing the function returns
+    ``"NA"`` so that tables keep their column layout even for systems that do
+    not provide both sensor types (e.g. CTF which only has gradiometers).
+    """
+
+    if count is None and percent is None:
+        return "NA"
+    if count is None:
+        return f"NA ({percent:.1f}%)" if percent is not None else "NA"
+    if percent is None:
+        return str(count)
+    return f"{count} ({percent:.1f}%)"
+
+
+def _extract_task_label(path: str) -> str:
+    """Return the BIDS task label encoded in ``path`` if present.
+
+    Filenames produced by the MEG QC pipeline follow the BIDS convention and
+    often include a ``task-<label>`` entity. This helper extracts that label so
+    group-level tables can display which task each row corresponds to. When no
+    task entity is found, an empty string is returned to avoid introducing a
+    placeholder that might be misinterpreted as a valid task name.
+    """
+
+    match = re.search(r"(?<=_task-)[^_]+", os.path.basename(path))
+    return match.group(0) if match else ""
+
+
+def _get_sensor_param(section: dict, subsection: str, param: str, preferred: str = "mag", fallback: str = "grad"):
+    """Return a sensor-specific parameter preferring magnetometers when present.
+
+    Elekta datasets expose both magnetometer and gradiometer entries. CTF data
+    only provides gradiometers, so we fall back to ``fallback`` when the
+    ``preferred`` sensor entry is missing. Returning ``"NA"`` ensures that the
+    summary table retains the same column layout for concatenation across
+    systems.
+    """
+
+    container = _safe_dict(_safe_dict(section).get(subsection))
+    preferred_section = _safe_dict(container.get(preferred))
+    if preferred_section and preferred_section.get(param) is not None:
+        return preferred_section.get(param)
+
+    fallback_section = _safe_dict(container.get(fallback))
+    if fallback_section and fallback_section.get(param) is not None:
+        return fallback_section.get(param)
+
+    return "NA"
 
 
 # ---------------------------------------------------------------------------
@@ -90,21 +144,36 @@ def create_summary_report(
     # Extract PSD noise information for magnetometers and gradiometers
     psd_details_mag = _safe_dict(_safe_dict(psd_global.get("mag")).get("details"))
     psd_details_grad = _safe_dict(_safe_dict(psd_global.get("grad")).get("details"))
+
+    has_mag_psd = bool(psd_details_mag)
+    has_grad_psd = bool(psd_details_grad)
+
     # Percentage of power attributed to noise for each sensor type
-    noisy_power_mag = sum(
-        d.get("percent_of_this_noise_ampl_relative_to_all_signal_global", 0)
-        for d in psd_details_mag.values()
+    noisy_power_mag = (
+        sum(
+            d.get("percent_of_this_noise_ampl_relative_to_all_signal_global", 0)
+            for d in psd_details_mag.values()
+        )
+        if has_mag_psd
+        else None
     )
-    noisy_power_grad = sum(
-        d.get("percent_of_this_noise_ampl_relative_to_all_signal_global", 0)
-        for d in psd_details_grad.values()
+    noisy_power_grad = (
+        sum(
+            d.get("percent_of_this_noise_ampl_relative_to_all_signal_global", 0)
+            for d in psd_details_grad.values()
+        )
+        if has_grad_psd
+        else None
     )
-    # Average noise level across available sensor types
-    if psd_details_mag and psd_details_grad:
+
+    # Average noise level across available sensor types. For CTF data only the
+    # gradiometer branch is available, but Elekta data (mag+grad) keeps the
+    # original averaging behaviour unchanged.
+    if has_mag_psd and has_grad_psd:
         M_psd = mean([noisy_power_mag, noisy_power_grad])
-    elif psd_details_mag:
+    elif has_mag_psd:
         M_psd = noisy_power_mag
-    elif psd_details_grad:
+    elif has_grad_psd:
         M_psd = noisy_power_grad
     else:
         M_psd = None
@@ -146,12 +215,13 @@ def create_summary_report(
         """Return a table summarising noisy and flat channels."""
         rows = []
         for sensor_type in ["mag", "grad"]:
-            n_noisy = source[sensor_type]["number_of_noisy_ch"]
-            p_noisy = source[sensor_type]["percent_of_noisy_ch"]
-            n_flat = source[sensor_type]["number_of_flat_ch"]
-            p_flat = source[sensor_type]["percent_of_flat_ch"]
-            rows.append({"Metric": "Noisy Channels", sensor_type: f"{n_noisy} ({p_noisy:.1f}%)"})
-            rows.append({"Metric": "Flat Channels", sensor_type: f"{n_flat} ({p_flat:.1f}%)"})
+            data_for_sensor = _safe_dict(_safe_dict(source).get(sensor_type))
+            n_noisy = data_for_sensor.get("number_of_noisy_ch")
+            p_noisy = data_for_sensor.get("percent_of_noisy_ch")
+            n_flat = data_for_sensor.get("number_of_flat_ch")
+            p_flat = data_for_sensor.get("percent_of_flat_ch")
+            rows.append({"Metric": "Noisy Channels", sensor_type: _format_count_percent(n_noisy, p_noisy)})
+            rows.append({"Metric": "Flat Channels", sensor_type: _format_count_percent(n_flat, p_flat)})
         df = pd.DataFrame(rows)
         df = df.groupby("Metric").first().reset_index()
         df.rename(columns={"mag": "MAGNETOMETERS", "grad": "GRADIOMETERS"}, inplace=True)
@@ -160,16 +230,12 @@ def create_summary_report(
     if std_present:
         general_df = build_summary_table(data["STD"]["STD_all_time_series"])
         std_epoch_df = _safe_dataframe(data["STD"].get("STD_epoch", {}))
-        std_lvl = data["STD"]["STD_all_time_series"]["mag"].get("std_lvl", "NA")
+        std_lvl = _get_sensor_param(data.get("STD", {}), "STD_all_time_series", "std_lvl")
         # ``STD_epoch`` can be ``null`` in the metrics JSON. Applying ``_safe_dict``
         # twice ensures we always operate on a dictionary before requesting the
-        # magnetometer multiplier.
-        std_epoch_lvl = (
-            _safe_dict(
-                _safe_dict(
-                    _safe_dict(data.get("STD", {})).get("STD_epoch")
-                ).get("mag")
-            ).get("noisy_channel_multiplier", "NA")
+        # sensor multiplier. For CTF data the value is taken from gradiometers.
+        std_epoch_lvl = _get_sensor_param(
+            data.get("STD", {}), "STD_epoch", "noisy_channel_multiplier"
         )
     else:
         general_df = pd.DataFrame()
@@ -180,16 +246,13 @@ def create_summary_report(
     if ptp_present:
         ptp_df = build_summary_table(data["PTP_MANUAL"]["ptp_manual_all"])
         ptp_epoch_df = _safe_dataframe(data["PTP_MANUAL"].get("ptp_manual_epoch", {}))
-        ptp_lvl = data["PTP_MANUAL"]["ptp_manual_all"]["mag"].get("ptp_lvl", "NA")
+        ptp_lvl = _get_sensor_param(data.get("PTP_MANUAL", {}), "ptp_manual_all", "ptp_lvl")
         # ``ptp_manual_epoch`` can also be ``null``. By wrapping the nested
         # ``get`` calls with ``_safe_dict`` we ensure a default dictionary and
-        # avoid ``AttributeError`` when extracting the multiplier.
-        ptp_epoch_lvl = (
-            _safe_dict(
-                _safe_dict(
-                    _safe_dict(data.get("PTP_MANUAL", {})).get("ptp_manual_epoch")
-                ).get("mag")
-            ).get("noisy_channel_multiplier", "NA")
+        # avoid ``AttributeError`` when extracting the multiplier. For CTF data
+        # the gradiometer entry is used instead of failing on the missing mag.
+        ptp_epoch_lvl = _get_sensor_param(
+            data.get("PTP_MANUAL", {}), "ptp_manual_epoch", "noisy_channel_multiplier"
         )
     else:
         ptp_df = pd.DataFrame()
@@ -202,8 +265,12 @@ def create_summary_report(
         df = pd.DataFrame([
             {"Metric": "Noise Power", "mag": noise_mag, "grad": noise_grad}
         ])
-        df["mag"] = df["mag"].map(lambda v: f"{v:.2f}%")
-        df["grad"] = df["grad"].map(lambda v: f"{v:.2f}%")
+
+        def _fmt_noise(val):
+            return f"{val:.2f}%" if val is not None else "NA"
+
+        df["mag"] = df["mag"].map(_fmt_noise)
+        df["grad"] = df["grad"].map(_fmt_noise)
         df.rename(columns={"mag": "MAGNETOMETERS", "grad": "GRADIOMETERS"}, inplace=True)
         return df
 
@@ -596,7 +663,7 @@ def create_group_metrics_figure(tsv_path: Union[str, os.PathLike], output_png: U
 
 
 
-def generate_gqi_summary(dataset_path: str, config_file: str) -> None:
+def generate_gqi_summary(dataset_path: str, derivatives_root: str, config_file: str) -> None:
     """Generate Global Quality Index summaries from existing metrics."""
     # Load user configuration to retrieve GQI settings
     qc_params = get_all_config_params(config_file)
@@ -604,8 +671,8 @@ def generate_gqi_summary(dataset_path: str, config_file: str) -> None:
         return
     gqi_params = qc_params.get("GlobalQualityIndex")
 
-    calc_dir = os.path.join(dataset_path, "derivatives", "Meg_QC", "calculation")
-    reports_root = os.path.join(dataset_path, "derivatives", "Meg_QC", "summary_reports")
+    calc_dir = os.path.join(derivatives_root, "Meg_QC", "calculation")
+    reports_root = os.path.join(derivatives_root, "Meg_QC", "summary_reports")
     os.makedirs(reports_root, exist_ok=True)
 
     # Create a new attempt folder using incremental numbering
@@ -626,23 +693,28 @@ def generate_gqi_summary(dataset_path: str, config_file: str) -> None:
         out_json = os.path.join(out_sub, base)
         # Generate per-subject summary JSON (no HTML)
         create_summary_report(json_path, None, out_json, gqi_params)
-        summary_paths.append(out_json)
+        task_label = _extract_task_label(json_path)
+        summary_paths.append((out_json, task_label))
 
     # Collate per-subject summaries into a group table and figure
     group_dir = os.path.join(reports_root, "group_metrics")
     os.makedirs(group_dir, exist_ok=True)
     from meg_qc.calculation.meg_qc_pipeline import flatten_summary_metrics
     rows = []
-    for path in summary_paths:
+    for path, task in summary_paths:
         # Flatten each summary JSON into a one-row dictionary
         with open(path, "r", encoding="utf-8") as f:
             js = json.load(f)
         subject = os.path.basename(os.path.dirname(path))
-        row = {"subject": subject}
+        row = {"task": task, "subject": subject}
         row.update(flatten_summary_metrics(js))
         rows.append(row)
     if rows:
         df = pd.DataFrame(rows)
+        # Ensure the task column is the first column of the table
+        cols = df.columns.tolist()
+        cols.insert(0, cols.pop(cols.index("task")))
+        df = df[cols]
         tsv_file = os.path.join(group_dir, f"Global_Quality_Index_attempt_{attempt}.tsv")
         df.to_csv(tsv_file, sep="\t", index=False)
         png_file = os.path.join(group_dir, f"Global_Quality_Index_attempt_{attempt}.png")

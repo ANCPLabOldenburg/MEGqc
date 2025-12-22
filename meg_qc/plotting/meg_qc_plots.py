@@ -13,6 +13,9 @@ from ancpbids import DatasetOptions
 import configparser
 from pathlib import Path
 import time
+from typing import Tuple, Optional
+from contextlib import contextmanager
+import tempfile
 
 # Get the absolute path of the parent directory of the current script
 parent_dir = os.path.dirname(os.getcwd())
@@ -74,6 +77,57 @@ def _load_plotting_backend():
 
 
 _load_plotting_backend()
+
+
+def resolve_output_roots(dataset_path: str, external_derivatives_root: Optional[str]) -> Tuple[str, str]:
+    """Return dataset output root and derivatives folder respecting overrides."""
+
+    ds_name = os.path.basename(os.path.normpath(dataset_path))
+    output_root = dataset_path if external_derivatives_root is None else os.path.join(external_derivatives_root, ds_name)
+    derivatives_root = os.path.join(output_root, 'derivatives')
+    os.makedirs(derivatives_root, exist_ok=True)
+    return output_root, derivatives_root
+
+
+def build_overlay_dataset(dataset_path: str, derivatives_root: str):
+    """Create a temporary overlay so ANCPBIDS sees external derivatives.
+
+    ANCPBIDS expects the derivatives folder to live under the dataset root. When
+    users direct outputs to an external path, we mirror the original dataset via
+    symlinks into a temporary directory and drop a ``derivatives`` link that
+    points to the external location. All symlinks stay outside the original
+    dataset, so read-only datasets remain untouched.
+    """
+
+    overlay_tmp = tempfile.TemporaryDirectory(prefix='megqc_bids_overlay_')
+    overlay_root = overlay_tmp.name
+
+    for entry in os.listdir(dataset_path):
+        if entry == 'derivatives':
+            # Never point back to the original derivatives tree; we want the
+            # external one to be used instead.
+            continue
+
+        src = os.path.join(dataset_path, entry)
+        dst = os.path.join(overlay_root, entry)
+
+        if not os.path.exists(dst):
+            os.symlink(src, dst)
+
+    os.symlink(derivatives_root, os.path.join(overlay_root, 'derivatives'))
+    return overlay_tmp, overlay_root
+
+
+@contextmanager
+def temporary_dataset_base(dataset, base_dir: str):
+    """Temporarily repoint the ANCPBIDS dataset to a new base directory."""
+
+    original_base = getattr(dataset, 'base_dir_', None)
+    dataset.base_dir_ = base_dir
+    try:
+        yield
+    finally:
+        dataset.base_dir_ = original_base
 
 # IMPORTANT: keep this order of imports, first need to add parent dir to sys.path, then import from it.
 
@@ -241,7 +295,7 @@ def select_subcategory(subcategories: List, category_title: str, window_title: s
     return results, quit_selector
 
 
-def get_ds_entities(dataset, calculated_derivs_folder: str):
+def get_ds_entities(dataset, calculated_derivs_folder: str, output_root: str):
 
     """
     Get the entities of the dataset using ancpbids, only get derivative entities, not all raw data.
@@ -252,6 +306,9 @@ def get_ds_entities(dataset, calculated_derivs_folder: str):
         The dataset object.
     calculated_derivs_folder : str
         The path to the calculated derivatives folder.
+    output_root : str
+        Base directory where derivatives are stored (may differ from the
+        original BIDS dataset when users provide an external location).
 
     Returns
     -------
@@ -260,12 +317,26 @@ def get_ds_entities(dataset, calculated_derivs_folder: str):
 
     """
 
-    try:
-        entities = dataset.query_entities(scope=calculated_derivs_folder)
-        print('___MEGqc___: ', 'Entities found in the dataset: ', entities)
-        #we only get entities of calculated derivatives here, not entire raw ds.
-    except:
+    def _safe_query_entities():
+        """Query entities while tolerating empty results/Windows ``None`` returns."""
+
+        try:
+            return dataset.query_entities(scope=calculated_derivs_folder) or {}
+        except TypeError:
+            # ``query_entities`` can raise ``TypeError`` when ``query`` returns
+            # ``None`` (e.g., when a derivatives folder does not exist yet on
+            # some platforms). Treat that situation as an empty mapping so we
+            # can try fallbacks before failing.
+            return {}
+
+    with temporary_dataset_base(dataset, output_root):
+        entities = _safe_query_entities()
+
+    if not entities:
         raise FileNotFoundError(f'___MEGqc___: No calculated derivatives found for this ds!')
+
+    print('___MEGqc___: ', 'Entities found in the dataset: ', entities)
+    # we only get entities of calculated derivatives here, not entire raw ds.
 
     return entities
 
@@ -593,82 +664,84 @@ def process_subject(
         derivs_to_plot: list,
         chosen_entities: dict,
         plot_settings: dict,
+        output_root: str,
 ):
     """Plot all metrics for a single subject."""
 
-    derivative = dataset.create_derivative(name="Meg_QC")
-    derivative.dataset_description.GeneratedBy.Name = "MEG QC Pipeline"
-    reports_folder = derivative.create_folder(name='reports')
-    subject_folder = reports_folder.create_folder(name='sub-' + sub)
+    with temporary_dataset_base(dataset, output_root):
+        derivative = dataset.create_derivative(name="Meg_QC")
+        derivative.dataset_description.GeneratedBy.Name = "MEG QC Pipeline"
+        reports_folder = derivative.create_folder(name='reports')
+        subject_folder = reports_folder.create_folder(name='sub-' + sub)
 
-    existing_raws_per_sub = list(set(
-        d.raw_entity_name for d in derivs_to_plot if d.subject == sub
-    ))
+        existing_raws_per_sub = list(set(
+            d.raw_entity_name for d in derivs_to_plot if d.subject == sub
+        ))
 
-    for raw_entity_name in existing_raws_per_sub:
-        derivs_for_this_raw = [
-            d for d in derivs_to_plot if d.raw_entity_name == raw_entity_name
-        ]
+        for raw_entity_name in existing_raws_per_sub:
+            derivs_for_this_raw = [
+                d for d in derivs_to_plot if d.raw_entity_name == raw_entity_name
+            ]
 
-        raw_entities_base = derivs_for_this_raw[0].deriv_entity_obj
+            raw_entities_base = derivs_for_this_raw[0].deriv_entity_obj
 
-        raw_info_path = None
-        report_str_path = None
-        simple_metrics_path = None
-        for d in derivs_for_this_raw:
-            if d.metric == 'RawInfo':
-                raw_info_path = d.path
-            elif d.metric == 'ReportStrings':
-                report_str_path = d.path
-            elif d.metric == 'SimpleMetrics':
-                simple_metrics_path = d.path
+            raw_info_path = None
+            report_str_path = None
+            simple_metrics_path = None
+            for d in derivs_for_this_raw:
+                if d.metric == 'RawInfo':
+                    raw_info_path = d.path
+                elif d.metric == 'ReportStrings':
+                    report_str_path = d.path
+                elif d.metric == 'SimpleMetrics':
+                    simple_metrics_path = d.path
 
-        metrics_to_plot = [
-            m for m in chosen_entities['METRIC']
-            if m not in ['RawInfo', 'ReportStrings', 'SimpleMetrics']
-        ]
+            metrics_to_plot = [
+                m for m in chosen_entities['METRIC']
+                if m not in ['RawInfo', 'ReportStrings', 'SimpleMetrics']
+            ]
 
-        for metric in metrics_to_plot:
-            tsv_paths = [d.path for d in derivs_for_this_raw if d.metric == metric]
-            if not tsv_paths:
-                print(f'___MEGqc___: No tsvs found for {metric} / subject {sub}')
-                continue
+            for metric in metrics_to_plot:
+                tsv_paths = [d.path for d in derivs_for_this_raw if d.metric == metric]
+                if not tsv_paths:
+                    print(f'___MEGqc___: No tsvs found for {metric} / subject {sub}')
+                    continue
 
-            tsvs_for_this_raw = [d for d in derivs_for_this_raw if d.metric == metric]
-            raw_entities_to_write = tsvs_for_this_raw[0].deriv_entity_obj
+                tsvs_for_this_raw = [d for d in derivs_for_this_raw if d.metric == metric]
+                raw_entities_to_write = tsvs_for_this_raw[0].deriv_entity_obj
 
-            html_report = csv_to_html_report(
-                raw_info_path,
-                metric,
-                tsv_paths,
-                report_str_path,
-                plot_settings,
-            )
+                html_report = csv_to_html_report(
+                    raw_info_path,
+                    metric,
+                    tsv_paths,
+                    report_str_path,
+                    plot_settings,
+                )
 
-            meg_artifact = subject_folder.create_artifact(raw=raw_entities_to_write)
-            meg_artifact.add_entity('desc', metric)
-            meg_artifact.suffix = 'meg'
-            meg_artifact.extension = '.html'
+                meg_artifact = subject_folder.create_artifact(raw=raw_entities_to_write)
+                meg_artifact.add_entity('desc', metric)
+                meg_artifact.suffix = 'meg'
+                meg_artifact.extension = '.html'
 
-            meg_artifact.content = lambda file_path, rep=html_report: rep.save(
-                file_path, overwrite=True, open_browser=False
-            )
+                meg_artifact.content = lambda file_path, rep=html_report: rep.save(
+                    file_path, overwrite=True, open_browser=False
+                )
 
-        if report_str_path and simple_metrics_path:
-            summary_html = make_summary_qc_report(report_str_path, simple_metrics_path)
-            meg_artifact = subject_folder.create_artifact(raw=raw_entities_base)
-            meg_artifact.add_entity('desc', 'summary_qc_report')
-            meg_artifact.suffix = 'meg'
-            meg_artifact.extension = '.html'
-            meg_artifact.content = (
-                lambda file_path, cont=summary_html: open(file_path, "w", encoding="utf-8").write(cont)
-            )
+            if report_str_path and simple_metrics_path:
+                summary_html = make_summary_qc_report(report_str_path, simple_metrics_path)
+                meg_artifact = subject_folder.create_artifact(raw=raw_entities_base)
+                meg_artifact.add_entity('desc', 'summary_qc_report')
+                meg_artifact.suffix = 'meg'
+                meg_artifact.extension = '.html'
+                meg_artifact.content = (
+                    lambda file_path, cont=summary_html: open(file_path, "w", encoding="utf-8").write(cont)
+                )
 
-    ancpbids.write_derivative(dataset, derivative)
+        ancpbids.write_derivative(dataset, derivative)
     return
 
 
-def make_plots_meg_qc(dataset_path: str, n_jobs: int = 1):
+def make_plots_meg_qc(dataset_path: str, n_jobs: int = 1, derivatives_base: Optional[str] = None):
     """
     Create plots for the MEG QC pipeline, but WITHOUT the interactive selector.
     Instead, we assume 'all' for every entity (subject, task, session, run, metric).
@@ -688,11 +761,22 @@ def make_plots_meg_qc(dataset_path: str, n_jobs: int = 1):
               'No data found in the given directory path! \nCheck directory path in config file and presence of data.')
         return
 
-    # Make sure the derivatives folder exists:
-    derivatives_path = os.path.join(dataset_path, 'derivatives')
-    if not os.path.isdir(derivatives_path):
-        os.mkdir(derivatives_path)
-        print('___MEGqc___: Derivs folder was not found! Created new.')
+    output_root, derivatives_root = resolve_output_roots(dataset_path, derivatives_base)
+    print(f"___MEGqc___: Reading derivatives from: {derivatives_root}")
+
+    query_dataset = dataset
+    query_base = output_root
+    overlay_tmp = None
+
+    # If derivatives live outside the original dataset, build a lightweight
+    # overlay tree that symlinks the read-only BIDS dataset alongside the
+    # external derivatives. This keeps ancpbids happy without touching the
+    # original dataset on disk.
+    if os.path.abspath(output_root) != os.path.abspath(dataset_path):
+        overlay_tmp, overlay_root = build_overlay_dataset(dataset_path, derivatives_root)
+        query_base = overlay_root
+        query_dataset = ancpbids.load_dataset(overlay_root, DatasetOptions(lazy_loading=True))
+        print(f"___MEGqc___: Using overlay dataset for queries at: {overlay_root}")
 
     calculated_derivs_folder = os.path.join('derivatives', 'Meg_QC', 'calculation')
 
@@ -700,7 +784,7 @@ def make_plots_meg_qc(dataset_path: str, n_jobs: int = 1):
     # REPLACE THE SELECTOR WITH A HARDCODED "ALL" CHOICE
     # --------------------------------------------------------------------------------
     # 1) Get all discovered entities from the derivatives scope
-    entities_found = get_ds_entities(dataset, calculated_derivs_folder)
+    entities_found = get_ds_entities(query_dataset, calculated_derivs_folder, query_base)
 
     # Suppose 'description' is the metric list
     all_metrics = entities_found.get('description', [])
@@ -762,88 +846,96 @@ def make_plots_meg_qc(dataset_path: str, n_jobs: int = 1):
     print('___MEGqc___: CHOSEN settings:', plot_settings)
     # --------------------------------------------------------------------------------
 
-    # 2. Collect TSVs for each sub + metric
-    tsvs_to_plot_by_metric = {}
-    tsv_entities_by_metric = {}
+    try:
+        # 2. Collect TSVs for each sub + metric
+        tsvs_to_plot_by_metric = {}
+        tsv_entities_by_metric = {}
 
-    for metric in chosen_entities['METRIC']:
-        query_args = {
-            'subj': chosen_entities['subject'],
-            'task': chosen_entities['task'],
-            'suffix': 'meg',
-            'extension': ['tsv', 'json', 'fif'],
-            'return_type': 'filename',
-            'desc': '',
-            'scope': calculated_derivs_folder,
-        }
+        for metric in chosen_entities['METRIC']:
+            query_args = {
+                'subj': chosen_entities['subject'],
+                'task': chosen_entities['task'],
+                'suffix': 'meg',
+                'extension': ['tsv', 'json', 'fif'],
+                'return_type': 'filename',
+                'desc': '',
+                'scope': calculated_derivs_folder,
+            }
 
-        # If the user (now "all") had multiple possible descs for PSDs, ECGs, etc.
-        if metric == 'PSDs':
-            # Include all PSD derivatives (noise and waves) so the PSD report is
-            # generated correctly.
-            query_args['desc'] = ['PSDs', 'PSDnoiseMag', 'PSDnoiseGrad', 'PSDwavesMag', 'PSDwavesGrad']
-        elif metric == 'ECGs':
-            query_args['desc'] = ['ECGchannel', 'ECGs']
-        elif metric == 'EOGs':
-            query_args['desc'] = ['EOGchannel', 'EOGs']
-        else:
-            query_args['desc'] = [metric]
+            # If the user (now "all") had multiple possible descs for PSDs, ECGs, etc.
+            if metric == 'PSDs':
+                # Include all PSD derivatives (noise and waves) so the PSD report is
+                # generated correctly.
+                query_args['desc'] = ['PSDs', 'PSDnoiseMag', 'PSDnoiseGrad', 'PSDwavesMag', 'PSDwavesGrad']
+            elif metric == 'ECGs':
+                query_args['desc'] = ['ECGchannel', 'ECGs']
+            elif metric == 'EOGs':
+                query_args['desc'] = ['EOGchannel', 'EOGs']
+            else:
+                query_args['desc'] = [metric]
 
-        # Optional session/run
-        if chosen_entities['session']:
-            query_args['session'] = chosen_entities['session']
-        if chosen_entities['run']:
-            query_args['run'] = chosen_entities['run']
+            # Optional session/run
+            if chosen_entities['session']:
+                query_args['session'] = chosen_entities['session']
+            if chosen_entities['run']:
+                query_args['run'] = chosen_entities['run']
 
-        tsv_paths = list(dataset.query(**query_args))
-        tsvs_to_plot_by_metric[metric] = sorted(tsv_paths)
+            with temporary_dataset_base(query_dataset, query_base):
+                tsv_paths = list(query_dataset.query(**query_args))
+            tsvs_to_plot_by_metric[metric] = sorted(tsv_paths)
 
-        # Now query object form for ancpbids entities
-        query_args['return_type'] = 'object'
-        entities_obj = sorted(list(dataset.query(**query_args)), key=lambda k: k['name'])
-        tsv_entities_by_metric[metric] = entities_obj
+            # Now query object form for ancpbids entities
+            query_args['return_type'] = 'object'
+            with temporary_dataset_base(query_dataset, query_base):
+                entities_obj = sorted(list(query_dataset.query(**query_args)), key=lambda k: k['name'])
+            tsv_entities_by_metric[metric] = entities_obj
 
-    # Convert them into a list of Deriv_to_plot objects
-    derivs_to_plot = []
-    for (tsv_metric, tsv_paths), (entity_metric, entity_vals) in zip(
-        tsvs_to_plot_by_metric.items(),
-        tsv_entities_by_metric.items()
-    ):
-        if tsv_metric != entity_metric:
-            raise ValueError('Different metrics in tsvs_to_plot_by_metric and entities_per_file')
-        if len(tsv_paths) != len(entity_vals):
-            raise ValueError(f'Different number of tsvs and entities for metric: {tsv_metric}')
+        # Convert them into a list of Deriv_to_plot objects
+        derivs_to_plot = []
+        for (tsv_metric, tsv_paths), (entity_metric, entity_vals) in zip(
+            tsvs_to_plot_by_metric.items(),
+            tsv_entities_by_metric.items()
+        ):
+            if tsv_metric != entity_metric:
+                raise ValueError('Different metrics in tsvs_to_plot_by_metric and entities_per_file')
+            if len(tsv_paths) != len(entity_vals):
+                raise ValueError(f'Different number of tsvs and entities for metric: {tsv_metric}')
 
-        for tsv_path, deriv_entities in zip(tsv_paths, entity_vals):
-            file_name_in_path = os.path.basename(tsv_path).split('_meg.')[0]
-            file_name_in_obj = deriv_entities['name'].split('_meg.')[0]
+            for tsv_path, deriv_entities in zip(tsv_paths, entity_vals):
+                file_name_in_path = os.path.basename(tsv_path).split('_meg.')[0]
+                file_name_in_obj = deriv_entities['name'].split('_meg.')[0]
 
-            if file_name_in_obj not in file_name_in_path:
-                raise ValueError('Different names in tsvs_to_plot_by_metric and entities_per_file')
+                if file_name_in_obj not in file_name_in_path:
+                    raise ValueError('Different names in tsvs_to_plot_by_metric and entities_per_file')
 
-            deriv = Deriv_to_plot(path=tsv_path, metric=tsv_metric, deriv_entity_obj=deriv_entities)
-            deriv.find_raw_entity_name()
-            derivs_to_plot.append(deriv)
+                deriv = Deriv_to_plot(path=tsv_path, metric=tsv_metric, deriv_entity_obj=deriv_entities)
+                deriv.find_raw_entity_name()
+                derivs_to_plot.append(deriv)
 
-    # Parallel execution per subject
-    Parallel(n_jobs=n_jobs)(
-        delayed(process_subject)(
-            sub=sub,
-            dataset=dataset,
-            derivs_to_plot=derivs_to_plot,
-            chosen_entities=chosen_entities,
-            plot_settings=plot_settings,
+        # Parallel execution per subject
+        Parallel(n_jobs=n_jobs)(
+            delayed(process_subject)(
+                sub=sub,
+                dataset=dataset,
+                derivs_to_plot=derivs_to_plot,
+                chosen_entities=chosen_entities,
+                plot_settings=plot_settings,
+                output_root=output_root,
+            )
+            for sub in chosen_entities['subject']
         )
-        for sub in chosen_entities['subject']
-    )
 
-    end_time = time.time()
-    elapsed_seconds = end_time - start_time
-    print("---------------------------------------------------------------")
-    print("---------------------------------------------------------------")
-    print("---------------------------------------------------------------")
-    print("---------------------------------------------------------------")
-    print(f"PLOTTING MODULE FINISHED. Elapsed time: {elapsed_seconds:.2f} seconds.")
+        end_time = time.time()
+        elapsed_seconds = end_time - start_time
+        print("---------------------------------------------------------------")
+        print("---------------------------------------------------------------")
+        print("---------------------------------------------------------------")
+        print("---------------------------------------------------------------")
+        print(f"PLOTTING MODULE FINISHED. Elapsed time: {elapsed_seconds:.2f} seconds.")
+    finally:
+        # Ensure the temporary overlay is cleaned up.
+        if overlay_tmp is not None:
+            overlay_tmp.cleanup()
     return
 
 

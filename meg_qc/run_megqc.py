@@ -10,6 +10,12 @@ def run_megqc():
     dataset_path_parser = argparse.ArgumentParser(description= "parser for MEGqc: --inputdata(mandatory) path/to/your/BIDSds --config path/to/config  if None default parameters are used)")
     dataset_path_parser.add_argument("--inputdata", type=str, required=True, help="path to the root of your BIDS MEG dataset")
     dataset_path_parser.add_argument("--config", type=str, required=False, help="path to config file")
+    dataset_path_parser.add_argument(
+        "--derivatives_output",
+        type=str,
+        required=False,
+        help="Optional folder to store MEGqc derivatives outside the BIDS dataset",
+    )
     args=dataset_path_parser.parse_args()
 
     path_to_megqc_installation= os.path.abspath(os.path.join(os.path.abspath(__file__), os.pardir))
@@ -39,14 +45,20 @@ def run_megqc():
 
     internal_config_file_path=path_to_megqc_installation + '/settings/settings_internal.ini'
 
-    make_derivative_meg_qc(config_file_path, internal_config_file_path, data_directory)
+    make_derivative_meg_qc(config_file_path, internal_config_file_path, data_directory,
+                           derivatives_base=args.derivatives_output)
 
-    print('MEGqc has completed the calculation of metrics. Results can be found in' + data_directory +'/derivatives/MEGqc/calculation')
+    output_root = data_directory if args.derivatives_output is None else os.path.join(
+        args.derivatives_output,
+        os.path.basename(os.path.normpath(data_directory))
+    )
+    print('MEGqc has completed the calculation of metrics. Results can be found in ' +
+          os.path.join(output_root, 'derivatives', 'MEGqc', 'calculation'))
 
     user_input = input('Do you want to run the MEGqc plotting module on the MEGqc results? (y/n): ').lower().strip() == 'y'
 
     if user_input == True:
-        make_plots_meg_qc(data_directory)
+        make_plots_meg_qc(data_directory, derivatives_base=args.derivatives_output)
         return
     else:
         return

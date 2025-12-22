@@ -34,7 +34,7 @@ from PyQt6.QtCore import QObject, QProcess, pyqtSignal, Qt, QCoreApplication
 from PyQt6.QtGui import QPixmap, QIcon, QPalette, QColor  # for loading images, setting icon, and theme toggling
 
 # Core MEG QC pipeline functions
-from meg_qc.calculation.meg_qc_pipeline import make_derivative_meg_qc
+from meg_qc.calculation.meg_qc_pipeline import make_derivative_meg_qc, resolve_output_roots
 from meg_qc.plotting.meg_qc_plots import make_plots_meg_qc
 from meg_qc.calculation.metrics.summary_report_GQI import generate_gqi_summary
 
@@ -714,6 +714,17 @@ class MainWindow(QMainWindow):
         row_lay.addWidget(btn_browse)
         shared.addRow("Data directory:", row)
 
+        # Optional external derivatives directory
+        self.derivatives_dir = QLineEdit()
+        derivatives_browse = QPushButton("Browse")
+        derivatives_browse.clicked.connect(lambda: self._browse(self.derivatives_dir))
+        deriv_row = QWidget()
+        deriv_lay = QHBoxLayout(deriv_row)
+        deriv_lay.setContentsMargins(0, 0, 0, 0)
+        deriv_lay.addWidget(self.derivatives_dir)
+        deriv_lay.addWidget(derivatives_browse)
+        shared.addRow("Derivatives output (optional):", deriv_row)
+
         self.jobs = QSpinBox()
         self.jobs.setRange(-1, os.cpu_count() or 1)
         self.jobs.setValue(-1)
@@ -849,6 +860,7 @@ class MainWindow(QMainWindow):
         """
         # 1) Gather inputs
         data_dir  = self.data_dir.text().strip()
+        derivatives_dir = self.derivatives_dir.text().strip() or None
         subs_raw  = self.calc_subs.text().strip()
         # If user typed “all” (case-insensitive) or left blank, use the string "all";
         # otherwise split by commas into a list of IDs.
@@ -859,13 +871,14 @@ class MainWindow(QMainWindow):
         )
         n_jobs = self.jobs.value()
 
-        # 2) Match the signature: (settings_path, internal_path, data_dir, subs, n_jobs)
+        # 2) Match the signature: (settings_path, internal_path, data_dir, subs, n_jobs, derivatives_base)
         args = (
             str(SETTINGS_PATH),
             str(INTERNAL_PATH),
             data_dir,
             subs,
             n_jobs,
+            derivatives_dir,
         )
 
         # 3) Create the Worker, hook up signals → log
@@ -929,13 +942,14 @@ class MainWindow(QMainWindow):
         """
         # 1) Gather inputs
         data_dir = self.data_dir.text().strip()
+        derivatives_dir = self.derivatives_dir.text().strip() or None
         n_jobs = self.jobs.value()
 
         # 2) Build args tuple for make_plots_meg_qc
         # The plotting backend (full or lite) is selected inside
         # ``make_plots_meg_qc`` based on the 'full_html_reports' option in
         # settings.ini.
-        args = (data_dir, n_jobs)
+        args = (data_dir, n_jobs, derivatives_dir)
 
         # 3) Create Worker and wire signals
         worker = Worker(make_plots_meg_qc, *args)
@@ -985,7 +999,12 @@ class MainWindow(QMainWindow):
     def start_gqi(self):
         """Run Global Quality Index calculation only."""
         data_dir = self.data_dir.text().strip()
-        args = (data_dir, str(SETTINGS_PATH))
+        derivatives_dir = self.derivatives_dir.text().strip() or None
+        # Align the GQI rerun with the calculation pipeline: resolve any
+        # external derivatives base into the concrete derivatives folder so
+        # downstream code can find the previously computed metrics.
+        _, derivatives_root = resolve_output_roots(data_dir, derivatives_dir)
+        args = (data_dir, derivatives_root, str(SETTINGS_PATH))
         worker = Worker(generate_gqi_summary, *args)
         # Prevent concurrent GQI runs; enable again once finished or stopped.
         self.btn_gqi_run.setEnabled(False)

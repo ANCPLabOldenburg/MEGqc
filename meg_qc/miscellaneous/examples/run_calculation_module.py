@@ -15,6 +15,11 @@ internal_config_file_path = '/home/karelo/PycharmProjects/megqc_update/.venv/lib
 sub_list = ['009']
 # sub_list = ['009','012','013','014','015']
 
+# Optional external derivatives root. If provided, MEGqc writes outputs to
+# <derivatives_output_path>/<dataset_name>/derivatives instead of the input
+# dataset directory.
+derivatives_output_path = None
+
 # Number of CPU cores you want to use (for example, 4). Use -1 to utilize all available CPU cores:
 n_jobs_to_use = 1
 # Number of parallel jobs to use during processing.
@@ -47,7 +52,8 @@ make_derivative_meg_qc(
     internal_config_file_path,
     data_directory,
     sub_list,
-    n_jobs=n_jobs_to_use
+    n_jobs=n_jobs_to_use,
+    derivatives_base=derivatives_output_path
 )
 
 end_time = time.time()

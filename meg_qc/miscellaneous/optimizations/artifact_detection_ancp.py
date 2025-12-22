@@ -5,7 +5,12 @@
 import gc
 import os
 import time
-from meg_qc.calculation.initial_meg_qc import (chs_dict_to_csv,load_data,save_meg_with_suffix)
+from meg_qc.calculation.initial_meg_qc import (
+    chs_dict_to_csv,
+    load_data,
+    remove_fif_and_splits,
+    save_meg_with_suffix,
+)
 import numpy as np
 from scipy.ndimage import distance_transform_edt, label
 from scipy.signal import find_peaks
@@ -33,7 +38,7 @@ from mne.utils import _mask_to_onsets_offsets, _pl, _validate_type, logger, verb
 @verbose
 def annotate_muscle_zscore(
     raw_muscle_path,
-    dataset_path,
+    derivatives_root,
     threshold=4,
     ch_type=None,
     min_length_good=0.1,
@@ -57,6 +62,8 @@ def annotate_muscle_zscore(
     ----------
     raw : instance of Raw
         Data to estimate segments with muscle artifacts.
+    derivatives_root : str
+        Base derivatives directory where temporary files should be written.
     threshold : float
         The threshold in z-scores for marking segments as containing muscle
         activity artifacts.
@@ -125,7 +132,12 @@ def annotate_muscle_zscore(
     sfreq = raw_copy.info["sfreq"]
 
     # Save annotated muscle filtered
-    raw_annotated_muscle_path = save_meg_with_suffix(raw_muscle_path, dataset_path, raw_copy, final_suffix="ANNOTATED_MUSCLE_FILTERED")
+    raw_annotated_muscle_path = save_meg_with_suffix(
+        raw_muscle_path,
+        derivatives_root,
+        raw_copy,
+        final_suffix="ANNOTATED_MUSCLE_FILTERED",
+    )
     # Clean filtered
     del raw_copy
     gc.collect()
@@ -174,7 +186,7 @@ def annotate_muscle_zscore(
     del raw
     del raw_copy
     gc.collect()
-    os.remove(raw_annotated_muscle_path)
+    remove_fif_and_splits(raw_annotated_muscle_path)
 
     return annot, scores_muscle
 

@@ -243,6 +243,7 @@ def get_plots():
     from the pipeline results in the derivatives folder.
     """
     from meg_qc.plotting.meg_qc_plots import make_plots_meg_qc
+    from meg_qc.calculation.meg_qc_pipeline import resolve_output_roots
 
     dataset_path_parser = argparse.ArgumentParser(
         description="parser for MEGqc: --inputdata (mandatory) path/to/BIDSds"
@@ -253,16 +254,29 @@ def get_plots():
         required=True,
         help="Path to the root of your BIDS MEG dataset"
     )
+    dataset_path_parser.add_argument(
+        "--derivatives_output",
+        type=str,
+        required=False,
+        help="Optional folder to store derivatives outside the BIDS dataset",
+    )
     args = dataset_path_parser.parse_args()
     data_directory = args.inputdata
 
-    make_plots_meg_qc(data_directory)
+    # Mirror the calculation module: allow the derivatives to live outside the
+    # dataset by resolving a custom output root when requested. The returned
+    # path is logged to help users find the exact folder being read.
+    _, derivatives_root = resolve_output_roots(data_directory, args.derivatives_output)
+    print(f"Using derivatives from: {derivatives_root}")
+
+    make_plots_meg_qc(data_directory, derivatives_base=args.derivatives_output)
     return
 
 
 def run_gqi():
     """Recalculate Global Quality Index reports using existing metrics."""
     from meg_qc.calculation.metrics.summary_report_GQI import generate_gqi_summary
+    from meg_qc.calculation.meg_qc_pipeline import resolve_output_roots
 
     parser = argparse.ArgumentParser(
         description="Recompute Global Quality Index using previously calculated metrics"
@@ -279,11 +293,21 @@ def run_gqi():
         required=False,
         help="Path to a config file with GQI parameters",
     )
+    parser.add_argument(
+        "--derivatives_output",
+        type=str,
+        required=False,
+        help="Optional folder to store derivatives outside the BIDS dataset",
+    )
     args = parser.parse_args()
 
     install_path = os.path.abspath(os.path.join(os.path.abspath(__file__), os.pardir))
     default_config = os.path.join(install_path, "settings", "settings.ini")
     cfg_path = args.config if args.config else default_config
 
-    generate_gqi_summary(args.inputdata, cfg_path)
+    # Use the same resolver as the calculation module so that external
+    # derivatives directories are handled consistently for GQI regeneration.
+    _, derivatives_root = resolve_output_roots(args.inputdata, args.derivatives_output)
+
+    generate_gqi_summary(args.inputdata, derivatives_root, cfg_path)
     return
