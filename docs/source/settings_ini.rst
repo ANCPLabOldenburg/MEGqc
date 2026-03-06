@@ -32,11 +32,7 @@ Default settings [DEFAULT]
     - **Muscle** (bool) : High frequency (110-140Hz) noise strongy correlated with (but not limited to) Muscle artifacts. Default: *True*
 
 - **data_crop_tmin** (int) & **data_crop_tmax** (int) : Settings for data crop. If no cropping needed, leave blank. Unit: seconds. Default: *blank*
-- **plot_mne_butterfly** (bool) : Plot MNE butterfly plot. Default: *True*
-- **plot_interactive_time_series** (bool) : Plot of the whole time series (each channel on top of others, separated by ch type: mags, grads). Will be done on the data resampled to 100Hz/sec. Raw data is shown, no filetring applied even if filer is set in the filering section. Benefit: it is interactive (you can see all or 1 or several channels, zoom in), which makes it more informative than built-in mne plot. Downside: This plot may signifcantly increase the time it takes to run the pipeline and the plot itself in html presentation might be slow due to large number of data points. Large size of html report. If you want to run it faster, set this to False. Default: *False*
-- **plot_interactive_time_series_average** (bool) : Plot interactive time series average (average over all channels of each type: mags, grads). Plot will be done on the data resampled to 100Hz/sec. This plot may increase the time it takes to run the pipeline, but dosnt significantly increase the size of html report. Default: False
-- **data_directory** (str) : **Absolute** path to the data directory . Possible to also enter several data path separated by coma. Example: *user/path/to/my/data/ds000000, user/path/to/my/data/ds000001*
-- **verbose_plots** (bool) : Show the plots when running the script (plotly and matplotlib). Default: True
+- **data_directory** (str) : **Absolute** path to the data directory. Possible to enter several dataset paths separated by comma. Example: *user/path/to/my/data/ds000000, user/path/to/my/data/ds000001*
 
 Filtering [Filtering]
 ---------------------
@@ -54,6 +50,9 @@ Epoching [Epoching]
 - **epoch_tmax** (float) : time in seconds after the event. Unit: sec. Default: 1
 - **stim_channel** (str) : leave blank if want it to be detected automatically or write explicitely like *STI101*. Default:  * blank *. 
 - **event_repeated** (str) : how to handle duplicates in events[:, 0]. Can be 'error' to raise an error, ‘drop’ to only retain the row occurring first in the events, or 'merge' to combine the coinciding events (=duplicates) into a new event (see Notes for details). Default: *merge*
+- **use_fixed_length_epochs** (bool) : if True and no stimulus channels are detected or fewer than 2 events are found, epoch the data into fixed-length segments. Default: *True*
+- **fixed_epoch_duration** (float) : length of fixed epochs in seconds. Used only when fixed-length epoching is enabled. Default: *2.0*
+- **fixed_epoch_overlap** (float) : overlap between consecutive fixed epochs in seconds. Must be smaller than duration. Default: *0.0*
 
 Standard deviation [STD]
 ------------------------
@@ -106,6 +105,7 @@ Heart beat artifacts [ECG]
 - **ecg_epoch_tmax** (float) : time in seconds after the event. Unit: seconds. Dont set smaller than 0.03. Default: *0.04*
 - **norm_lvl** (int) : The norm level is the scaling factor for the threshold. The mean artifact amplitude over all channels is multiplied by the norm_lvl to get the threshold. Default: *1*
 - **gaussian_sigma** (int) - The sigma of the gaussian kernel used to smooth the data. The higher the sigma, the more smoothing. Typically ECG data is less noisy than EOG nd requires smaller sigma. Default: 4
+- **fixed_channel_names** (str) - Optional comma-separated list of channel names to treat as ECG (e.g., *EEG059*). Leave blank to use automatic ECG detection via the raw object.
 
 
 Eye movement artifacts [EOG]
@@ -123,6 +123,7 @@ Eye movement artifacts [EOG]
 - **eog_epoch_tmax** (float) : time in seconds after the event. Unit: seconds. Default: *0.4*
 - **norm_lvl** (int) : the norm level is the scaling factor for the threshold. The mean artifact amplitude over all channels is multiplied by the norm_lvl to get the threshold. Default: *1*
 - **gaussian_sigma** (int) - The sigma of the gaussian kernel used to smooth the data. The higher the sigma, the more smoothing. Typically EOG data is more noisy than EG nd requires larger sigma. Default: 6
+- **fixed_channel_names** (str) - Optional comma-separated list of channel names to treat as EOG (e.g., *EEG057, EEG058*). Leave blank to use automatic EOG detection via the raw object.
 
 Head_movement artifacts [Head_movement]
 ---------------------------------------
@@ -137,5 +138,3 @@ Muscle artifacts [Muscle]
 - **min_distance_between_different_muscle_events** (int or float) : minimum distance between different muscle events in seconds. If events happen closer to each other they will all be counted as one event and the time will be assigned as the first peak. Unit: seconds. Default: *1*  
 
 Difference between last 2 settings: **min_length_good** - used to detect ALL muscle events, **min_distance_between_different_muscle_events** - used to detect evets with z-score higher than the threshold on base of ALL muscle events
-
-

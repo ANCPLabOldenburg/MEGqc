@@ -1,3 +1,7 @@
+from importlib.metadata import PackageNotFoundError, version
 
-from . import _version
-__version__ = _version.get_versions()['version']
+try:
+    __version__ = version("meg_qc")
+except PackageNotFoundError:
+    # Source checkout fallback (kept in sync with pyproject.toml).
+    __version__ = "0.6.7"

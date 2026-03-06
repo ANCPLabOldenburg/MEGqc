@@ -1,45 +1,94 @@
-## MEGqc - a standardized pipeline for MEG data quality control
+# MEGqc
 
-Magnetoencephalography (MEG) data are susceptible to noise and artifacts, which can severely corrupt the data quality. They can originate from environmental noise sources, e.g. powerline noise, internal noise sources like data contamination due to eye movements of the subject, or systemic noise sources, e.g. malfunction of a sensor or vibrations. For this reason, quality control of the data is an important step for valid and reproducible science (Niso et al., 2022). However, the visual detection and annotation of artifacts in MEG data require expertise, is a tedious and time extensive task, and hardly resembles a standardized procedure. Since quality control is commonly done manually it might also be subject to biases induced by the person inspecting the data. Despite the minimization of human biases, a standardized workflow for quality control will additionally make datasets better comparable thereby allowing for between-datasets comparisons as opposed to quality control within a single dataset. Hence, an automated and standardized approach to quality control is desirable for the quality assessment of in-house and shared datasets. To address this issue we developed a software tool for automated and standardized quality control of MEG recordings, MEGqc, which is inspired by software for quality control in the domain of fMRI, called mriqc (Esteban et al., 2017). 
+MEGqc is an open-source, BIDS-aligned toolbox for automated **MEG quality assessment (QA)** and explicit **quality control (QC)** summarization.
 
-MEGqc is designed to detect specific noise patterns in the data and visualize them in easily interpretable human-readable reports. Additionally, the calculated metrics are provided in machine-readable JSON files, which allow for better machine interoperability or integration into workflows. Among other measures we calculate the relative power of noise frequencies in the Power Spectral Density (PSD), several metrics to describe the ‘noisiness’ of channels and/or epochs, e.g. STD or peak-to-peak amplitudes, and quantification of EOG and ECG related noise averaged over all channels and on a per-channel basis (see the architecture UML for a list of all computed metrics). The software strives to help researchers to standardize and speed up their quality control workflow. This being said, usability is a central aspect of MEGqc. It requires only minimal user input to work: a path to the dataset and the tuning of a handful of parameters through a human and machine-readable configuration file, but can also be adapted to the specific needs of more experienced users by overriding the default values of respective parameters in the configuration file. However, this simple user interface, e.g. only one path to the dataset is required and the software will locate and load the files needed for the workflow, only works if the structural organization of the dataset is internally known to the software. 
+It is designed for large cohorts and reproducible workflows, and provides both:
+- interactive HTML reports for human inspection, and
+- machine-readable derivatives for downstream automation.
 
-Since neuroimaging data can be very diverse concerning their structural organization the software is tailored to the BIDS standard (Gorgolewski et al., 2016; Niso et al., 2018). Thus MEGqc requires the data to be organized according to BIDS. 
+## What MEGqc Provides
 
-MEGqc strongly relies on the MNE-python software package (Gramfort et al., 2013).
+- **QA-first quality profiling** of raw MEG signal quality before exclusion decisions.
+- **Multi-metric coverage** including:
+  - standard deviation (STD),
+  - peak-to-peak amplitude (PtP),
+  - power spectral density (PSD),
+  - ECG/EOG-related contamination,
+  - high-frequency muscle burden,
+  - optional head-motion summaries.
+- **Multi-scale reporting** across recording, channel, epoch, subject, dataset group, and multi-sample comparisons.
+- **QC support layer** with configurable module-level criteria and a Global Quality Index (GQI).
+- **Reproducible execution** with profile-aware outputs and saved settings provenance.
+- **Three usage modes**: CLI, GUI, and programmatic dispatchers.
 
-Documentation, Installation Guide and Tutorial: https://ancplaboldenburg.github.io/megqc_documentation/index.html
+## Requirements
 
-The following derivatives are produced as the result of the analysis for each data file (.fif):
+- **Python 3.10**
+- MEG data organized according to **BIDS/MEG-BIDS**.
 
-- HTML report for all metrics presented as interactive figures, that can be scrolled through and enlarged;
-- TSV file with the results of the analysis for some of the metrics;
-- machine-readable JSON file with the results of the analysis for all metrics.
+## Installation
 
-### Between sample analysis
+Use the official installation guide:
 
-The package includes a small utility to compare quality metrics between
-datasets. Assuming you have the per-sample TSV tables created by the MEGqc
-pipeline, run::
+[https://ancplaboldenburg.github.io/megqc_documentation/book/installation2.html](https://ancplaboldenburg.github.io/megqc_documentation/book/installation2.html)
 
-    python -m meg_qc.calculation.between_sample_analysis \
-        --tsv sample1/group_metrics.tsv sample2/group_metrics.tsv \
-        --names sample1 sample2 \
-        --output-dir results
+## Quick Start (CLI)
 
-All violin plots and regression results will be written to the ``results``
-directory. Significant regression coefficients are marked with asterisks.
+1. Export default config:
 
-To add a mutual information (MI) analysis, include the ``--mi`` flag. The
-number of permutations for the significance test is controlled via
-``--mi-permutations`` (use ``0`` to disable permutation testing). For example::
+```bash
+get-megqc-config --target_directory ./config
+```
 
-    python -m meg_qc.calculation.between_sample_analysis \
-        --tsv sample1/group_metrics.tsv sample2/group_metrics.tsv \
-        --names sample1 sample2 \
-        --output-dir results \
-        --mi --mi-permutations 1000
+2. Run QA/QC calculation:
 
-MI results (raw, net, z-scores, p-values, normalized variants and entropies)
-are stored in the ``mutual_information`` folder for each sample and for the
-combined dataset.
+```bash
+run-megqc   --inputdata /path/to/bids_dataset   --config ./config/settings.ini
+```
+
+3. Build plotting reports:
+
+```bash
+run-megqc-plotting --inputdata /path/to/bids_dataset
+```
+
+4. Recompute GQI summaries (optional):
+
+```bash
+globalqualityindex --inputdata /path/to/bids_dataset
+```
+
+5. Run full pipeline in one command (calculation + plotting):
+
+```bash
+run-megqc   --inputdata /path/to/bids_dataset   --config ./config/settings.ini   --run-all
+```
+
+## Launch GUI
+
+```bash
+megqc
+```
+
+The GUI uses the same backend logic as CLI dispatchers and writes the same derivative/report outputs.
+
+## Typical Outputs
+
+MEGqc writes outputs under BIDS derivatives (default):
+
+- `derivatives/Meg_QC/calculation/...` (metric tables + JSON summaries)
+- `derivatives/Meg_QC/reports/...` (interactive HTML reports)
+- `derivatives/Meg_QC/...` QC summaries including GQI artifacts
+
+## Documentation
+
+- Main documentation: [https://ancplaboldenburg.github.io/megqc_documentation/index.html](https://ancplaboldenburg.github.io/megqc_documentation/index.html)
+- Tutorial: [https://ancplaboldenburg.github.io/megqc_documentation/book/tutorial.html](https://ancplaboldenburg.github.io/megqc_documentation/book/tutorial.html)
+
+## Source Code
+
+[https://github.com/ANCPLabOldenburg/MEGqc](https://github.com/ANCPLabOldenburg/MEGqc)
+
+## License
+
+MIT License.

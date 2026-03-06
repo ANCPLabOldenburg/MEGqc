@@ -12,9 +12,12 @@ import sys
 import os
 import signal
 import json
+import time
 import configparser
+import hashlib
+import shutil
 from pathlib import Path
-from typing import Dict, Optional
+from typing import Dict, List, Optional, Union, Tuple
 
 # Attempt to import psutil for accurate RAM info; if unavailable, fallback later
 try:
@@ -27,16 +30,32 @@ except ImportError:
 from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QPushButton, QLineEdit, QLabel,
     QFileDialog, QPlainTextEdit, QVBoxLayout, QHBoxLayout, QFormLayout,
-    QGroupBox, QSpinBox, QTabWidget, QScrollArea, QFrame, QMessageBox,
-    QMenu               #  ← add this entry
+    QGroupBox, QSpinBox, QTabWidget, QScrollArea, QMessageBox,
+    QListWidget, QCheckBox, QTableWidget, QTableWidgetItem, QHeaderView,
+    QDialog, QComboBox, QDoubleSpinBox, QDialogButtonBox, QGridLayout,
+    QInputDialog,
 )
-from PyQt6.QtCore import QObject, QProcess, pyqtSignal, Qt, QCoreApplication
-from PyQt6.QtGui import QPixmap, QIcon, QPalette, QColor  # for loading images, setting icon, and theme toggling
+from PyQt6.QtCore import (
+    QObject,
+    QProcess,
+    pyqtSignal,
+    Qt,
+    QCoreApplication,
+    QSettings,
+    QTimer,
+    QStandardPaths,
+)
+from PyQt6.QtGui import QPixmap, QIcon, QPalette, QColor
 
 # Core MEG QC pipeline functions
-from meg_qc.calculation.meg_qc_pipeline import make_derivative_meg_qc, resolve_output_roots
-from meg_qc.plotting.meg_qc_plots import make_plots_meg_qc
-from meg_qc.calculation.metrics.summary_report_GQI import generate_gqi_summary
+from meg_qc.test import (
+    run_calculation_dispatch,
+    run_all_dispatch,
+    run_plotting_dispatch,
+    run_gqi_dispatch,
+    validate_plot_request,
+)
+from meg_qc.calculation.meg_qc_pipeline import list_analysis_profiles
 
 # Use Qt5 widget integration and not the OS integrations (This will prevent incompatibilities)
 QCoreApplication.setAttribute(Qt.ApplicationAttribute.AA_DontUseNativeDialogs)
@@ -48,7 +67,6 @@ GUI_DIR = Path(__file__).parent
 # PKG_ROOT apunta a la raíz del paquete meg_qc (dos niveles arriba)
 PKG_ROOT = GUI_DIR.parent.parent
 
-# Rutas a los ficheros
 SETTINGS_PATH = PKG_ROOT / "settings" / "settings.ini"
 INTERNAL_PATH = PKG_ROOT / "settings" / "settings_internal.ini"
 # Logo e icon se quedan en la carpeta GUI
@@ -252,139 +270,556 @@ class Worker(QObject):
         self.process.kill()
 
 
-class SettingsEditor(QWidget):
+def _runtime_config_dir() -> Path:
+    """Return and create the writable folder used for runtime config copies."""
+    base = QStandardPaths.writableLocation(QStandardPaths.StandardLocation.AppConfigLocation)
+    if not base:
+        base = str(Path.home() / ".config" / "MEGqc")
+    path = Path(base) / "runtime_configs"
+    path.mkdir(parents=True, exist_ok=True)
+    return path
+
+
+class SettingsEditorDialog(QDialog):
     """
-    Scrollable editor for settings.ini.
-    Comments above each key are shown as tooltips on the QLineEdit.
+    Typed INI editor used by GUI config manager buttons.
+
+    Design goals:
+    - Never modify package defaults in-place.
+    - Prefer selectable controls (bool/combo/numeric) over free typing.
+    - Display sections in two columns for better use of screen width.
     """
 
-    def __init__(self, config: configparser.ConfigParser, path: Path):
-        super().__init__()
-        self.config = config
-        self.path = path
-        self._comment_map = {}
-        current_section = 'DEFAULT'
-        pending = []
-        try:
-            with open(path, 'r') as f:
-                for raw in f:
-                    line = raw.rstrip('\n')
-                    stripped = line.strip()
-                    if stripped.startswith('[') and stripped.endswith(']'):
-                        current_section = stripped[1:-1]
-                        pending = []
-                    elif stripped.startswith('#') or stripped.startswith(';'):
-                        txt = stripped.lstrip('#; ').strip()
-                        if txt:
-                            pending.append(txt)
-                    elif '=' in stripped and not stripped.startswith('#') and not stripped.startswith(';'):
-                        key = stripped.split('=', 1)[0].strip()
-                        comment = ' '.join(pending)
-                        self._comment_map[(current_section, key)] = comment
-                        pending = []
-        except Exception:
-            pass
+    _ENUM_OPTIONS: Dict[Tuple[str, str], List[str]] = {
+        ("Filtering", "method"): ["iir", "fir"],
+        ("Epoching", "event_repeated"): ["merge", "drop", "error"],
+    }
+    # These fields intentionally allow blank values in settings.ini.
+    # Using text widgets here avoids forcing a numeric value during resets.
+    _OPTIONAL_NUMERIC_KEYS = {
+        ("GENERAL", "data_crop_tmin"),
+        ("GENERAL", "data_crop_tmax"),
+    }
 
-        layout = QVBoxLayout(self)
-        layout.setContentsMargins(10, 10, 10, 10)
-        layout.setSpacing(8)
+    def __init__(self, source_path: Union[str, Path], defaults_path: Union[str, Path], title: str, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle(title)
+        self.resize(1080, 760)
+
+        self.source_path = Path(source_path)
+        self.defaults_path = Path(defaults_path)
+        # Build an editor model from package defaults first, then overlay
+        # user/runtime values. This keeps the GUI aligned to supported keys and
+        # silently drops deprecated legacy options from older profiles.
+        self.template_config = configparser.ConfigParser()
+        self.template_config.optionxform = str
+        self.template_config.read(self.defaults_path)
+
+        source_cfg = configparser.ConfigParser()
+        source_cfg.optionxform = str
+        source_cfg.read(self.source_path)
+
+        self.config = configparser.ConfigParser()
+        self.config.optionxform = str
+        for section in self.template_config.sections():
+            self.config.add_section(section)
+            for key, default_val in self.template_config[section].items():
+                if section in source_cfg and key in source_cfg[section]:
+                    self.config[section][key] = source_cfg[section][key]
+                else:
+                    self.config[section][key] = default_val
+
+        # Fallback for corrupted/missing defaults: preserve old behavior and
+        # show whatever exists in source config instead of failing.
+        if not self.config.sections():
+            self.config.read(self.source_path)
+
+        self.comment_map = self._build_comment_map(self.defaults_path)
+        self.widgets: Dict[Tuple[str, str], Tuple[QWidget, str]] = {}
+
+        root = QVBoxLayout(self)
+        root.setContentsMargins(10, 10, 10, 10)
 
         scroll = QScrollArea()
         scroll.setWidgetResizable(True)
         container = QWidget()
-        form_layout = QVBoxLayout(container)
-        self.fields = {}
+        grid = QGridLayout(container)
+        grid.setHorizontalSpacing(12)
+        grid.setVerticalSpacing(10)
 
-        # DEFAULT section
-        defaults = config.defaults()
-        if defaults:
-            box = QGroupBox('DEFAULT')
-            form = QFormLayout(box)
-            for key, val in defaults.items():
-                field = QLineEdit(val)
-                if (tip := self._comment_map.get(('DEFAULT', key))):
-                    field.setToolTip(tip)
-                form.addRow(QLabel(key), field)
-                self.fields[('DEFAULT', key)] = field
-            form_layout.addWidget(box)
-            sep = QFrame();
-            sep.setFrameShape(QFrame.Shape.HLine)
-            form_layout.addWidget(sep)
-
-        # Other sections
-        for section in config.sections():
+        sections = self._ordered_sections()
+        for idx, section in enumerate(sections):
             box = QGroupBox(section)
+            box.setMinimumWidth(260)
+            box.setMaximumWidth(360)
             form = QFormLayout(box)
-            items = config._sections.get(section, {})
-            for key, val in items.items():
-                field = QLineEdit(val)
-                if (tip := self._comment_map.get((section, key))):
-                    field.setToolTip(tip)
-                form.addRow(QLabel(key), field)
-                self.fields[(section, key)] = field
-            form_layout.addWidget(box)
-            sep2 = QFrame();
-            sep2.setFrameShape(QFrame.Shape.HLine)
-            form_layout.addWidget(sep2)
-
-        save = QPushButton('Save Settings')
-        save.clicked.connect(self.save)
-        form_layout.addWidget(save, alignment=Qt.AlignmentFlag.AlignCenter)
+            form.setFieldGrowthPolicy(QFormLayout.FieldGrowthPolicy.FieldsStayAtSizeHint)
+            for key, val in self._section_items(section):
+                widget, widget_type = self._build_widget(section, key, str(val))
+                self.widgets[(section, key)] = (widget, widget_type)
+                tip = self.comment_map.get((section, key), "")
+                label = QLabel(key)
+                if tip:
+                    label.setToolTip(tip)
+                    widget.setToolTip(tip)
+                form.addRow(label, widget)
+            grid.addWidget(box, idx // 3, idx % 3)
 
         scroll.setWidget(container)
-        layout.addWidget(scroll)
+        root.addWidget(scroll)
 
-    def save(self):
-        # 1. recoge los valores nuevos en un dict {(section, key): str_value}
-        new_vals = {(sec, key): w.text() for (sec, key), w in self.fields.items()}
+        btn_row = QHBoxLayout()
+        self.btn_reset = QPushButton("Reset to defaults")
+        self.btn_reset.clicked.connect(self._reset_to_defaults)
+        self.btn_save_as = QPushButton("Save as...")
+        self.btn_save_as.clicked.connect(self._save_as)
+        btn_row.addWidget(self.btn_reset)
+        btn_row.addWidget(self.btn_save_as)
+        btn_row.addStretch(1)
+        root.addLayout(btn_row)
+
+        buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        root.addWidget(buttons)
+
+    def _ordered_sections(self) -> List[str]:
+        sections = list(self.config.sections())
+        if "GENERAL" in sections:
+            sections = ["GENERAL"] + [s for s in sections if s != "GENERAL"]
+        return sections
+
+    def _section_items(self, section: str):
+        return list(self.config[section].items())
+
+    @staticmethod
+    def _build_comment_map(path: Path) -> Dict[Tuple[str, str], str]:
+        """
+        Parse INI comments and map them to (section, key) tooltips.
+        Uses the package default INI where comments are preserved.
+        """
+        mapping: Dict[Tuple[str, str], str] = {}
+        current_section = "DEFAULT"
+        pending: List[str] = []
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                for raw in f:
+                    line = raw.rstrip("\n")
+                    stripped = line.strip()
+                    if stripped.startswith("[") and stripped.endswith("]"):
+                        current_section = stripped[1:-1]
+                        pending = []
+                    elif stripped.startswith("#") or stripped.startswith(";"):
+                        txt = stripped.lstrip("#; ").strip()
+                        if txt:
+                            pending.append(txt)
+                    elif "=" in stripped and not stripped.startswith("#") and not stripped.startswith(";"):
+                        key = stripped.split("=", 1)[0].strip()
+                        mapping[(current_section, key)] = " ".join(pending).strip()
+                        pending = []
+        except Exception:
+            return {}
+        return mapping
+
+    def _build_widget(self, section: str, key: str, raw: str) -> Tuple[QWidget, str]:
+        val = raw.strip()
+        key_lower = key.lower()
+        sec_key = (section, key)
+
+        if section == "GENERAL" and key_lower == "ch_types":
+            container = QWidget()
+            lay = QHBoxLayout(container)
+            lay.setContentsMargins(0, 0, 0, 0)
+            lay.setSpacing(8)
+            chk_mag = QCheckBox("mag")
+            chk_grad = QCheckBox("grad")
+            chk_mag.setMinimumWidth(72)
+            chk_grad.setMinimumWidth(72)
+            parts = [p.strip().lower() for p in val.split(",") if p.strip()]
+            chk_mag.setChecked("mag" in parts)
+            chk_grad.setChecked("grad" in parts)
+            lay.addWidget(chk_mag)
+            lay.addWidget(chk_grad)
+            lay.addStretch(1)
+            container.setProperty("ch_types_widgets", (chk_mag, chk_grad))
+            return container, "ch_types"
+
+        if sec_key in self._ENUM_OPTIONS:
+            combo = QComboBox()
+            options = self._ENUM_OPTIONS[sec_key]
+            combo.addItems(options)
+            if val in options:
+                combo.setCurrentText(val)
+            combo.setMinimumWidth(135)
+            combo.setMaximumWidth(205)
+            return combo, "enum"
+
+        if val.lower() in {"true", "false"}:
+            chk = QCheckBox()
+            chk.setChecked(val.lower() == "true")
+            return chk, "bool"
+
+        if sec_key in self._OPTIONAL_NUMERIC_KEYS:
+            line = QLineEdit(val)
+            line.setPlaceholderText("empty")
+            line.setMinimumWidth(145)
+            line.setMaximumWidth(215)
+            return line, "text"
+
+        if val == "":
+            line = QLineEdit("")
+            line.setPlaceholderText("empty")
+            line.setMinimumWidth(145)
+            line.setMaximumWidth(215)
+            return line, "text"
 
         try:
-            # 2. lee el archivo original completo
-            with open(self.path, "r", encoding="utf-8") as f:
-                lines = f.readlines()
+            ival = int(val)
+            spin = QSpinBox()
+            spin.setRange(-1_000_000_000, 1_000_000_000)
+            spin.setValue(ival)
+            spin.setMinimumWidth(145)
+            spin.setMaximumWidth(215)
+            return spin, "int"
+        except Exception:
+            pass
 
-            current = "DEFAULT"
-            for i, raw in enumerate(lines):
-                s = raw.strip()
+        try:
+            fval = float(val)
+            dspin = QDoubleSpinBox()
+            # Keep float editing concise and readable in the settings dialog.
+            dspin.setDecimals(3)
+            dspin.setRange(-1_000_000_000.0, 1_000_000_000.0)
+            dspin.setValue(fval)
+            dspin.setMinimumWidth(145)
+            dspin.setMaximumWidth(215)
+            return dspin, "float"
+        except Exception:
+            pass
 
-                # detecta sección
-                if s.startswith("[") and s.endswith("]"):
-                    current = s[1:-1]
+        line = QLineEdit(val)
+        line.setMinimumWidth(145)
+        line.setMaximumWidth(215)
+        return line, "text"
 
-                # detecta línea clave = valor (no comentario)
-                elif "=" in s and not s.startswith("#") and not s.startswith(";"):
-                    key = s.split("=", 1)[0].strip()
-                    if (current, key) in new_vals:
-                        # 3. sustituye solo el valor, deja intacto todo lo demás (espacios, inline comments)
-                        prefix, _ = raw.split("=", 1)
-                        new_val = new_vals[(current, key)]
-                        # conserva el texto que hubiera después del valor (p.ej. comentario al final de línea)
-                        after = raw.split("=", 1)[1]
-                        if "#" in after or ";" in after:
-                            # si hay comentario inline, sepáralo
-                            val_part, comment_part = after.split("#", 1) if "#" in after else after.split(";", 1)
-                            lines[
-                                i] = f"{prefix}= {new_val}  #{comment_part}" if "#" in after else f"{prefix}= {new_val}  ;{comment_part}"
-                        else:
-                            lines[i] = f"{prefix}= {new_val}\n"
+    def _widget_to_value(self, widget: QWidget, widget_type: str) -> str:
+        if widget_type == "ch_types":
+            chk_mag, chk_grad = widget.property("ch_types_widgets")
+            chosen = []
+            if chk_mag.isChecked():
+                chosen.append("mag")
+            if chk_grad.isChecked():
+                chosen.append("grad")
+            return ", ".join(chosen)
+        if widget_type == "enum":
+            return str(widget.currentText())
+        if widget_type == "bool":
+            return "True" if widget.isChecked() else "False"
+        if widget_type == "int":
+            return str(int(widget.value()))
+        if widget_type == "float":
+            return str(float(widget.value()))
+        return str(widget.text())
 
-            # 4. escribe de vuelta
-            with open(self.path, "w", encoding="utf-8") as f:
-                f.writelines(lines)
+    def to_config(self) -> configparser.ConfigParser:
+        out = configparser.ConfigParser()
+        out.optionxform = str
+        for section in self._ordered_sections():
+            out.add_section(section)
+            for key, _ in self._section_items(section):
+                widget, widget_type = self.widgets[(section, key)]
+                out[section][key] = self._widget_to_value(widget, widget_type)
+        return out
 
-            QMessageBox.information(self, "Settings", "Settings saved successfully")
+    def _reset_to_defaults(self):
+        cfg = configparser.ConfigParser()
+        cfg.optionxform = str
+        cfg.read(self.defaults_path)
+        for (section, key), (widget, widget_type) in self.widgets.items():
+            if section not in cfg or key not in cfg[section]:
+                continue
+            val = cfg[section][key]
+            if widget_type == "ch_types":
+                chk_mag, chk_grad = widget.property("ch_types_widgets")
+                parts = [p.strip().lower() for p in val.split(",") if p.strip()]
+                chk_mag.setChecked("mag" in parts)
+                chk_grad.setChecked("grad" in parts)
+            elif widget_type == "enum":
+                widget.setCurrentText(val)
+            elif widget_type == "bool":
+                widget.setChecked(str(val).lower() == "true")
+            elif widget_type == "int":
+                try:
+                    widget.setValue(int(val))
+                except Exception:
+                    pass
+            elif widget_type == "float":
+                try:
+                    widget.setValue(float(val))
+                except Exception:
+                    pass
+            else:
+                widget.setText(str(val))
 
-        except Exception as e:
-            QMessageBox.critical(self, "Error", f"Failed to save settings:\n{e}")
+    def _save_as(self):
+        target, _ = QFileDialog.getSaveFileName(
+            self,
+            "Save settings as",
+            str(Path.home() / "settings.ini"),
+            "INI files (*.ini);;All files (*)",
+        )
+        if not target:
+            return
+        cfg = self.to_config()
+        with open(target, "w", encoding="utf-8") as f:
+            cfg.write(f)
 
+    def _write_to_source(self) -> None:
+        cfg = self.to_config()
+        self.source_path.parent.mkdir(parents=True, exist_ok=True)
+        with open(self.source_path, "w", encoding="utf-8") as f:
+            cfg.write(f)
+
+    def accept(self):
+        try:
+            self._write_to_source()
+        except Exception as exc:
+            QMessageBox.critical(self, "Settings", f"Failed to save settings:\n{exc}")
+            return
+        super().accept()
+
+
+class GUISettingsDialog(QDialog):
+    """Popup window for GUI-only preferences (theme, system info)."""
+
+    def __init__(self, parent, themes: Dict[str, QPalette], active_theme: str, cpu_count: int, total_gb: float):
+        super().__init__(parent)
+        self.setWindowTitle("GUI Settings")
+        self.resize(420, 220)
+        self._themes = themes
+
+        lay = QVBoxLayout(self)
+        form = QFormLayout()
+        self.theme_combo = QComboBox()
+        self.theme_combo.addItems(list(themes.keys()))
+        if active_theme in themes:
+            self.theme_combo.setCurrentText(active_theme)
+        form.addRow("Theme:", self.theme_combo)
+        form.addRow("CPUs:", QLabel(str(cpu_count)))
+        form.addRow("Total RAM (GB):", QLabel(f"{total_gb:.1f}"))
+        lay.addLayout(form)
+
+        buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        lay.addWidget(buttons)
+
+
+class SubjectSelectionDialog(QDialog):
+    """Dataset subject selector with All/Specific modes."""
+
+    def __init__(self, dataset_label: str, subjects: List[str], current_value: Union[str, List[str]], parent=None):
+        super().__init__(parent)
+        self.setWindowTitle(f"Subjects: {dataset_label}")
+        self.resize(520, 620)
+
+        lay = QVBoxLayout(self)
+        self.chk_all = QCheckBox("All subjects")
+        self.chk_all.toggled.connect(self._on_all_toggled)
+        lay.addWidget(self.chk_all)
+
+        self.list_widget = QListWidget()
+        self.list_widget.setSelectionMode(QListWidget.SelectionMode.MultiSelection)
+        for sub in subjects:
+            self.list_widget.addItem(sub)
+        lay.addWidget(self.list_widget)
+
+        helper = QLabel("Tip: use Ctrl/Cmd-click or Shift-click to select multiple subjects.")
+        helper.setWordWrap(True)
+        lay.addWidget(helper)
+
+        buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        lay.addWidget(buttons)
+
+        self._set_initial_selection(current_value)
+
+    def _set_initial_selection(self, current_value: Union[str, List[str]]) -> None:
+        if current_value == "all":
+            self.chk_all.setChecked(True)
+            return
+        chosen = {str(s) for s in (current_value or [])}
+        if not chosen:
+            self.chk_all.setChecked(True)
+            return
+        self.chk_all.setChecked(False)
+        for i in range(self.list_widget.count()):
+            item = self.list_widget.item(i)
+            item.setSelected(item.text() in chosen)
+
+    def _on_all_toggled(self, checked: bool) -> None:
+        self.list_widget.setEnabled(not checked)
+
+    def selected_value(self) -> Union[str, List[str]]:
+        if self.chk_all.isChecked():
+            return "all"
+        selected = [item.text() for item in self.list_widget.selectedItems()]
+        return selected if selected else "all"
+
+
+class _DetachedSectionDialog(QDialog):
+    """Floating container used by detachable main sections."""
+
+    def __init__(self, title: str, owner, parent=None):
+        super().__init__(parent)
+        self.owner = owner
+        self._content_widget: Optional[QWidget] = None
+        self._closing_by_owner = False
+        self.setWindowTitle(f"{title} (detached)")
+        self.resize(900, 700)
+
+        root = QVBoxLayout(self)
+        root.setContentsMargins(8, 8, 8, 8)
+        self.content_layout = QVBoxLayout()
+        self.content_layout.setContentsMargins(0, 0, 0, 0)
+        root.addLayout(self.content_layout, 1)
+
+        row = QHBoxLayout()
+        row.addStretch(1)
+        btn = QPushButton("Reattach")
+        btn.clicked.connect(self.owner.reattach_section)
+        row.addWidget(btn)
+        root.addLayout(row)
+
+    def set_content_widget(self, widget: QWidget) -> None:
+        self._content_widget = widget
+        self.content_layout.addWidget(widget)
+
+    def take_content_widget(self) -> Optional[QWidget]:
+        if self._content_widget is None:
+            return None
+        widget = self._content_widget
+        self.content_layout.removeWidget(widget)
+        widget.setParent(None)
+        self._content_widget = None
+        return widget
+
+    def close_by_owner(self) -> None:
+        self._closing_by_owner = True
+        self.close()
+
+    def closeEvent(self, event):
+        if not self._closing_by_owner and self.owner is not None:
+            self.owner._handle_detached_dialog_closed()
+        super().closeEvent(event)
+
+
+class CollapsibleDetachableSection(QWidget):
+    """Section wrapper with collapse and detach/reattach controls."""
+
+    def __init__(self, title: str, content_widget: QWidget, parent=None):
+        super().__init__(parent)
+        self.title = title
+        self.content_widget = content_widget
+        self.detached_dialog: Optional[_DetachedSectionDialog] = None
+
+        root = QVBoxLayout(self)
+        root.setContentsMargins(0, 0, 0, 0)
+        root.setSpacing(0)
+
+        # Single visual frame for the whole section (header + body) to avoid
+        # rendering as two separate "bubbles" in expanded state.
+        self.frame = QWidget()
+        self.frame.setObjectName("sectionFrame")
+        frame_lay = QVBoxLayout(self.frame)
+        frame_lay.setContentsMargins(0, 0, 0, 0)
+        frame_lay.setSpacing(0)
+        root.addWidget(self.frame)
+
+        header = QWidget()
+        header.setObjectName("sectionHeader")
+        header_lay = QHBoxLayout(header)
+        header_lay.setContentsMargins(4, 2, 4, 2)
+        header_lay.setSpacing(6)
+
+        self.btn_toggle = QPushButton(f"▼ {self.title}")
+        self.btn_toggle.setObjectName("sectionToggle")
+        self.btn_toggle.setCheckable(True)
+        self.btn_toggle.setChecked(True)
+        self.btn_toggle.clicked.connect(self._toggle_collapsed)
+        self.btn_toggle.setFlat(True)
+        self.btn_toggle.setCursor(Qt.CursorShape.PointingHandCursor)
+
+        self.btn_detach = QPushButton("Detach")
+        self.btn_detach.setObjectName("sectionDetach")
+        self.btn_detach.clicked.connect(self._toggle_detached)
+        self.btn_detach.setCursor(Qt.CursorShape.PointingHandCursor)
+
+        header_lay.addWidget(self.btn_toggle)
+        header_lay.addStretch(1)
+        header_lay.addWidget(self.btn_detach)
+        frame_lay.addWidget(header)
+
+        self.body = QWidget()
+        self.body.setObjectName("sectionBody")
+        self.body_lay = QVBoxLayout(self.body)
+        self.body_lay.setContentsMargins(0, 0, 0, 0)
+        # Inner "mainSection" group boxes are embedded into the outer frame,
+        # so they should not draw a second border.
+        self.content_widget.setProperty("embeddedSection", True)
+        self.body_lay.addWidget(self.content_widget)
+        frame_lay.addWidget(self.body)
+
+    def _toggle_collapsed(self, checked: bool) -> None:
+        arrow = "▼" if checked else "▶"
+        self.btn_toggle.setText(f"{arrow} {self.title}")
+        if self.detached_dialog is None:
+            self.body.setVisible(checked)
+
+    def _toggle_detached(self) -> None:
+        if self.detached_dialog is None:
+            self.detach_section()
+        else:
+            self.reattach_section()
+
+    def detach_section(self) -> None:
+        if self.detached_dialog is not None:
+            return
+        self.body_lay.removeWidget(self.content_widget)
+        self.content_widget.setParent(None)
+        self.detached_dialog = _DetachedSectionDialog(self.title, self, self.window())
+        self.detached_dialog.set_content_widget(self.content_widget)
+        self.detached_dialog.show()
+        self.btn_detach.setText("Reattach")
+        self.body.setVisible(False)
+
+    def reattach_section(self) -> None:
+        if self.detached_dialog is None:
+            return
+        widget = self.detached_dialog.take_content_widget()
+        if widget is not None:
+            self.body_lay.addWidget(widget)
+        dialog = self.detached_dialog
+        self.detached_dialog = None
+        self.btn_detach.setText("Detach")
+        self.body.setVisible(self.btn_toggle.isChecked())
+        dialog.close_by_owner()
+        dialog.deleteLater()
+
+    def _handle_detached_dialog_closed(self) -> None:
+        if self.detached_dialog is None:
+            return
+        widget = self.detached_dialog.take_content_widget()
+        if widget is not None:
+            self.body_lay.addWidget(widget)
+        self.detached_dialog = None
+        self.btn_detach.setText("Detach")
+        self.body.setVisible(self.btn_toggle.isChecked())
 
 class MainWindow(QMainWindow):
     """
-    Main application window
-    ─────────────────────────────────────────────────────────────
-    • “Run” tab       – launch / stop calculation and plotting jobs
-    • “Settings” tab  – edit settings.ini with mouse‑hover tooltips
-    • Status bar      – CPU / RAM info + Theme selector (Dark / Light / Beige)
+    Main application window for dataset execution and report generation.
     """
 
     # ──────────────────────────────── #
@@ -393,76 +828,64 @@ class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
 
-        # -- Window basics -------------------------------------------------
         self.setWindowTitle("MEGqc")
-        self.resize(500, 600)
+        self.resize(700, 780)
         if ICON_PATH and ICON_PATH.exists():
             self.setWindowIcon(QIcon(str(ICON_PATH)))
 
-        # -- Load settings (keep key case for tooltips) --------------------
-        self.config = configparser.ConfigParser()
-        self.config.optionxform = str
-        self.config.read(SETTINGS_PATH)
+        # Runtime config manager state.
+        # Package defaults are read-only; GUI edits always go to runtime copies.
+        self.default_settings_path = Path(SETTINGS_PATH)
+        self.global_config_path: Optional[str] = None
+        self.dataset_config_paths: Dict[str, str] = {}
 
-        # -- Tabs: Run | Settings -----------------------------------------
-        tabs = QTabWidget()
-        tabs.addTab(self._create_run_tab(), "Run")
-        tabs.addTab(SettingsEditor(self.config, SETTINGS_PATH), "Settings")
+        # Persistent GUI preferences (theme etc.) are stored cross-platform
+        # through QSettings backend (plist on macOS, registry on Windows, INI on Linux).
+        self.settings_store = QSettings("ANCP", "MEGqc")
 
-        # -- Central layout (optional logo + tabs) ------------------------
+        self.themes = self._build_theme_dict()
+        self.cpu_count, self.total_ram_gb = self._detect_system_resources()
+        self.active_theme_name = "Ocean"
+
+        # Bottom execution status controls (rendered inside main layout).
+        self.spinner_frames = ["|", "/", "-", "\\"]
+        self.spinner_idx = 0
+        self.spinner_label = QLabel("")
+        self.spinner_label.setFixedWidth(14)
+        self.elapsed_label = QLabel("Active tasks: none")
+
+        self.workers: Dict[str, Worker] = {}
+        self.task_started_at: Dict[str, float] = {}
+
+        self.elapsed_timer = QTimer(self)
+        self.elapsed_timer.setInterval(1000)
+        self.elapsed_timer.timeout.connect(self._refresh_elapsed_label)
+
+        self.spinner_timer = QTimer(self)
+        self.spinner_timer.setInterval(130)
+        self.spinner_timer.timeout.connect(self._animate_spinner)
+
         central = QWidget()
         vlay = QVBoxLayout(central)
-        vlay.setContentsMargins(5, 5, 5, 5)
+        vlay.setContentsMargins(8, 4, 8, 8)
+        vlay.setSpacing(4)
 
         if LOGO_PATH and LOGO_PATH.exists():
             logo = QLabel()
             pix = QPixmap(str(LOGO_PATH))
-            pix = pix.scaledToHeight(120, Qt.TransformationMode.SmoothTransformation)
+            pix = pix.scaledToHeight(54, Qt.TransformationMode.SmoothTransformation)
             logo.setPixmap(pix)
             logo.setAlignment(Qt.AlignmentFlag.AlignCenter)
             vlay.addWidget(logo)
 
-        vlay.addWidget(tabs)
+        vlay.addWidget(self._create_run_tab())
         self.setCentralWidget(central)
+        self.statusBar().setVisible(False)
 
-        # -- Status bar: Theme menu + system info -------------------------
-        self.themes = self._build_theme_dict()      # dict: name → palette
-        # status‑bar theme selector
-        self.theme_btn = QPushButton("🌓")  # half‑moon icon suggests theme switch
-        self.theme_btn.setFixedWidth(60)  # smaller, now just an icon
-        self.statusBar().addWidget(self.theme_btn)
-        self.theme_btn.setStyleSheet("margin-left:15px;")
-
-        theme_menu = QMenu(self)
-        for name in self.themes.keys():
-            act = theme_menu.addAction(name)
-            act.triggered.connect(lambda _, n=name: self.apply_theme(n))
-        self.theme_btn.setMenu(theme_menu)
-
-        # System info (CPU / RAM)
-        cpu_cnt = os.cpu_count() or 1
-        total_bytes = psutil.virtual_memory().total if has_psutil else 0
-        if not has_psutil:
-            try:
-                with open("/proc/meminfo") as f:
-                    for line in f:
-                        if line.startswith("MemTotal:"):
-                            total_bytes = int(line.split()[1]) * 1024
-                            break
-            except Exception:
-                total_bytes = 0
-        total_gb = total_bytes / (1024**3) if total_bytes else 0
-
-        sys_w = QWidget()
-        sys_l = QVBoxLayout(sys_w)
-        sys_l.setContentsMargins(0, 0, 0, 0)
-        sys_l.addWidget(QLabel(f"CPUs: {cpu_cnt}"))
-        sys_l.addWidget(QLabel(f"Total RAM: {total_gb:.1f} GB"))
-        self.statusBar().addPermanentWidget(sys_w)
-
-        # -- Workers dict + initial theme ---------------------------------
-        self.workers: dict[str, Worker] = {}
-        self.apply_theme("Ocean")                # set default palette
+        saved_theme = str(self.settings_store.value("ui/theme", "Ocean"))
+        if saved_theme not in self.themes:
+            saved_theme = "Ocean"
+        self.apply_theme(saved_theme, persist=False)
 
 
     # ──────────────────────────────── #
@@ -483,8 +906,9 @@ class MainWindow(QMainWindow):
         dark.setColor(QPalette.ColorRole.Text, Qt.GlobalColor.white)
         dark.setColor(QPalette.ColorRole.Button, QColor(53, 53, 53))
         dark.setColor(QPalette.ColorRole.ButtonText, Qt.GlobalColor.white)
-        dark.setColor(QPalette.ColorRole.Highlight, QColor(142, 45, 197))
-        dark.setColor(QPalette.ColorRole.HighlightedText, Qt.GlobalColor.black)
+        # Use blue selection in Dark theme (instead of the legacy purple).
+        dark.setColor(QPalette.ColorRole.Highlight, QColor(78, 163, 255))
+        dark.setColor(QPalette.ColorRole.HighlightedText, Qt.GlobalColor.white)
         themes["Dark"] = dark
 
         # LIGHT ☀
@@ -687,34 +1111,338 @@ class MainWindow(QMainWindow):
     # ──────────────────────────────── #
     # apply selected theme             #
     # ──────────────────────────────── #
-    def apply_theme(self, name: str):
+    def apply_theme(self, name: str, persist: bool = True):
         """Apply palette chosen from the Theme menu."""
+        self.active_theme_name = name
         QApplication.instance().setPalette(self.themes[name])
+        self._apply_section_highlight_style()
+        if persist:
+            self.settings_store.setValue("ui/theme", name)
+
+    def _build_section_highlight_stylesheet(self) -> str:
+        """
+        Build a section style from the active theme palette so highlighted
+        section chrome always follows user-selected colors.
+        """
+        pal = QApplication.instance().palette()
+        hl = pal.color(QPalette.ColorRole.Highlight)
+        base = pal.color(QPalette.ColorRole.Window)
+        text = pal.color(QPalette.ColorRole.WindowText)
+
+        # Explicit request: keep blue section accents when Dark theme is active.
+        if getattr(self, "active_theme_name", "") == "Dark":
+            hl = QColor(126, 200, 255)
+
+        border_alpha = 185
+        title_alpha = 225
+        # Slight theme-aware tint so section boxes are visible in both
+        # dark and light palettes without hard-coded color names.
+        if base.lightness() < 110:
+            section_bg = base.lighter(108)
+        else:
+            section_bg = base.darker(103)
+
+        return (
+            "QWidget#sectionFrame {"
+            f" border: 1px solid rgba({hl.red()}, {hl.green()}, {hl.blue()}, {border_alpha});"
+            " border-radius: 8px;"
+            f" background-color: rgba({section_bg.red()}, {section_bg.green()}, {section_bg.blue()}, 35);"
+            "}"
+            "QGroupBox#mainSection {"
+            f" border: 1px solid rgba({hl.red()}, {hl.green()}, {hl.blue()}, {border_alpha});"
+            " border-radius: 8px;"
+            " margin-top: 6px;"
+            " font-weight: 600;"
+            f" background-color: rgba({section_bg.red()}, {section_bg.green()}, {section_bg.blue()}, 35);"
+            "}"
+            "QGroupBox#mainSection[embeddedSection=\"true\"] {"
+            " border: none;"
+            " border-radius: 0px;"
+            " margin-top: 0px;"
+            " background: transparent;"
+            "}"
+            "QGroupBox#mainSection::title {"
+            " subcontrol-origin: margin;"
+            " left: 10px;"
+            " padding: 0 6px;"
+            f" color: rgba({hl.red()}, {hl.green()}, {hl.blue()}, {title_alpha});"
+            "}"
+            "QLabel#sectionCaption {"
+            f" color: rgba({text.red()}, {text.green()}, {text.blue()}, 190);"
+            " font-size: 11px;"
+            "}"
+            "QWidget#sectionHeader {"
+            " border: none;"
+            " border-top-left-radius: 8px;"
+            " border-top-right-radius: 8px;"
+            f" background-color: rgba({section_bg.red()}, {section_bg.green()}, {section_bg.blue()}, 60);"
+            "}"
+            "QWidget#sectionBody {"
+            " border: none;"
+            " border-bottom-left-radius: 8px;"
+            " border-bottom-right-radius: 8px;"
+            " background: transparent;"
+            "}"
+            "QPushButton#sectionToggle {"
+            " border: none;"
+            " text-align: left;"
+            " font-weight: 700;"
+            " padding: 4px 8px;"
+            f" color: rgba({hl.red()}, {hl.green()}, {hl.blue()}, 230);"
+            "}"
+            "QPushButton#sectionToggle:hover {"
+            f" background-color: rgba({hl.red()}, {hl.green()}, {hl.blue()}, 25);"
+            " border-radius: 5px;"
+            "}"
+            "QPushButton#sectionDetach {"
+            f" border: 1px solid rgba({hl.red()}, {hl.green()}, {hl.blue()}, 170);"
+            " border-radius: 6px;"
+            " padding: 2px 10px;"
+            f" color: rgba({text.red()}, {text.green()}, {text.blue()}, 225);"
+            f" background-color: rgba({section_bg.red()}, {section_bg.green()}, {section_bg.blue()}, 40);"
+            "}"
+            "QPushButton#sectionDetach:hover {"
+            f" background-color: rgba({hl.red()}, {hl.green()}, {hl.blue()}, 30);"
+            "}"
+        )
+
+    def _apply_section_highlight_style(self) -> None:
+        if hasattr(self, "run_root_widget"):
+            self.run_root_widget.setStyleSheet(self._build_section_highlight_stylesheet())
+
+    def _detect_system_resources(self) -> Tuple[int, float]:
+        cpu_cnt = os.cpu_count() or 1
+        total_bytes = psutil.virtual_memory().total if has_psutil else 0
+        if not has_psutil:
+            try:
+                with open("/proc/meminfo", encoding="utf-8") as f:
+                    for line in f:
+                        if line.startswith("MemTotal:"):
+                            total_bytes = int(line.split()[1]) * 1024
+                            break
+            except Exception:
+                total_bytes = 0
+        total_gb = total_bytes / (1024**3) if total_bytes else 0.0
+        return cpu_cnt, total_gb
+
+    def _open_gui_settings_dialog(self):
+        active_theme = str(self.settings_store.value("ui/theme", "Ocean"))
+        dialog = GUISettingsDialog(
+            self,
+            themes=self.themes,
+            active_theme=active_theme,
+            cpu_count=self.cpu_count,
+            total_gb=self.total_ram_gb,
+        )
+        if dialog.exec() == QDialog.DialogCode.Accepted:
+            self.apply_theme(dialog.theme_combo.currentText(), persist=True)
+
+    def _animate_spinner(self) -> None:
+        if not self.task_started_at:
+            self.spinner_label.setText("")
+            return
+        self.spinner_label.setText(self.spinner_frames[self.spinner_idx % len(self.spinner_frames)])
+        self.spinner_idx += 1
+
+    def _log(self, message: str) -> None:
+        ts = time.strftime("%H:%M:%S")
+        self.log.appendPlainText(f"[{ts}] {message}")
+
+    def _start_task_timer(self, key: str) -> None:
+        self.task_started_at[key] = time.time()
+        if not self.elapsed_timer.isActive():
+            self.elapsed_timer.start()
+        if not self.spinner_timer.isActive():
+            self.spinner_timer.start()
+        self._refresh_elapsed_label()
+
+    def _stop_task_timer(self, key: str) -> float:
+        started = self.task_started_at.pop(key, None)
+        self._refresh_elapsed_label()
+        if not self.task_started_at and self.elapsed_timer.isActive():
+            self.elapsed_timer.stop()
+        if not self.task_started_at and self.spinner_timer.isActive():
+            self.spinner_timer.stop()
+            self.spinner_label.setText("")
+        if started is None:
+            return 0.0
+        return max(0.0, time.time() - started)
+
+    def _refresh_elapsed_label(self) -> None:
+        if not self.task_started_at:
+            self.elapsed_label.setText("Active tasks: none")
+            return
+        parts = []
+        now = time.time()
+        for key in sorted(self.task_started_at.keys()):
+            elapsed = int(max(0.0, now - self.task_started_at[key]))
+            h, rem = divmod(elapsed, 3600)
+            m, s = divmod(rem, 60)
+            parts.append(f"{key} {h:02d}:{m:02d}:{s:02d}")
+        self.elapsed_label.setText("Active tasks: " + " | ".join(parts))
+
+    def _set_active_run_task(self, task_key: Optional[str]) -> None:
+        """Keep run controls mutually exclusive to prevent accidental overlap.
+
+        Only one pipeline action can run at a time (calculation, plotting, GQI,
+        or run-all). When a task is active, all run buttons are disabled and
+        only the corresponding stop button stays enabled.
+        """
+        buttons = {
+            "calc": (getattr(self, "btn_calc_run", None), getattr(self, "btn_calc_stop", None)),
+            "plot": (getattr(self, "btn_plot_run", None), getattr(self, "btn_plot_stop", None)),
+            "gqi": (getattr(self, "btn_gqi_run", None), getattr(self, "btn_gqi_stop", None)),
+            "all": (getattr(self, "btn_all_run", None), getattr(self, "btn_all_stop", None)),
+        }
+        if task_key is None:
+            for _key, (run_btn, stop_btn) in buttons.items():
+                if run_btn is not None:
+                    run_btn.setEnabled(True)
+                if stop_btn is not None:
+                    stop_btn.setEnabled(False)
+            return
+        for key, (run_btn, stop_btn) in buttons.items():
+            if run_btn is not None:
+                run_btn.setEnabled(False)
+            if stop_btn is not None:
+                stop_btn.setEnabled(key == task_key)
+
+    def _reset_run_controls_if_idle(self) -> None:
+        """Restore default run controls when no worker task is alive."""
+        active = any(name in self.workers for name in ("calc", "plot", "gqi", "all"))
+        if not active:
+            self._set_active_run_task(None)
+
+    def _ensure_no_active_pipeline_task(self, requester_label: str) -> bool:
+        """Guard against overlapping task launches from multiple run buttons."""
+        active = [name for name in ("calc", "plot", "gqi", "all") if name in self.workers]
+        if active:
+            QMessageBox.warning(
+                self,
+                requester_label,
+                "Another task is already running.\n"
+                "Stop the active task before starting a new one.",
+            )
+            return False
+        return True
 
     # ──────────────────────────────── #
     # build “Run” tab                  #
-    # (identical to your original)     #
     # ──────────────────────────────── #
     def _create_run_tab(self) -> QWidget:
         w = QWidget()
+        self.run_root_widget = w
         lay = QVBoxLayout(w)
-        lay.setContentsMargins(10, 10, 10, 10)
-        lay.setSpacing(12)
+        lay.setContentsMargins(10, 4, 10, 10)
+        lay.setSpacing(10)
 
-        # --- shared data directory ---
-        shared = QFormLayout()
+        inputs_box = QGroupBox("")
+        inputs_box.setObjectName("mainSection")
+        inputs_layout = QVBoxLayout(inputs_box)
 
-        self.data_dir = QLineEdit()
-        btn_browse = QPushButton("Browse")
-        btn_browse.clicked.connect(lambda: self._browse(self.data_dir))
-        row = QWidget()
-        row_lay = QHBoxLayout(row)
-        row_lay.setContentsMargins(0, 0, 0, 0)
-        row_lay.addWidget(self.data_dir)
-        row_lay.addWidget(btn_browse)
-        shared.addRow("Data directory:", row)
+        global_row = QWidget()
+        global_lay = QHBoxLayout(global_row)
+        global_lay.setContentsMargins(0, 0, 0, 0)
+        self.btn_cfg_edit_global = QPushButton("Global settings...")
+        self.btn_cfg_edit_global.clicked.connect(self._edit_global_settings)
+        self.btn_cfg_reset = QPushButton("Reset to package defaults")
+        self.btn_cfg_reset.clicked.connect(self._reset_runtime_settings_selection)
+        global_lay.addWidget(self.btn_cfg_edit_global)
+        global_lay.addWidget(self.btn_cfg_reset)
+        global_lay.addStretch(1)
+        inputs_layout.addWidget(global_row)
 
-        # Optional external derivatives directory
+        dataset_input_row = QWidget()
+        dataset_input_lay = QHBoxLayout(dataset_input_row)
+        dataset_input_lay.setContentsMargins(0, 0, 0, 0)
+        self.dataset_input = QLineEdit()
+        self.dataset_input.setPlaceholderText("Add one BIDS dataset path")
+        btn_dataset_browse = QPushButton("Browse")
+        btn_dataset_browse.clicked.connect(self._browse_dataset_input)
+        btn_dataset_add = QPushButton("Add")
+        btn_dataset_add.clicked.connect(self._add_dataset_from_input)
+        dataset_input_lay.addWidget(self.dataset_input)
+        dataset_input_lay.addWidget(btn_dataset_browse)
+        dataset_input_lay.addWidget(btn_dataset_add)
+        inputs_layout.addWidget(dataset_input_row)
+
+        self.dataset_table = QTableWidget(0, 2)
+        self.dataset_table.setHorizontalHeaderLabels(["Dataset path", "Settings"])
+        self.dataset_table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
+        self.dataset_table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeMode.ResizeToContents)
+        self.dataset_table.itemSelectionChanged.connect(self._on_dataset_selection_changed)
+        inputs_layout.addWidget(self.dataset_table)
+
+        options_row = QWidget()
+        options_lay = QHBoxLayout(options_row)
+        options_lay.setContentsMargins(0, 0, 0, 0)
+        self.chk_use_per_dataset_config = QCheckBox("Use per-dataset configuration")
+        self.chk_use_per_dataset_config.toggled.connect(self._toggle_per_dataset_config)
+        self.chk_use_per_dataset_config.setChecked(False)
+        options_lay.addWidget(self.chk_use_per_dataset_config)
+        options_lay.addStretch(1)
+        inputs_layout.addWidget(options_row)
+
+        # Analysis profile + runtime policy controls.
+        # These settings are shared by calculation/plotting/GQI so users can
+        # choose legacy output or profile-based runs from one place.
+        profile_box = QGroupBox("Analysis profile + policies")
+        profile_lay = QGridLayout(profile_box)
+
+        self.cmb_analysis_mode = QComboBox()
+        self.cmb_analysis_mode.addItems(["legacy", "new", "reuse", "latest"])
+        self.cmb_analysis_mode.setCurrentText("new")
+
+        self.edit_analysis_id = QLineEdit()
+        self.edit_analysis_id.setPlaceholderText("Optional profile ID (required for mode=reuse)")
+        self.btn_load_profiles = QPushButton("Load profiles...")
+        self.btn_load_profiles.clicked.connect(self._load_available_profiles)
+        self.btn_refresh_profiles = QPushButton("Refresh profiles")
+        self.btn_refresh_profiles.clicked.connect(self._refresh_profiles_cache)
+
+        self.cmb_existing_cfg_policy = QComboBox()
+        self.cmb_existing_cfg_policy.addItems(["provided", "latest_saved", "fail"])
+        self.cmb_existing_cfg_policy.setCurrentText("provided")
+
+        self.cmb_processed_sub_policy = QComboBox()
+        self.cmb_processed_sub_policy.addItems(["skip", "rerun", "fail"])
+        self.cmb_processed_sub_policy.setCurrentText("skip")
+
+        profile_lay.addWidget(QLabel("Mode:"), 0, 0)
+        profile_lay.addWidget(self.cmb_analysis_mode, 0, 1)
+        profile_lay.addWidget(QLabel("Profile ID:"), 0, 2)
+        profile_lay.addWidget(self.edit_analysis_id, 0, 3)
+        profile_lay.addWidget(self.btn_load_profiles, 0, 4)
+        profile_lay.addWidget(self.btn_refresh_profiles, 0, 5)
+        profile_lay.addWidget(QLabel("Config policy:"), 1, 0)
+        profile_lay.addWidget(self.cmb_existing_cfg_policy, 1, 1)
+        profile_lay.addWidget(QLabel("Processed subjects:"), 1, 2)
+        profile_lay.addWidget(self.cmb_processed_sub_policy, 1, 3)
+        profile_lay.setColumnStretch(3, 1)
+        inputs_layout.addWidget(profile_box)
+
+        dataset_btn_row = QWidget()
+        dataset_btn_lay = QHBoxLayout(dataset_btn_row)
+        dataset_btn_lay.setContentsMargins(0, 0, 0, 0)
+        btn_remove = QPushButton("Remove selected")
+        btn_remove.clicked.connect(self._remove_selected_dataset)
+        btn_clear = QPushButton("Clear")
+        btn_clear.clicked.connect(self._clear_datasets)
+        btn_up = QPushButton("Move up")
+        btn_up.clicked.connect(lambda: self._move_selected_dataset(-1))
+        btn_down = QPushButton("Move down")
+        btn_down.clicked.connect(lambda: self._move_selected_dataset(1))
+        dataset_btn_lay.addWidget(btn_remove)
+        dataset_btn_lay.addWidget(btn_clear)
+        dataset_btn_lay.addWidget(btn_up)
+        dataset_btn_lay.addWidget(btn_down)
+        inputs_layout.addWidget(dataset_btn_row)
+        self.section_inputs = CollapsibleDetachableSection("Inputs", inputs_box, parent=w)
+        lay.addWidget(self.section_inputs)
+
+        output_box = QGroupBox("")
+        output_box.setObjectName("mainSection")
+        output_form = QFormLayout(output_box)
         self.derivatives_dir = QLineEdit()
         derivatives_browse = QPushButton("Browse")
         derivatives_browse.clicked.connect(lambda: self._browse(self.derivatives_dir))
@@ -723,11 +1451,20 @@ class MainWindow(QMainWindow):
         deriv_lay.setContentsMargins(0, 0, 0, 0)
         deriv_lay.addWidget(self.derivatives_dir)
         deriv_lay.addWidget(derivatives_browse)
-        shared.addRow("Derivatives output (optional):", deriv_row)
+        output_form.addRow("Derivatives output:", deriv_row)
+        self.section_output = CollapsibleDetachableSection("Output folder (optional)", output_box, parent=w)
+        lay.addWidget(self.section_output)
+
+        # — Calculation section —
+        # Tab label already states "QA/QC calculation"; keep inner panel untitled
+        # to avoid repeated heading text and accent separator.
+        calc_box = QGroupBox("")
+        calc_form = QFormLayout(calc_box)
 
         self.jobs = QSpinBox()
         self.jobs.setRange(-1, os.cpu_count() or 1)
         self.jobs.setValue(-1)
+        self.jobs.valueChanged.connect(lambda _: self._refresh_calc_jobs_table())
         btn_info = QPushButton("Info")
         btn_info.setToolTip("Parallel jobs info")
 
@@ -750,26 +1487,27 @@ class MainWindow(QMainWindow):
             Using -1 will use all cores. Optimal RAM ≳ 3.5×
             #cores.
                     """
-            QMessageBox.information(self, 'Jobs Recommendation', info)
+            QMessageBox.information(self, "Jobs Recommendation", info)
 
         btn_info.clicked.connect(show_jobs_info)
-
         row_jobs = QWidget()
         jobs_lay = QHBoxLayout(row_jobs)
         jobs_lay.setContentsMargins(0, 0, 0, 0)
         jobs_lay.addWidget(self.jobs)
         jobs_lay.addWidget(btn_info)
-        shared.addRow("Jobs:", row_jobs)
+        calc_form.addRow("Calculation n_jobs:", row_jobs)
 
-        lay.addLayout(shared)
+        self.chk_calc_per_dataset_jobs = QCheckBox("Use per-dataset n_jobs override")
+        self.chk_calc_per_dataset_jobs.toggled.connect(self._toggle_calc_jobs_table)
+        calc_form.addRow(self.chk_calc_per_dataset_jobs)
 
-        # — Calculation section —
-        calc_box = QGroupBox("Calculation")
-        calc_form = QFormLayout(calc_box)
-
-        self.calc_subs = QLineEdit()
-        self.calc_subs.setPlaceholderText("all or IDs, e.g. 009,012")
-        calc_form.addRow("Subjects:", self.calc_subs)
+        self.calc_jobs_table = QTableWidget(0, 4)
+        self.calc_jobs_table.setHorizontalHeaderLabels(["Dataset", "Calc n_jobs", "Subjects", "Scan/select"])
+        self.calc_jobs_table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
+        self.calc_jobs_table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeMode.ResizeToContents)
+        self.calc_jobs_table.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeMode.Stretch)
+        self.calc_jobs_table.horizontalHeader().setSectionResizeMode(3, QHeaderView.ResizeMode.ResizeToContents)
+        calc_form.addRow(self.calc_jobs_table)
 
         self.btn_calc_run = QPushButton("Run Calculation")
         self.btn_calc_run.clicked.connect(self.start_calc)
@@ -780,7 +1518,7 @@ class MainWindow(QMainWindow):
         btns_lay.setContentsMargins(0, 0, 0, 0)
         btns_lay.addWidget(self.btn_calc_run)
         btns_lay.addWidget(self.btn_calc_stop)
-        calc_form.addRow("", row_btns)
+        calc_form.addRow(row_btns)
 
         self.btn_gqi_run = QPushButton("Run GQI")
         self.btn_gqi_run.clicked.connect(self.start_gqi)
@@ -791,13 +1529,89 @@ class MainWindow(QMainWindow):
         gqi_lay.setContentsMargins(0, 0, 0, 0)
         gqi_lay.addWidget(self.btn_gqi_run)
         gqi_lay.addWidget(self.btn_gqi_stop)
-        calc_form.addRow("", row_gqi)
-
-        lay.addWidget(calc_box)
+        calc_form.addRow(row_gqi)
 
         # — Plotting section —
-        plot_box = QGroupBox("Plotting")
+        # Tab label already states "QA/QC plotting"; keep inner panel untitled
+        # to avoid repeated heading text and accent separator.
+        plot_box = QGroupBox("")
         plot_form = QFormLayout(plot_box)
+
+        self.chk_qa_subject = QCheckBox("QA subject reports")
+        self.chk_qa_group = QCheckBox("QA group reports")
+        self.chk_qa_multisample = QCheckBox("QA multisample report")
+        self.chk_qc_group = QCheckBox("QC group report(s)")
+        self.chk_qc_multisample = QCheckBox("QC multisample report")
+        self.chk_qa_subject.setChecked(True)
+
+        mode_row = QWidget()
+        mode_lay = QVBoxLayout(mode_row)
+        mode_lay.setContentsMargins(0, 0, 0, 0)
+        mode_lay.addWidget(self.chk_qa_subject)
+        mode_lay.addWidget(self.chk_qa_group)
+        mode_lay.addWidget(self.chk_qa_multisample)
+        mode_lay.addWidget(self.chk_qc_group)
+        mode_lay.addWidget(self.chk_qc_multisample)
+        plot_form.addRow("Modes:", mode_row)
+
+        preset_row = QWidget()
+        preset_lay = QHBoxLayout(preset_row)
+        preset_lay.setContentsMargins(0, 0, 0, 0)
+        btn_qa_all = QPushButton("QA all")
+        btn_qa_all.clicked.connect(self._set_plot_preset_qa)
+        btn_qc_all = QPushButton("QC all")
+        btn_qc_all.clicked.connect(self._set_plot_preset_qc)
+        btn_all = QPushButton("All")
+        btn_all.clicked.connect(self._set_plot_preset_all)
+        btn_clear_modes = QPushButton("Clear modes")
+        btn_clear_modes.clicked.connect(self._clear_plot_modes)
+        preset_lay.addWidget(btn_qa_all)
+        preset_lay.addWidget(btn_qc_all)
+        preset_lay.addWidget(btn_all)
+        preset_lay.addWidget(btn_clear_modes)
+        plot_form.addRow("", preset_row)
+
+        self.plot_attempt = QSpinBox()
+        self.plot_attempt.setRange(0, 9999)
+        self.plot_attempt.setValue(0)
+        self.plot_attempt.setToolTip("0 means auto/latest attempt")
+        plot_form.addRow("QC attempt (0=auto):", self.plot_attempt)
+
+        self.plot_jobs = QSpinBox()
+        self.plot_jobs.setRange(-1, os.cpu_count() or 1)
+        self.plot_jobs.setValue(self.jobs.value())
+        plot_form.addRow("Plotting n_jobs:", self.plot_jobs)
+
+        self.plot_input_tsv = QLineEdit()
+        self.plot_input_tsv.setPlaceholderText("Optional: Global_Quality_Index_attempt_*.tsv")
+        btn_input_tsv = QPushButton("Browse")
+        btn_input_tsv.clicked.connect(self._browse_plot_input_tsv)
+        tsv_row = QWidget()
+        tsv_lay = QHBoxLayout(tsv_row)
+        tsv_lay.setContentsMargins(0, 0, 0, 0)
+        tsv_lay.addWidget(self.plot_input_tsv)
+        tsv_lay.addWidget(btn_input_tsv)
+        plot_form.addRow("QC input TSV:", tsv_row)
+
+        self.plot_output_report = QLineEdit()
+        self.plot_output_report.setPlaceholderText("Optional: explicit output HTML path")
+        btn_output_report = QPushButton("Browse")
+        btn_output_report.clicked.connect(self._browse_plot_output_report)
+        out_row = QWidget()
+        out_lay = QHBoxLayout(out_row)
+        out_lay.setContentsMargins(0, 0, 0, 0)
+        out_lay.addWidget(self.plot_output_report)
+        out_lay.addWidget(btn_output_report)
+        plot_form.addRow("Output report:", out_row)
+
+        for chk in [
+            self.chk_qa_subject,
+            self.chk_qa_group,
+            self.chk_qa_multisample,
+            self.chk_qc_group,
+            self.chk_qc_multisample,
+        ]:
+            chk.toggled.connect(self._update_plot_form_state)
 
         self.btn_plot_run = QPushButton("Run Plotting")
         self.btn_plot_run.clicked.connect(self.start_plot)
@@ -810,14 +1624,79 @@ class MainWindow(QMainWindow):
         pl2.addWidget(self.btn_plot_stop)
         plot_form.addRow("", prow2)
 
-        lay.addWidget(plot_box)
+        mode_tabs = QTabWidget()
+        calc_tab = QWidget()
+        calc_tab_lay = QVBoxLayout(calc_tab)
+        calc_tab_lay.setContentsMargins(0, 0, 0, 0)
+        calc_tab_lay.addWidget(calc_box)
+        calc_scroll = QScrollArea()
+        calc_scroll.setWidgetResizable(True)
+        calc_scroll.setWidget(calc_tab)
+        mode_tabs.addTab(calc_scroll, "QA/QC calculation")
+
+        plot_tab = QWidget()
+        plot_tab_lay = QVBoxLayout(plot_tab)
+        plot_tab_lay.setContentsMargins(0, 0, 0, 0)
+        plot_tab_lay.addWidget(plot_box)
+        plot_scroll = QScrollArea()
+        plot_scroll.setWidgetResizable(True)
+        plot_scroll.setWidget(plot_tab)
+        mode_tabs.addTab(plot_scroll, "QA/QC plotting")
+
+        # Full execution area = calculation + plotting tabs + run-all controls.
+        # This is the section users requested to treat as one "Pipeline orchestration" block.
+        orchestration_box = QGroupBox("")
+        orchestration_box.setObjectName("mainSection")
+        orchestration_lay = QVBoxLayout(orchestration_box)
+        orchestration_lay.setContentsMargins(8, 8, 8, 8)
+        orchestration_lay.setSpacing(8)
+        orchestration_lay.addWidget(mode_tabs)
+
+        all_row = QWidget()
+        all_box_lay = QHBoxLayout(all_row)
+        all_box_lay.setContentsMargins(0, 0, 0, 0)
+        self.btn_all_run = QPushButton("Run ALL (calc + plotting)")
+        self.btn_all_run.clicked.connect(self.start_all)
+        self.btn_all_stop = QPushButton("Stop ALL")
+        self.btn_all_stop.clicked.connect(self.stop_all)
+        all_box_lay.addStretch(1)
+        all_box_lay.addWidget(self.btn_all_run)
+        all_box_lay.addWidget(self.btn_all_stop)
+        all_box_lay.addStretch(1)
+        orchestration_lay.addWidget(all_row)
+
+        self.section_orchestration = CollapsibleDetachableSection(
+            "Pipeline orchestration",
+            orchestration_box,
+            parent=w,
+        )
+        lay.addWidget(self.section_orchestration)
 
         # — Log output —
         self.log = QPlainTextEdit()
         self.log.setReadOnly(True)
         lay.addWidget(QLabel("Log:"))
         lay.addWidget(self.log)
+        lay.addSpacing(10)
 
+        bottom_row = QWidget()
+        bottom_lay = QHBoxLayout(bottom_row)
+        bottom_lay.setContentsMargins(0, 0, 0, 0)
+        bottom_lay.setSpacing(10)
+        bottom_lay.addStretch(1)
+        self.btn_gui_settings = QPushButton("GUI settings")
+        self.btn_gui_settings.clicked.connect(self._open_gui_settings_dialog)
+        bottom_lay.addWidget(self.btn_gui_settings)
+        bottom_lay.addWidget(self.spinner_label)
+        bottom_lay.addWidget(self.elapsed_label)
+        bottom_lay.addStretch(1)
+        lay.addWidget(bottom_row)
+
+        self._refresh_calc_jobs_table()
+        self._update_config_status()
+        self._update_plot_form_state()
+        self._apply_section_highlight_style()
+        self._set_active_run_task(None)
         return w
 
     # ──────────────────────────────── #
@@ -847,74 +1726,684 @@ class MainWindow(QMainWindow):
         if path:
             edit.setText(path)
 
+    def _browse_dataset_input(self):
+        self._browse(self.dataset_input)
+        if self.dataset_input.text().strip():
+            self._add_dataset_from_input()
+
+    def _browse_plot_input_tsv(self):
+        path, _ = QFileDialog.getOpenFileName(
+            self,
+            "Select GQI TSV",
+            self.plot_input_tsv.text().strip() or "",
+            "TSV files (*.tsv);;All files (*)",
+        )
+        if path:
+            self.plot_input_tsv.setText(path)
+
+    def _browse_plot_output_report(self):
+        path, _ = QFileDialog.getSaveFileName(
+            self,
+            "Select output HTML",
+            self.plot_output_report.text().strip() or "",
+            "HTML files (*.html);;All files (*)",
+        )
+        if path:
+            self.plot_output_report.setText(path)
+
+    def _add_dataset_from_input(self):
+        path = self.dataset_input.text().strip()
+        if not path:
+            return
+        self._add_dataset_path(path)
+        self.dataset_input.clear()
+
+    def _populate_dataset_table(self, paths: List[str], selected_row: Optional[int] = None) -> None:
+        self.dataset_table.setRowCount(0)
+        for ds in paths:
+            row = self.dataset_table.rowCount()
+            self.dataset_table.insertRow(row)
+            item = QTableWidgetItem(ds)
+            item.setFlags(item.flags() & ~Qt.ItemFlag.ItemIsEditable)
+            self.dataset_table.setItem(row, 0, item)
+            cfg_btn = QPushButton("Settings...")
+            cfg_btn.setProperty("dataset_path", ds)
+            cfg_btn.clicked.connect(self._edit_dataset_settings_from_button)
+            self.dataset_table.setCellWidget(row, 1, cfg_btn)
+        if selected_row is not None and paths:
+            selected_row = max(0, min(selected_row, len(paths) - 1))
+            self.dataset_table.selectRow(selected_row)
+        self._refresh_dataset_settings_button_state()
+
+    def _add_dataset_path(self, dataset_path: str):
+        normalized = os.path.normpath(dataset_path)
+        existing = self._collect_dataset_paths()
+        if normalized in existing:
+            return
+        existing.append(normalized)
+        self._populate_dataset_table(existing, selected_row=len(existing) - 1)
+        self._refresh_calc_jobs_table()
+        self._update_config_status()
+        self._update_plot_form_state()
+
+    def _remove_selected_dataset(self):
+        selected = self.dataset_table.currentRow()
+        if selected < 0:
+            return
+        paths = self._collect_dataset_paths()
+        removed_path = paths[selected]
+        del paths[selected]
+        self._populate_dataset_table(paths, selected_row=min(selected, len(paths) - 1))
+        if removed_path:
+            self.dataset_config_paths.pop(removed_path, None)
+        self._refresh_calc_jobs_table()
+        self._update_config_status()
+        self._update_plot_form_state()
+
+    def _clear_datasets(self):
+        self._populate_dataset_table([])
+        self.dataset_config_paths.clear()
+        self._refresh_calc_jobs_table()
+        self._update_config_status()
+        self._update_plot_form_state()
+
+    def _move_selected_dataset(self, offset: int):
+        row = self.dataset_table.currentRow()
+        if row < 0:
+            return
+        paths = self._collect_dataset_paths()
+        new_row = row + offset
+        if new_row < 0 or new_row >= len(paths):
+            return
+        paths[row], paths[new_row] = paths[new_row], paths[row]
+        self._populate_dataset_table(paths, selected_row=new_row)
+        self._refresh_calc_jobs_table()
+        self._update_config_status()
+
+    def _on_dataset_selection_changed(self):
+        self._update_config_status()
+        self._update_plot_form_state()
+
+    def _collect_dataset_paths(self) -> List[str]:
+        paths: List[str] = []
+        if not hasattr(self, "dataset_table"):
+            return paths
+        for i in range(self.dataset_table.rowCount()):
+            item = self.dataset_table.item(i, 0)
+            if item is not None and item.text().strip():
+                paths.append(os.path.normpath(item.text().strip()))
+        return paths
+
+    def _selected_dataset_path(self) -> Optional[str]:
+        row = self.dataset_table.currentRow()
+        if row < 0:
+            return None
+        item = self.dataset_table.item(row, 0)
+        if item is None:
+            return None
+        return os.path.normpath(item.text().strip())
+
+    def _runtime_global_settings_path(self) -> Path:
+        return _runtime_config_dir() / "settings_global.ini"
+
+    def _runtime_dataset_settings_path(self, dataset_path: str) -> Path:
+        normalized = os.path.normpath(dataset_path)
+        digest = hashlib.sha1(normalized.encode("utf-8")).hexdigest()[:10]
+        base = Path(normalized).name.replace(" ", "_")
+        return _runtime_config_dir() / f"settings_{base}_{digest}.ini"
+
+    def _ensure_runtime_settings_copy(self, target_path: Path) -> Path:
+        if not target_path.exists():
+            shutil.copy(self.default_settings_path, target_path)
+        return target_path
+
+    def _open_settings_dialog(self, ini_path: Path, title: str) -> bool:
+        self._ensure_runtime_settings_copy(ini_path)
+        dialog = SettingsEditorDialog(
+            source_path=ini_path,
+            defaults_path=self.default_settings_path,
+            title=title,
+            parent=self,
+        )
+        return dialog.exec() == QDialog.DialogCode.Accepted
+
+    def _edit_global_settings(self):
+        runtime_path = self._runtime_global_settings_path()
+        if self._open_settings_dialog(runtime_path, "Global settings profile"):
+            self.global_config_path = str(runtime_path)
+            self._log(f"Global config active: {runtime_path}")
+            self._update_config_status()
+
+    def _edit_selected_dataset_settings(self):
+        selected = self._selected_dataset_path()
+        if not selected:
+            QMessageBox.warning(self, "Settings", "Select one dataset first.")
+            return
+        runtime_path = self._runtime_dataset_settings_path(selected)
+        if self._open_settings_dialog(runtime_path, f"Settings profile: {Path(selected).name}"):
+            self.dataset_config_paths[selected] = str(runtime_path)
+            self._log(f"Dataset override active: {selected} -> {runtime_path}")
+            self._update_config_status()
+
+    def _edit_dataset_settings_from_button(self):
+        sender = self.sender()
+        if sender is None:
+            return
+        ds = sender.property("dataset_path")
+        if not ds:
+            return
+        if not self.chk_use_per_dataset_config.isChecked():
+            return
+        selected = os.path.normpath(str(ds))
+        runtime_path = self._runtime_dataset_settings_path(selected)
+        if self._open_settings_dialog(runtime_path, f"Settings profile: {Path(selected).name}"):
+            self.dataset_config_paths[selected] = str(runtime_path)
+            self._log(f"Dataset override active: {selected} -> {runtime_path}")
+            self._update_config_status()
+
+    def _refresh_dataset_settings_button_state(self):
+        enabled = bool(getattr(self, "chk_use_per_dataset_config", None) and self.chk_use_per_dataset_config.isChecked())
+        if not hasattr(self, "dataset_table"):
+            return
+        for row in range(self.dataset_table.rowCount()):
+            btn = self.dataset_table.cellWidget(row, 1)
+            if isinstance(btn, QPushButton):
+                btn.setEnabled(enabled)
+
+    def _toggle_per_dataset_config(self, checked: bool):
+        # Keep existing mapping but only apply it when checkbox is active.
+        self._refresh_dataset_settings_button_state()
+        self._update_config_status()
+
+    def _clear_selected_dataset_config(self):
+        selected = self._selected_dataset_path()
+        if not selected:
+            QMessageBox.warning(self, "Settings", "Select one dataset first.")
+            return
+        if selected in self.dataset_config_paths:
+            self.dataset_config_paths.pop(selected, None)
+            self._log(f"Removed dataset override: {selected}")
+            self._update_config_status()
+
+    def _reset_runtime_settings_selection(self):
+        self.global_config_path = None
+        self.dataset_config_paths.clear()
+        self._log("Config selection reset to package defaults.")
+        self._update_config_status()
+
+    def _collect_dataset_config_overrides(self) -> Optional[Dict[str, str]]:
+        if not hasattr(self, "chk_use_per_dataset_config") or not self.chk_use_per_dataset_config.isChecked():
+            return None
+        if not self.dataset_config_paths:
+            return None
+        active = {os.path.normpath(p) for p in self._collect_dataset_paths()}
+        valid = {
+            os.path.normpath(ds): cfg
+            for ds, cfg in self.dataset_config_paths.items()
+            if os.path.normpath(ds) in active
+        }
+        return valid or None
+
+    def _update_config_status(self):
+        datasets = {os.path.normpath(p) for p in self._collect_dataset_paths()}
+        self.dataset_config_paths = {
+            os.path.normpath(ds): cfg
+            for ds, cfg in self.dataset_config_paths.items()
+            if os.path.normpath(ds) in datasets
+        }
+        self._refresh_dataset_settings_button_state()
+
+    def _collect_analysis_profile_settings(self) -> Tuple[str, Optional[str], str, str]:
+        """Read analysis/profile execution settings from GUI widgets."""
+        mode = self.cmb_analysis_mode.currentText().strip().lower()
+        analysis_id = self.edit_analysis_id.text().strip() or None
+        cfg_policy = self.cmb_existing_cfg_policy.currentText().strip().lower()
+        sub_policy = self.cmb_processed_sub_policy.currentText().strip().lower()
+        return mode, analysis_id, cfg_policy, sub_policy
+
+    @staticmethod
+    def _generate_shared_analysis_id() -> str:
+        """Create a deterministic, human-readable profile ID for GUI runs."""
+        return f"analysis_{time.strftime('%Y%m%d_%H%M%S')}"
+
+    def _validate_analysis_selection(
+        self,
+        mode: str,
+        analysis_id: Optional[str],
+        cfg_policy: Optional[str] = None,
+        sub_policy: Optional[str] = None,
+    ) -> bool:
+        """Return ``True`` if analysis mode/id combination is valid."""
+        if mode == "reuse" and not analysis_id:
+            QMessageBox.warning(
+                self,
+                "Analysis profile",
+                "analysis_mode='reuse' requires a profile ID.\n"
+                "Set a profile ID or use 'Load profiles...'.",
+            )
+            return False
+        return True
+
+    def _discover_profiles_for_datasets(self) -> Tuple[Dict[str, List[str]], List[str]]:
+        """Return per-dataset profile lists and their intersection."""
+        datasets = self._collect_dataset_paths()
+        derivatives_base = self.derivatives_dir.text().strip() or None
+        profile_map: Dict[str, List[str]] = {}
+        for ds in datasets:
+            try:
+                profile_map[ds] = list_analysis_profiles(
+                    dataset_path=ds,
+                    external_derivatives_root=derivatives_base,
+                )
+            except Exception:
+                profile_map[ds] = []
+        common: List[str] = []
+        if profile_map:
+            common_set = set(next(iter(profile_map.values())))
+            for values in profile_map.values():
+                common_set &= set(values)
+            common = sorted(common_set)
+        return profile_map, common
+
+    def _refresh_profiles_cache(self):
+        """Scan profile IDs across datasets and emit a concise log summary."""
+        datasets = self._collect_dataset_paths()
+        if not datasets:
+            QMessageBox.warning(self, "Profiles", "Add at least one dataset first.")
+            return
+        profile_map, common = self._discover_profiles_for_datasets()
+        summary = ", ".join(f"{Path(ds).name}:{len(vals)}" for ds, vals in profile_map.items())
+        self._log(f"Profile scan completed ({summary}); common={len(common)}.")
+        if len(datasets) > 1 and not common:
+            QMessageBox.information(
+                self,
+                "Profiles",
+                "No common profile ID across all selected datasets.\n"
+                "Use legacy mode or create/reuse a shared analysis_id.",
+            )
+
+    def _load_available_profiles(self):
+        """Discover profiles and let users pick a compatible one."""
+        datasets = self._collect_dataset_paths()
+        if not datasets:
+            QMessageBox.warning(self, "Profiles", "Add at least one dataset first.")
+            return
+
+        selected_ds = self._selected_dataset_path() or datasets[0]
+        profile_map, common = self._discover_profiles_for_datasets()
+        if len(datasets) > 1:
+            options = common
+            label = "Available common profiles across selected datasets:"
+        else:
+            options = profile_map.get(selected_ds, [])
+            label = f"Available profiles for {Path(selected_ds).name}:"
+
+        if not options:
+            QMessageBox.information(
+                self,
+                "Profiles",
+                "No compatible profiles found for current selection.",
+            )
+            return
+
+        picked, ok = QInputDialog.getItem(
+            self,
+            "Select profile",
+            label,
+            options,
+            0,
+            False,
+        )
+        if ok and picked:
+            self.edit_analysis_id.setText(str(picked))
+            self.cmb_analysis_mode.setCurrentText("reuse")
+            self._log(f"Selected profile: {picked}")
+
+    def _validate_multisample_profile_compatibility(
+        self,
+        mode: str,
+        analysis_id: Optional[str],
+        *,
+        qa_multisample: bool,
+        qc_multisample: bool,
+        require_existing_profiles: bool = True,
+    ) -> bool:
+        """Ensure multisample plotting uses a compatible profile across datasets."""
+        if not (qa_multisample or qc_multisample):
+            return True
+        if mode == "legacy":
+            return True
+        if mode not in {"reuse", "new"}:
+            QMessageBox.warning(
+                self,
+                "Profile compatibility",
+                "Multisample plotting requires a shared profile strategy.\n"
+                "Use mode='reuse' (existing profile), mode='new' (fresh shared profile),\n"
+                "or legacy mode.",
+            )
+            return False
+        if not analysis_id:
+            QMessageBox.warning(
+                self,
+                "Profile compatibility",
+                "Multisample plotting requires a profile ID for mode='reuse'/'new'.",
+            )
+            return False
+        # During Run ALL in mode='new', profiles are created by the calculation
+        # step; do not require them to exist before queueing.
+        if mode == "new" and not require_existing_profiles:
+            return True
+        profile_map, _common = self._discover_profiles_for_datasets()
+        missing = [Path(ds).name for ds, vals in profile_map.items() if analysis_id not in set(vals)]
+        if missing:
+            QMessageBox.warning(
+                self,
+                "Profile compatibility",
+                "Selected profile is missing for:\n- " + "\n- ".join(missing),
+            )
+            return False
+        return True
+
+    def _toggle_calc_jobs_table(self, checked: bool):
+        # Njobs override toggle only affects editability of the n_jobs column.
+        self._refresh_calc_jobs_table()
+
+    def _refresh_calc_jobs_table(self):
+        if not hasattr(self, "calc_jobs_table"):
+            return
+        datasets = self._collect_dataset_paths()
+        current_values: Dict[str, int] = {}
+        current_subjects: Dict[str, str] = {}
+        for row in range(self.calc_jobs_table.rowCount()):
+            item = self.calc_jobs_table.item(row, 0)
+            spin = self.calc_jobs_table.cellWidget(row, 1)
+            subs_widget = self.calc_jobs_table.cellWidget(row, 2)
+            if item is not None and spin is not None:
+                current_values[item.text()] = int(spin.value())
+            if item is not None and isinstance(subs_widget, QLineEdit):
+                current_subjects[item.text()] = subs_widget.text().strip() or "all"
+
+        self.calc_jobs_table.setRowCount(len(datasets))
+        max_jobs = os.cpu_count() or 1
+        allow_njobs_override = self.chk_calc_per_dataset_jobs.isChecked()
+        for row, ds in enumerate(datasets):
+            ds_item = QTableWidgetItem(ds)
+            ds_item.setFlags(ds_item.flags() & ~Qt.ItemFlag.ItemIsEditable)
+            self.calc_jobs_table.setItem(row, 0, ds_item)
+            spin = QSpinBox()
+            spin.setRange(-1, max_jobs)
+            spin.setValue(current_values.get(ds, self.jobs.value()))
+            spin.setEnabled(allow_njobs_override)
+            self.calc_jobs_table.setCellWidget(row, 1, spin)
+            subs_edit = QLineEdit()
+            subs_edit.setPlaceholderText("all or comma-separated IDs")
+            subs_edit.setText(current_subjects.get(ds, "all"))
+            self.calc_jobs_table.setCellWidget(row, 2, subs_edit)
+            scan_btn = QPushButton("Scan...")
+            scan_btn.setProperty("dataset_path", ds)
+            scan_btn.clicked.connect(self._open_subject_selector_for_row)
+            self.calc_jobs_table.setCellWidget(row, 3, scan_btn)
+
+    def _scan_dataset_subjects(self, dataset_path: str) -> List[str]:
+        """
+        Use ANCPBIDS to list available subjects from raw scope for one dataset.
+        """
+        import ancpbids
+        from ancpbids import DatasetOptions
+
+        dataset = ancpbids.load_dataset(dataset_path, DatasetOptions(lazy_loading=True))
+        entities = dataset.query_entities(scope="raw")
+        subjects = sorted(list(entities.get("subject", [])))
+        return [str(s) for s in subjects if str(s).strip()]
+
+    def _open_subject_selector_for_row(self):
+        sender = self.sender()
+        if sender is None:
+            return
+        ds = sender.property("dataset_path")
+        if not ds:
+            return
+        dataset_path = os.path.normpath(str(ds))
+        row_idx = None
+        for row in range(self.calc_jobs_table.rowCount()):
+            item = self.calc_jobs_table.item(row, 0)
+            if item is not None and os.path.normpath(item.text()) == dataset_path:
+                row_idx = row
+                break
+        if row_idx is None:
+            return
+        subs_widget = self.calc_jobs_table.cellWidget(row_idx, 2)
+        if not isinstance(subs_widget, QLineEdit):
+            return
+        current_raw = subs_widget.text().strip()
+        current_value: Union[str, List[str]]
+        if not current_raw or current_raw.lower() == "all":
+            current_value = "all"
+        else:
+            current_value = [s.strip() for s in current_raw.split(",") if s.strip()]
+
+        try:
+            subjects = self._scan_dataset_subjects(dataset_path)
+        except Exception as exc:
+            QMessageBox.warning(self, "Subject scan", f"Failed to scan dataset subjects:\n{exc}")
+            return
+        if not subjects:
+            QMessageBox.information(self, "Subject scan", "No subjects found in this dataset.")
+            return
+
+        dialog = SubjectSelectionDialog(Path(dataset_path).name, subjects, current_value, self)
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return
+        selected = dialog.selected_value()
+        if selected == "all":
+            subs_widget.setText("all")
+        else:
+            subs_widget.setText(",".join(selected))
+
+    def _collect_calc_njobs_overrides(self) -> Optional[Dict[str, int]]:
+        if not self.chk_calc_per_dataset_jobs.isChecked():
+            return None
+        overrides: Dict[str, int] = {}
+        for row in range(self.calc_jobs_table.rowCount()):
+            item = self.calc_jobs_table.item(row, 0)
+            spin = self.calc_jobs_table.cellWidget(row, 1)
+            if item is None or spin is None:
+                continue
+            overrides[item.text()] = int(spin.value())
+        return overrides or None
+
+    def _collect_dataset_sub_overrides(self) -> Optional[Dict[str, Union[str, List[str]]]]:
+        overrides: Dict[str, Union[str, List[str]]] = {}
+        for row in range(self.calc_jobs_table.rowCount()):
+            item = self.calc_jobs_table.item(row, 0)
+            subs_widget = self.calc_jobs_table.cellWidget(row, 2)
+            if item is None or not isinstance(subs_widget, QLineEdit):
+                continue
+            raw = subs_widget.text().strip()
+            if not raw or raw.lower() == "all":
+                overrides[item.text()] = "all"
+                continue
+            parsed = [s.strip() for s in raw.split(",") if s.strip()]
+            overrides[item.text()] = parsed if parsed else "all"
+        return overrides or None
+
+    def _set_plot_modes(self, *, qa_subject: bool, qa_group: bool, qa_multisample: bool, qc_group: bool, qc_multisample: bool):
+        self.chk_qa_subject.setChecked(qa_subject)
+        self.chk_qa_group.setChecked(qa_group)
+        self.chk_qa_multisample.setChecked(qa_multisample)
+        self.chk_qc_group.setChecked(qc_group)
+        self.chk_qc_multisample.setChecked(qc_multisample)
+        self._update_plot_form_state()
+
+    def _set_plot_preset_qa(self):
+        self._set_plot_modes(
+            qa_subject=True,
+            qa_group=True,
+            qa_multisample=True,
+            qc_group=False,
+            qc_multisample=False,
+        )
+
+    def _set_plot_preset_qc(self):
+        self._set_plot_modes(
+            qa_subject=False,
+            qa_group=False,
+            qa_multisample=False,
+            qc_group=True,
+            qc_multisample=True,
+        )
+
+    def _set_plot_preset_all(self):
+        self._set_plot_modes(
+            qa_subject=True,
+            qa_group=True,
+            qa_multisample=True,
+            qc_group=True,
+            qc_multisample=True,
+        )
+
+    def _clear_plot_modes(self):
+        self._set_plot_modes(
+            qa_subject=False,
+            qa_group=False,
+            qa_multisample=False,
+            qc_group=False,
+            qc_multisample=False,
+        )
+
+    def _update_plot_form_state(self):
+        dataset_count = len(self._collect_dataset_paths())
+        allow_multisample = dataset_count >= 2
+        for chk in [self.chk_qa_multisample, self.chk_qc_multisample]:
+            if not allow_multisample and chk.isChecked():
+                chk.blockSignals(True)
+                chk.setChecked(False)
+                chk.blockSignals(False)
+            chk.setEnabled(allow_multisample)
+
+        qa_subject_selected = self.chk_qa_subject.isChecked()
+        qa_group_selected = self.chk_qa_group.isChecked()
+        qa_multisample_selected = self.chk_qa_multisample.isChecked()
+        qc_group_selected = self.chk_qc_group.isChecked()
+        qc_multisample_selected = self.chk_qc_multisample.isChecked()
+
+        input_tsv_allowed = qc_group_selected and dataset_count == 1 and not qc_multisample_selected
+        self.plot_input_tsv.setEnabled(input_tsv_allowed)
+        if not input_tsv_allowed:
+            self.plot_input_tsv.clear()
+
+        attempt_allowed = qc_group_selected or qc_multisample_selected
+        self.plot_attempt.setEnabled(attempt_allowed)
+        if not attempt_allowed:
+            self.plot_attempt.setValue(0)
+
+        mode_count = sum(
+            1
+            for selected in [
+                qa_subject_selected,
+                qa_group_selected,
+                qa_multisample_selected,
+                qc_group_selected,
+                qc_multisample_selected,
+            ]
+            if selected
+        )
+        output_allowed = mode_count == 1 and (
+            qa_multisample_selected
+            or qc_multisample_selected
+            or (qc_group_selected and dataset_count == 1)
+        )
+        self.plot_output_report.setEnabled(output_allowed)
+        if not output_allowed:
+            self.plot_output_report.clear()
+
     # ──────────────────────────────── #
     # start / stop handlers            #
     # ──────────────────────────────── #
     def start_calc(self):
         """
         Slot for the “Run Calculation” button.
-        1) Read user inputs from the Run tab
-        2) Build the argument tuple for make_derivative_meg_qc
-        3) Instantiate and configure a Worker
-        4) Start the Worker and store it in self.workers
+        Runs one or more datasets through the shared calculation dispatcher.
         """
-        # 1) Gather inputs
-        data_dir  = self.data_dir.text().strip()
+        if not self._ensure_no_active_pipeline_task("Calculation"):
+            return
+        dataset_paths = self._collect_dataset_paths()
+        if not dataset_paths:
+            QMessageBox.warning(self, "Calculation", "Please add at least one dataset.")
+            return
+
         derivatives_dir = self.derivatives_dir.text().strip() or None
-        subs_raw  = self.calc_subs.text().strip()
-        # If user typed “all” (case-insensitive) or left blank, use the string "all";
-        # otherwise split by commas into a list of IDs.
-        subs = (
-            [s.strip() for s in subs_raw.split(",") if s.strip()]
-            if subs_raw and subs_raw.lower() != "all"
-            else "all"
+        subs = "all"
+        dataset_subs = self._collect_dataset_sub_overrides()
+        global_n_jobs = self.jobs.value()
+        dataset_njobs = self._collect_calc_njobs_overrides()
+        dataset_cfg_overrides = self._collect_dataset_config_overrides()
+        analysis_mode, analysis_id, cfg_policy, sub_policy = (
+            self._collect_analysis_profile_settings()
         )
-        n_jobs = self.jobs.value()
+        if not self._validate_analysis_selection(
+            analysis_mode,
+            analysis_id,
+            cfg_policy=cfg_policy,
+            sub_policy=sub_policy,
+        ):
+            return
 
-        # 2) Match the signature: (settings_path, internal_path, data_dir, subs, n_jobs, derivatives_base)
         args = (
-            str(SETTINGS_PATH),
+            dataset_paths,
+            str(self.default_settings_path),
             str(INTERNAL_PATH),
-            data_dir,
             subs,
-            n_jobs,
+            global_n_jobs,
             derivatives_dir,
+            dataset_njobs,
+            dataset_subs,
+            self.global_config_path,
+            dataset_cfg_overrides,
+            analysis_mode,
+            analysis_id,
+            cfg_policy,
+            sub_policy,
+            False,  # interactive_prompts disabled to prevent worker stdin blocking
+            False,  # keep_temp_on_error handled via CLI for debugging runs
         )
 
-        # 3) Create the Worker, hook up signals → log
-        worker = Worker(make_derivative_meg_qc, *args)
-        # Prevent launching the same task multiple times while it is already running.
-        self.btn_calc_run.setEnabled(False)
+        worker = Worker(run_calculation_dispatch, *args)
+        self._set_active_run_task("calc")
 
         def on_started():
-            self.log.appendPlainText("Calculation started")
+            self._start_task_timer("calc")
+            cfg_note = f"global={self.global_config_path or 'default'}"
+            self._log(
+                f"Calculation started for {len(dataset_paths)} dataset(s) "
+                f"({cfg_note}, per-dataset overrides={len(dataset_cfg_overrides or {})}, "
+                f"analysis={analysis_mode}:{analysis_id or 'legacy'})."
+            )
 
         def on_finished():
-            # Successful completion: log and re-enable button for future runs.
-            self.log.appendPlainText("Calculation finished")
-            self.btn_calc_run.setEnabled(True)
+            elapsed = self._stop_task_timer("calc")
+            self._log(f"Calculation finished in {elapsed:.2f}s.")
             self.workers.pop("calc", None)
+            self._reset_run_controls_if_idle()
 
         def on_error(err: str):
-            # Error path: report and allow the user to retry.
-            self.log.appendPlainText(f"Calculation error: {err}")
-            self.btn_calc_run.setEnabled(True)
+            elapsed = self._stop_task_timer("calc")
+            self._log(f"Calculation error after {elapsed:.2f}s: {err}")
             self.workers.pop("calc", None)
+            self._reset_run_controls_if_idle()
 
         worker.started.connect(on_started)
         worker.finished.connect(on_finished)
         worker.error.connect(on_error)
 
-        # 4) Launch and save. Store the worker before starting to avoid race conditions
-        # where the thread finishes extremely quickly.
         self.workers["calc"] = worker
         try:
             worker.start()
         except Exception as exc:
-            # Starting the worker can fail if the OS denies process creation.
-            self.log.appendPlainText(f"Calculation error: {exc}")
-            self.btn_calc_run.setEnabled(True)
+            self._stop_task_timer("calc")
+            self._log(f"Calculation error: {exc}")
             self.workers.pop("calc", None)
+            self._reset_run_controls_if_idle()
 
 
     def stop_calc(self):
@@ -926,61 +2415,134 @@ class MainWindow(QMainWindow):
         worker = self.workers.get("calc")
         if worker:
             worker.stop()
-            self.log.appendPlainText("Calculation stopped")
-            self.btn_calc_run.setEnabled(True)
+            elapsed = self._stop_task_timer("calc")
+            self._log(f"Calculation stopped after {elapsed:.2f}s.")
             self.workers.pop("calc", None)
+            self._reset_run_controls_if_idle()
 
 
     def start_plot(self):
         """
         Slot for the “Run Plotting” button.
-        Same pattern as start_calc:
-        1) Gather inputs
-        2) Build args tuple for make_plots_meg_qc
-        3) Hook up signals → log
-        4) Start Worker and store
+        Runs the shared plotting dispatcher for selected QA/QC modes.
         """
-        # 1) Gather inputs
-        data_dir = self.data_dir.text().strip()
+        if not self._ensure_no_active_pipeline_task("Plotting"):
+            return
+        dataset_paths = self._collect_dataset_paths()
+        if not dataset_paths:
+            QMessageBox.warning(self, "Plotting", "Please add at least one dataset.")
+            return
+
         derivatives_dir = self.derivatives_dir.text().strip() or None
-        n_jobs = self.jobs.value()
+        n_jobs = self.plot_jobs.value()
+        attempt_raw = self.plot_attempt.value()
+        attempt = attempt_raw if attempt_raw > 0 else None
+        input_tsv = self.plot_input_tsv.text().strip() or None
+        output_report = self.plot_output_report.text().strip() or None
 
-        # 2) Build args tuple for make_plots_meg_qc
-        # The plotting backend (full or lite) is selected inside
-        # ``make_plots_meg_qc`` based on the 'full_html_reports' option in
-        # settings.ini.
-        args = (data_dir, n_jobs, derivatives_dir)
+        qa_subject = self.chk_qa_subject.isChecked()
+        qa_group = self.chk_qa_group.isChecked()
+        qa_multisample = self.chk_qa_multisample.isChecked()
+        qc_group = self.chk_qc_group.isChecked()
+        qc_multisample = self.chk_qc_multisample.isChecked()
+        analysis_mode, analysis_id, _cfg_policy, _sub_policy = (
+            self._collect_analysis_profile_settings()
+        )
+        if not self._validate_analysis_selection(
+            analysis_mode,
+            analysis_id,
+            cfg_policy=_cfg_policy,
+            sub_policy=_sub_policy,
+        ):
+            return
+        if analysis_mode == "new" and not analysis_id:
+            QMessageBox.warning(
+                self,
+                "Plotting",
+                "Mode 'new' requires a profile ID for plotting.\n"
+                "Use mode 'reuse' with a profile ID, or 'latest'/'legacy'.",
+            )
+            return
+        if not self._validate_multisample_profile_compatibility(
+            analysis_mode,
+            analysis_id,
+            qa_multisample=qa_multisample,
+            qc_multisample=qc_multisample,
+        ):
+            return
 
-        # 3) Create Worker and wire signals
-        worker = Worker(make_plots_meg_qc, *args)
-        # Prevent duplicate plotting runs until the active one ends.
-        self.btn_plot_run.setEnabled(False)
+        check_qa_subject = qa_subject
+        if not any([qa_subject, qa_group, qa_multisample, qc_group, qc_multisample]):
+            check_qa_subject = True
+
+        try:
+            validate_plot_request(
+                dataset_paths=dataset_paths,
+                qa_subject=check_qa_subject,
+                qa_group=qa_group,
+                qa_multisample=qa_multisample,
+                qc_group=qc_group,
+                qc_multisample=qc_multisample,
+                input_tsv=input_tsv,
+                output_report=output_report,
+            )
+        except ValueError as exc:
+            QMessageBox.warning(self, "Plotting", str(exc))
+            return
+
+        args = (
+            dataset_paths,
+            derivatives_dir,
+            output_report,
+            attempt,
+            input_tsv,
+            n_jobs,
+            qa_subject,
+            qa_group,
+            qa_multisample,
+            qc_group,
+            qc_multisample,
+            False,  # qa_all
+            False,  # qc_all
+            False,  # all_modes
+            analysis_mode,
+            analysis_id,
+        )
+
+        worker = Worker(run_plotting_dispatch, *args)
+        self._set_active_run_task("plot")
 
         def on_started():
-            self.log.appendPlainText("Plotting started")
+            self._start_task_timer("plot")
+            self._log(
+                f"Plotting started for {len(dataset_paths)} dataset(s) "
+                f"(analysis={analysis_mode}:{analysis_id or 'legacy'})."
+            )
 
         def on_finished():
-            self.log.appendPlainText("Plotting finished")
-            self.btn_plot_run.setEnabled(True)
+            elapsed = self._stop_task_timer("plot")
+            self._log(f"Plotting finished in {elapsed:.2f}s.")
             self.workers.pop("plot", None)
+            self._reset_run_controls_if_idle()
 
         def on_error(err: str):
-            self.log.appendPlainText(f"Plotting error: {err}")
-            self.btn_plot_run.setEnabled(True)
+            elapsed = self._stop_task_timer("plot")
+            self._log(f"Plotting error after {elapsed:.2f}s: {err}")
             self.workers.pop("plot", None)
+            self._reset_run_controls_if_idle()
 
         worker.started.connect(on_started)
         worker.finished.connect(on_finished)
         worker.error.connect(on_error)
 
-        # 4) Launch and save
         self.workers["plot"] = worker
         try:
             worker.start()
         except Exception as exc:
-            self.log.appendPlainText(f"Plotting error: {exc}")
-            self.btn_plot_run.setEnabled(True)
+            self._stop_task_timer("plot")
+            self._log(f"Plotting error: {exc}")
             self.workers.pop("plot", None)
+            self._reset_run_controls_if_idle()
 
 
     def stop_plot(self):
@@ -992,35 +2554,69 @@ class MainWindow(QMainWindow):
         worker = self.workers.get("plot")
         if worker:
             worker.stop()
-            self.log.appendPlainText("Plotting stopped")
-            self.btn_plot_run.setEnabled(True)
+            elapsed = self._stop_task_timer("plot")
+            self._log(f"Plotting stopped after {elapsed:.2f}s.")
             self.workers.pop("plot", None)
+            self._reset_run_controls_if_idle()
 
     def start_gqi(self):
-        """Run Global Quality Index calculation only."""
-        data_dir = self.data_dir.text().strip()
+        """Run Global Quality Index calculation for one or more datasets."""
+        if not self._ensure_no_active_pipeline_task("GQI"):
+            return
+        dataset_paths = self._collect_dataset_paths()
+        if not dataset_paths:
+            QMessageBox.warning(self, "GQI", "Please add at least one dataset.")
+            return
         derivatives_dir = self.derivatives_dir.text().strip() or None
-        # Align the GQI rerun with the calculation pipeline: resolve any
-        # external derivatives base into the concrete derivatives folder so
-        # downstream code can find the previously computed metrics.
-        _, derivatives_root = resolve_output_roots(data_dir, derivatives_dir)
-        args = (data_dir, derivatives_root, str(SETTINGS_PATH))
-        worker = Worker(generate_gqi_summary, *args)
-        # Prevent concurrent GQI runs; enable again once finished or stopped.
-        self.btn_gqi_run.setEnabled(False)
+        dataset_cfg_overrides = self._collect_dataset_config_overrides()
+        analysis_mode, analysis_id, _cfg_policy, _sub_policy = (
+            self._collect_analysis_profile_settings()
+        )
+        if not self._validate_analysis_selection(
+            analysis_mode,
+            analysis_id,
+            cfg_policy=_cfg_policy,
+            sub_policy=_sub_policy,
+        ):
+            return
+        if analysis_mode == "new" and not analysis_id:
+            QMessageBox.warning(
+                self,
+                "GQI",
+                "Mode 'new' requires a profile ID for GQI recomputation.\n"
+                "Use mode 'reuse' with a profile ID, or 'latest'/'legacy'.",
+            )
+            return
+        args = (
+            dataset_paths,
+            str(self.default_settings_path),
+            derivatives_dir,
+            self.global_config_path,
+            dataset_cfg_overrides,
+            analysis_mode,
+            analysis_id,
+        )
+        worker = Worker(run_gqi_dispatch, *args)
+        self._set_active_run_task("gqi")
 
         def on_started():
-            self.log.appendPlainText("GQI started")
+            self._start_task_timer("gqi")
+            self._log(
+                f"GQI started for {len(dataset_paths)} dataset(s) "
+                f"(analysis={analysis_mode}:{analysis_id or 'legacy'})."
+            )
 
         def on_finished():
-            self.log.appendPlainText("GQI finished")
-            self.btn_gqi_run.setEnabled(True)
+            elapsed = self._stop_task_timer("gqi")
+            self._log(f"GQI finished in {elapsed:.2f}s.")
             self.workers.pop("gqi", None)
+            self._reset_run_controls_if_idle()
 
         def on_error(err: str):
-            self.log.appendPlainText(f"GQI error: {err}")
-            self.btn_gqi_run.setEnabled(True)
+            elapsed = self._stop_task_timer("gqi")
+            self._log(f"GQI error after {elapsed:.2f}s: {err}")
             self.workers.pop("gqi", None)
+            self._reset_run_controls_if_idle()
 
         worker.started.connect(on_started)
         worker.finished.connect(on_finished)
@@ -1029,17 +2625,145 @@ class MainWindow(QMainWindow):
         try:
             worker.start()
         except Exception as exc:
-            self.log.appendPlainText(f"GQI error: {exc}")
-            self.btn_gqi_run.setEnabled(True)
+            self._stop_task_timer("gqi")
+            self._log(f"GQI error: {exc}")
             self.workers.pop("gqi", None)
+            self._reset_run_controls_if_idle()
 
     def stop_gqi(self):
         worker = self.workers.get("gqi")
         if worker:
             worker.stop()
-            self.log.appendPlainText("GQI stopped")
-            self.btn_gqi_run.setEnabled(True)
+            elapsed = self._stop_task_timer("gqi")
+            self._log(f"GQI stopped after {elapsed:.2f}s.")
             self.workers.pop("gqi", None)
+            self._reset_run_controls_if_idle()
+
+    def start_all(self):
+        """Run calculation (including GQI) and then selected plotting scopes."""
+        if not self._ensure_no_active_pipeline_task("Run ALL"):
+            return
+        dataset_paths = self._collect_dataset_paths()
+        if not dataset_paths:
+            QMessageBox.warning(self, "Run ALL", "Please add at least one dataset.")
+            return
+
+        derivatives_dir = self.derivatives_dir.text().strip() or None
+        dataset_subs = self._collect_dataset_sub_overrides()
+        calc_jobs = self.jobs.value()
+        plot_jobs = self.plot_jobs.value()
+        dataset_njobs = self._collect_calc_njobs_overrides()
+        dataset_cfg_overrides = self._collect_dataset_config_overrides()
+        analysis_mode, analysis_id, cfg_policy, sub_policy = (
+            self._collect_analysis_profile_settings()
+        )
+        if not self._validate_analysis_selection(
+            analysis_mode,
+            analysis_id,
+            cfg_policy=cfg_policy,
+            sub_policy=sub_policy,
+        ):
+            return
+        qa_subject = self.chk_qa_subject.isChecked()
+        qa_group = self.chk_qa_group.isChecked()
+        qa_multisample = self.chk_qa_multisample.isChecked()
+        qc_group = self.chk_qc_group.isChecked()
+        qc_multisample = self.chk_qc_multisample.isChecked()
+        multisample_requested = qa_multisample or qc_multisample
+        if (
+            analysis_mode == "new"
+            and multisample_requested
+            and len(dataset_paths) > 1
+            and not analysis_id
+        ):
+            # Queue-friendly behavior for fresh runs: assign one shared profile
+            # ID so all datasets write to matching profile namespaces and the
+            # multisample plotting stage can run in the same Run ALL job.
+            analysis_id = self._generate_shared_analysis_id()
+            self.edit_analysis_id.setText(analysis_id)
+            self._log(
+                "Run ALL assigned shared analysis_id for multisample queue: "
+                f"{analysis_id}"
+            )
+        if not self._validate_multisample_profile_compatibility(
+            analysis_mode,
+            analysis_id,
+            qa_multisample=qa_multisample,
+            qc_multisample=qc_multisample,
+            require_existing_profiles=False,
+        ):
+            return
+        requested_any_scope = any([qa_subject, qa_group, qa_multisample, qc_group, qc_multisample])
+
+        args = (
+            dataset_paths,
+            str(self.default_settings_path),
+            str(INTERNAL_PATH),
+            "all",
+            calc_jobs,
+            plot_jobs,
+            derivatives_dir,
+            dataset_njobs,
+            dataset_subs,
+            self.global_config_path,
+            dataset_cfg_overrides,
+            analysis_mode,
+            analysis_id,
+            cfg_policy,
+            sub_policy,
+            False,  # interactive_prompts disabled to prevent worker stdin blocking
+            False,  # keep_temp_on_error (GUI keeps default: clean temp on errors)
+            qa_subject,
+            qa_group,
+            qa_multisample,
+            qc_group,
+            qc_multisample,
+            False,  # qa_all
+            False,  # qc_all
+            not requested_any_scope,  # all_modes fallback when no scopes are selected
+        )
+        worker = Worker(run_all_dispatch, *args)
+        self._set_active_run_task("all")
+
+        def on_started():
+            self._start_task_timer("all")
+            self._log(
+                f"Run ALL started for {len(dataset_paths)} dataset(s) "
+                f"(analysis={analysis_mode}:{analysis_id or 'legacy'})."
+            )
+
+        def on_finished():
+            elapsed = self._stop_task_timer("all")
+            self._log(f"Run ALL finished in {elapsed:.2f}s.")
+            self.workers.pop("all", None)
+            self._reset_run_controls_if_idle()
+
+        def on_error(err: str):
+            elapsed = self._stop_task_timer("all")
+            self._log(f"Run ALL error after {elapsed:.2f}s: {err}")
+            self.workers.pop("all", None)
+            self._reset_run_controls_if_idle()
+
+        worker.started.connect(on_started)
+        worker.finished.connect(on_finished)
+        worker.error.connect(on_error)
+        self.workers["all"] = worker
+        try:
+            worker.start()
+        except Exception as exc:
+            self._stop_task_timer("all")
+            self._log(f"Run ALL error: {exc}")
+            self.workers.pop("all", None)
+            self._reset_run_controls_if_idle()
+
+    def stop_all(self):
+        worker = self.workers.get("all")
+        if worker:
+            worker.stop()
+            elapsed = self._stop_task_timer("all")
+            self._log(f"Run ALL stopped after {elapsed:.2f}s.")
+            self.workers.pop("all", None)
+            self._reset_run_controls_if_idle()
 
 
     # ──────────────────────────────── #
@@ -1067,4 +2791,3 @@ def run_megqc_gui():
 
 if __name__ == '__main__':
     run_megqc_gui()
-

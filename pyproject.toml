@@ -1,13 +1,14 @@
 [build-system]
-requires = ["setuptools>=61.0", "wheel", "versioneer[toml]"]
+requires = ["setuptools>=61.0", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
 name = "meg_qc"
 description = "Tool for automated MEG data quality control"
 readme = "README.md"
-requires-python = ">=3.9"
-license = {text = "MIT"}
+requires-python = "==3.10.*"
+version = "0.7.0"
+license = "MIT"
 authors = [
     {name = "Karel Lopez Vilaret", email = "karel.mauricio.lopez.vilaret@uni-oldenburg.de"},
     {name = "Karel Lopez Vilaret"},
@@ -17,25 +18,18 @@ authors = [
     {name = "Erdal Karaca"},
 ]
 maintainers = [
-    {name = "ANCP Lab, University of Oldenburg", email = "currentancp@listserv.uni-oldenburg.de"},
+    {name = "ANCP Lab, University of Oldenburg", email = "karel.mauricio.lopez.vilaret@uni-oldenburg.de"},
 ]
 classifiers = [
     "Development Status :: 3 - Alpha",
     "Environment :: Console",
     "Intended Audience :: Science/Research",
-    "License :: OSI Approved :: MIT License",
     "Operating System :: OS Independent",
-    "Programming Language :: Python :: 3.8",
-    "Programming Language :: Python :: 3.9",
     "Programming Language :: Python :: 3.10",
-    "Programming Language :: Python :: 3.11",
-    "Programming Language :: Python :: 3.12",
-    "Programming Language :: Python :: 3.13",
-    "Programming Language :: Python :: 3.14",
     "Topic :: Scientific/Engineering",
 ]
 
-dynamic = ["version", "dependencies"]
+dynamic = ["dependencies"]
 
 [project.urls]
 Homepage = "https://github.com/ANCPLabOldenburg/MEGqc"
@@ -45,7 +39,6 @@ megqc = "meg_qc.miscellaneous.GUI.megqcGUI:run_megqc_gui"
 run-megqc = "meg_qc.test:run_megqc"
 run-megqc-plotting = "meg_qc.test:get_plots"
 get-megqc-config = "meg_qc.test:get_config"
-run-meg-qc = "meg_qc.run_megqc:hello_world"
 globalqualityindex = "meg_qc.test:run_gqi"
 
 [tool.setuptools]
@@ -57,12 +50,3 @@ include = ["meg_qc*"]
 
 [tool.setuptools.dynamic.dependencies]
 file = ["requirements.txt"]
-
-[tool.versioneer]
-VCS = "git"
-style = "pep440-pre"
-versionfile_source = "meg_qc/_version.py"
-versionfile_build = "meg_qc/_version.py"
-tag_prefix = ""
-parentdir_prefix = ""
-

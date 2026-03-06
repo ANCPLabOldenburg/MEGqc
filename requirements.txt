@@ -9,6 +9,3 @@ pyqt6-plugins==6.4.2.2.3; platform_system != "Darwin"
 numba==0.58.1
 psutil==5.9.8
 matplotlib==3.8.4
-statsmodels
-scikit-learn
-seaborn

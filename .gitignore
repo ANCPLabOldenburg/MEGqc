@@ -19,3 +19,8 @@ check/settings.ini
 check/settings_internal.ini
 *.egg-info/
 build/
+__pycache__/
+*.py[cod]
+*.nbc
+*.nbi
+.pytest_cache/

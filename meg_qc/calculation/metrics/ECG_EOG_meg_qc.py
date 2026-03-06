@@ -1488,7 +1488,9 @@ def get_ECG_data_choose_method(raw: mne.io.Raw, ecg_params: dict):
     raw : mne.io.Raw
         Raw data.
     ecg_params : dict
-        Dictionary with ECG parameters originating from config file.
+        Dictionary with ECG parameters originating from config file. If
+        ``fixed_channel_names`` is provided, those names are used instead
+        of MNE channel-type detection.
     
         
     Returns
@@ -1506,9 +1508,15 @@ def get_ECG_data_choose_method(raw: mne.io.Raw, ecg_params: dict):
 
     """
 
-    picks_ECG = mne.pick_types(raw.info, ecg=True)
-
-    ecg_ch_name = [raw.info['chs'][name]['ch_name'] for name in picks_ECG]
+    fixed_ecg_names = ecg_params.get('fixed_channel_names', [])
+    if fixed_ecg_names:
+        ecg_ch_name = [name for name in fixed_ecg_names if name in raw.ch_names]
+        missing = [name for name in fixed_ecg_names if name not in raw.ch_names]
+        if missing:
+            print('___MEGqc___: ECG fixed channels not found in data:', missing)
+    else:
+        picks_ECG = mne.pick_types(raw.info, ecg=True)
+        ecg_ch_name = [raw.info['chs'][name]['ch_name'] for name in picks_ECG]
 
     print ('___MEGqc___: ECG channel names:', ecg_ch_name)
 
@@ -1560,7 +1568,7 @@ def get_ECG_data_choose_method(raw: mne.io.Raw, ecg_params: dict):
     return use_method, ecg_str_total, ecg_ch_name, ecg_data, event_indexes
 
 
-def get_EOG_data(raw: mne.io.Raw):
+def get_EOG_data(raw: mne.io.Raw, eog_params: dict):
 
     """
     Find if the EOG channel is present anfd get its data.
@@ -1569,6 +1577,10 @@ def get_EOG_data(raw: mne.io.Raw):
     ----------
     raw : mne.io.Raw
         Raw data.
+    eog_params : dict
+        Dictionary with EOG parameters originating from config file. If
+        ``fixed_channel_names`` is provided, those names are used instead
+        of MNE channel-type detection.
     
         
     Returns
@@ -1587,18 +1599,33 @@ def get_EOG_data(raw: mne.io.Raw):
     
     # Find EOG events in your data and get the name of the EOG channel
 
-    # Select the EOG channels
-    eog_channels = mne.pick_types(raw.info, meg=False, eeg=False, stim=False, eog=True)
+    fixed_eog_names = eog_params.get('fixed_channel_names', [])
+    use_fixed_eog = bool(fixed_eog_names)
+    if use_fixed_eog:
+        eog_channel_names = [name for name in fixed_eog_names if name in raw.ch_names]
+        missing = [name for name in fixed_eog_names if name not in raw.ch_names]
+        if missing:
+            print('___MEGqc___: EOG fixed channels not found in data:', missing)
+        if eog_channel_names:
+            raw.set_channel_types({name: 'eog' for name in eog_channel_names})
+    else:
+        # Select the EOG channels
+        eog_channels = mne.pick_types(raw.info, meg=False, eeg=False, stim=False, eog=True)
 
-    # Get the names of the EOG channels
-    eog_channel_names = [raw.ch_names[ch] for ch in eog_channels]
+        # Get the names of the EOG channels
+        eog_channel_names = [raw.ch_names[ch] for ch in eog_channels]
 
     print('___MEGqc___: EOG channel names:', eog_channel_names)
 
 
     #TODO: WHY AM I DOING THIS CHECK??
     try:
-        eog_events = mne.preprocessing.find_eog_events(raw)
+        if eog_channel_names:
+            eog_events = mne.preprocessing.find_eog_events(raw, ch_name=eog_channel_names)
+        elif use_fixed_eog:
+            raise RuntimeError('No fixed EOG channels were found in the data.')
+        else:
+            eog_events = mne.preprocessing.find_eog_events(raw)
         #eog_events_times  = (eog_events[:, 0] - raw.first_samp) / raw.info['sfreq']
 
         #even if 2 EOG channels are present, MNE can only detect blinks!
@@ -2278,7 +2305,7 @@ def EOG_meg_qc(eog_params: dict, eog_params_internal: dict, data_path: str, chan
     gaussian_sigma=eog_params['gaussian_sigma']
     thresh_lvl_peakfinder=eog_params['thresh_lvl_peakfinder']
 
-    eog_str, eog_data, event_indexes, eog_ch_name = get_EOG_data(raw)
+    eog_str, eog_data, event_indexes, eog_ch_name = get_EOG_data(raw, eog_params)
 
     eog_derivs = []
     if len(eog_data) == 0:

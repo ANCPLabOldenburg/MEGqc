@@ -10,9 +10,12 @@ import sys
 import mne
 import shutil
 import glob
+import hashlib
 from typing import List, Union
 from joblib import Parallel, delayed
 import time
+import datetime as dt
+import importlib.metadata
 
 
 # Needed to import the modules without specifying the full path, for command line and jupyter notebook
@@ -56,6 +59,18 @@ from contextlib import contextmanager
 from meg_qc.calculation.metrics.summary_report_GQI import generate_gqi_summary
 
 
+_ANALYSIS_MODES = {"legacy", "new", "reuse", "latest"}
+# Prompt-based policies were removed to guarantee non-blocking execution in
+# CLI batch runs and GUI worker subprocesses.
+_CONFIG_POLICIES = {"provided", "latest_saved", "fail"}
+_PROCESSED_SUBJECT_POLICIES = {"skip", "rerun", "fail"}
+
+
+def _timestamp_analysis_id() -> str:
+    """Return a compact profile identifier suitable for filesystem paths."""
+    return dt.datetime.now().strftime("%Y%m%d_%H%M%S")
+
+
 def resolve_output_roots(dataset_path: str, external_derivatives_root: Optional[str]) -> Tuple[str, str]:
     """Return the dataset output root and derivatives folder respecting overrides.
 
@@ -81,6 +96,142 @@ def resolve_output_roots(dataset_path: str, external_derivatives_root: Optional[
     derivatives_root = os.path.join(output_root, 'derivatives')
     os.makedirs(derivatives_root, exist_ok=True)
     return output_root, derivatives_root
+
+
+def list_analysis_profiles(
+    dataset_path: str,
+    external_derivatives_root: Optional[str] = None,
+) -> List[str]:
+    """List available MEGqc profile IDs for one dataset.
+
+    Profiles are discovered under ``derivatives/Meg_QC/profiles/<analysis_id>``.
+    Returned IDs are sorted by latest modification time first.
+    """
+    _, derivatives_root = resolve_output_roots(dataset_path, external_derivatives_root)
+    profiles_root = os.path.join(derivatives_root, "Meg_QC", "profiles")
+    if not os.path.isdir(profiles_root):
+        return []
+    candidates = []
+    for entry in os.listdir(profiles_root):
+        full = os.path.join(profiles_root, entry)
+        if os.path.isdir(full):
+            try:
+                mtime = os.path.getmtime(full)
+            except OSError:
+                mtime = 0.0
+            candidates.append((entry, mtime))
+    candidates.sort(key=lambda item: item[1], reverse=True)
+    return [name for name, _ in candidates]
+
+
+def resolve_analysis_root(
+    dataset_path: str,
+    external_derivatives_root: Optional[str] = None,
+    analysis_mode: str = "legacy",
+    analysis_id: Optional[str] = None,
+    create_if_missing: bool = False,
+) -> Tuple[str, str, str, Optional[str], List[str]]:
+    """Resolve output roots plus profile-specific MEGqc folder.
+
+    Returns
+    -------
+    tuple
+        ``(output_root, derivatives_root, megqc_root, resolved_analysis_id, analysis_segments)``
+        where ``analysis_segments`` is ``[]`` in legacy mode and
+        ``["profiles", resolved_analysis_id]`` otherwise.
+    """
+    mode = str(analysis_mode or "legacy").strip().lower()
+    if mode not in _ANALYSIS_MODES:
+        raise ValueError(
+            f"Invalid analysis_mode '{analysis_mode}'. Supported modes: "
+            f"{', '.join(sorted(_ANALYSIS_MODES))}."
+        )
+
+    output_root, derivatives_root = resolve_output_roots(dataset_path, external_derivatives_root)
+    legacy_root = os.path.join(derivatives_root, "Meg_QC")
+    if mode == "legacy":
+        if create_if_missing:
+            os.makedirs(legacy_root, exist_ok=True)
+        return output_root, derivatives_root, legacy_root, None, []
+
+    profiles_root = os.path.join(legacy_root, "profiles")
+    if create_if_missing:
+        os.makedirs(profiles_root, exist_ok=True)
+
+    resolved_id = analysis_id.strip() if isinstance(analysis_id, str) and analysis_id.strip() else None
+    available = list_analysis_profiles(dataset_path, external_derivatives_root)
+
+    if mode == "new":
+        resolved_id = resolved_id or _timestamp_analysis_id()
+    elif mode == "reuse":
+        if not resolved_id:
+            raise ValueError("analysis_mode='reuse' requires analysis_id.")
+        if resolved_id not in available and not create_if_missing:
+            raise FileNotFoundError(
+                f"Profile '{resolved_id}' not found under {profiles_root}."
+            )
+    elif mode == "latest":
+        if available:
+            resolved_id = available[0]
+        else:
+            raise FileNotFoundError(
+                f"No analysis profiles found under {profiles_root}. "
+                "Use analysis_mode='new' to create one, or analysis_mode='legacy'."
+            )
+
+    profile_root = os.path.join(profiles_root, str(resolved_id))
+    if create_if_missing:
+        os.makedirs(profile_root, exist_ok=True)
+
+    analysis_segments = ["profiles", str(resolved_id)]
+    return output_root, derivatives_root, profile_root, resolved_id, analysis_segments
+
+
+def _config_dir_from_megqc_root(megqc_root: str) -> str:
+    return os.path.join(megqc_root, "config")
+
+
+def _list_used_settings_files(config_dir: str) -> List[str]:
+    """Return saved config snapshots sorted by latest first."""
+    if not os.path.isdir(config_dir):
+        return []
+    pattern = os.path.join(config_dir, "*_desc-UsedSettings*_meg.ini")
+    files = glob.glob(pattern)
+    files.sort(key=lambda p: os.path.getmtime(p), reverse=True)
+    return files
+
+
+def _resolve_config_by_policy(
+    default_config_file_path: str,
+    config_dir: str,
+    existing_config_policy: str = "provided",
+    interactive_prompts: bool = False,
+) -> Optional[str]:
+    """Resolve the config file for one run according to explicit policy."""
+    policy = str(existing_config_policy or "provided").strip().lower()
+    if policy not in _CONFIG_POLICIES:
+        raise ValueError(
+            f"Invalid existing_config_policy '{existing_config_policy}'. Supported: "
+            f"{', '.join(sorted(_CONFIG_POLICIES))}."
+        )
+
+    existing = _list_used_settings_files(config_dir)
+    if policy == "provided":
+        return default_config_file_path
+    if policy == "latest_saved":
+        return existing[0] if existing else default_config_file_path
+    if policy == "fail":
+        if existing:
+            raise RuntimeError(
+                "Existing config snapshots were found for this dataset/profile. "
+                "Choose existing_config_policy='provided' or 'latest_saved'."
+            )
+        return default_config_file_path
+
+    raise RuntimeError(
+        "Prompt-based config policy is no longer supported. "
+        "Use existing_config_policy='provided', 'latest_saved', or 'fail'."
+    )
 
 
 @contextmanager
@@ -250,7 +401,7 @@ def get_files_list(sid: str, dataset_path: str, dataset):
     return list_of_files, entities_per_file
 
 
-def create_config_artifact(derivative, config_file_path: str, f_name_to_save: str, all_taken_raw_files: List[str]):
+def create_config_artifact(root_folder, config_file_path: str, f_name_to_save: str, all_taken_raw_files: List[str]):
     """
     Save the config file used for this run as a derivative.
 
@@ -260,8 +411,8 @@ def create_config_artifact(derivative, config_file_path: str, f_name_to_save: st
 
     Parameters
     ----------
-    derivative : ancpbids.Derivative
-        Derivative object to save the config file.
+    root_folder : ancpbids folder-like object
+        Folder-like node where the ``config`` folder should be created.
     config_file_path : str
         Path to the config file used for this ds conversion
     f_name_to_save : str
@@ -277,7 +428,7 @@ def create_config_artifact(derivative, config_file_path: str, f_name_to_save: st
 
     f_name_to_save = f_name_to_save + str(timestamp)
 
-    config_folder = derivative.create_folder(name='config')
+    config_folder = root_folder.create_folder(name='config')
     config_artifact = config_folder.create_artifact()
 
     config_artifact.content = lambda file_path, cont=config_file_path: shutil.copy(cont, file_path)
@@ -317,37 +468,117 @@ def ask_user_rerun_subs(reuse_config_file_path: str, sub_list: List[str]):
 
     """
 
-    list_of_files_json, _ = get_list_of_raws_for_config(reuse_config_file_path)
-    if not list_of_files_json:
-        return sub_list
+    # Deprecated helper kept only for API compatibility.
+    raise RuntimeError(
+        "ask_user_rerun_subs() is deprecated. "
+        "Use processed_subjects_policy ('skip'|'rerun'|'fail')."
+    )
 
-    # find all 'sub-' in the file names to get the subject ID:
-    json_subjects_to_skip = [f.split('sub-')[1].split('_')[0] for f in list_of_files_json]
 
-    # keep unique subjects:
-    json_subjects_to_skip = list(set(json_subjects_to_skip))
+def _subjects_overlap_from_config(config_file_path: Optional[str], requested_subs: List[str]) -> List[str]:
+    """Return requested subjects that were already processed for one config snapshot."""
+    if not config_file_path:
+        return []
+    prev_files, _ = get_list_of_raws_for_config(config_file_path)
+    if not prev_files:
+        return []
+    parsed = []
+    for name in prev_files:
+        try:
+            parsed.append(str(name).split('sub-')[1].split('_')[0])
+        except Exception:
+            continue
+    done_subs = set(parsed)
+    return [sub for sub in requested_subs if sub in done_subs]
 
-    # find subjects overlapping withing current list and the json file:
-    subjects_to_skip = [sub for sub in sub_list if sub in json_subjects_to_skip]
 
-    # ask the user if he wants to skip these subjects:
-    print('___MEGqc___: ', 'These requested subjects were already processed before with this config file:',
-          subjects_to_skip)
-    while True:
-        user_input = input(
-            '___MEGqc___: Do you want to RERUN these subjects with the same config parameters? (Y/N): ').lower()
-        if user_input == 'n':  # remove these subs
-            print('___MEGqc___: ', 'Subjects to skip:', subjects_to_skip)
-            sub_list = [sub for sub in sub_list if sub not in subjects_to_skip]
-            print('___MEGqc___: ', 'Subjects to process:', sub_list)
-            break
-        elif user_input == 'y':  # keep these subs in all_taken_raw_files
-            print('___MEGqc___: ', 'Subjects to process:', sub_list)
-            break
-        else:  # ask again if the input is not correct
-            print('___MEGqc___: ', 'Wrong input. Please enter Y or N.')
+def _apply_processed_subjects_policy(
+    requested_subs: List[str],
+    overlap_subs: List[str],
+    processed_subjects_policy: str = "skip",
+    interactive_prompts: bool = False,
+) -> List[str]:
+    """Apply explicit policy for already-processed subjects.
 
-    return sub_list
+    Parameters
+    ----------
+    requested_subs
+        Subjects requested for current run.
+    overlap_subs
+        Subjects already represented in the selected config snapshot.
+    processed_subjects_policy
+        One of: ``skip``, ``rerun``, ``fail``.
+    interactive_prompts
+        Deprecated (kept for API compatibility). Prompt policies were removed.
+    """
+    policy = str(processed_subjects_policy or "skip").strip().lower()
+    if policy not in _PROCESSED_SUBJECT_POLICIES:
+        raise ValueError(
+            f"Invalid processed_subjects_policy '{processed_subjects_policy}'. Supported: "
+            f"{', '.join(sorted(_PROCESSED_SUBJECT_POLICIES))}."
+        )
+    if not overlap_subs:
+        return requested_subs
+
+    print('___MEGqc___: ', 'These requested subjects were already processed before:', overlap_subs)
+
+    if policy == "skip":
+        updated = [sub for sub in requested_subs if sub not in set(overlap_subs)]
+        print('___MEGqc___: ', 'Subjects to process after skip policy:', updated)
+        return updated
+    if policy == "rerun":
+        print('___MEGqc___: ', 'Rerun policy selected; all requested subjects will be processed.')
+        return requested_subs
+    if policy == "fail":
+        raise RuntimeError(
+            "Already-processed subjects detected and processed_subjects_policy='fail'. "
+            "Use 'skip' or 'rerun' to continue."
+        )
+
+    raise RuntimeError(
+        "Prompt-based processed-subject policy is no longer supported. "
+        "Use processed_subjects_policy='skip', 'rerun', or 'fail'."
+    )
+
+
+def _write_profile_manifest(
+    megqc_root: str,
+    *,
+    analysis_mode: str,
+    analysis_id: Optional[str],
+    config_file_path: str,
+    existing_config_policy: str,
+    processed_subjects_policy: str,
+) -> None:
+    """Persist lightweight metadata for one profile run.
+
+    This manifest supports future GUI profile introspection and reproducibility
+    without scanning every artifact.
+    """
+    os.makedirs(megqc_root, exist_ok=True)
+    cfg_hash = None
+    try:
+        with open(config_file_path, "rb") as f:
+            cfg_hash = hashlib.sha1(f.read()).hexdigest()
+    except Exception:
+        cfg_hash = None
+    manifest = {
+        "analysis_mode": analysis_mode,
+        "analysis_id": analysis_id,
+        "timestamp": dt.datetime.now().isoformat(timespec="seconds"),
+        "config_file_path": config_file_path,
+        "config_sha1": cfg_hash,
+        "existing_config_policy": existing_config_policy,
+        "processed_subjects_policy": processed_subjects_policy,
+    }
+    # Version is optional at runtime (editable installs may not expose metadata).
+    try:
+        manifest["meg_qc_version"] = importlib.metadata.version("meg_qc")
+    except Exception:
+        manifest["meg_qc_version"] = None
+    out = os.path.join(megqc_root, "profile_manifest.json")
+    with open(out, "w", encoding="utf-8") as f:
+        json.dump(manifest, f, indent=2)
 
 
 def get_list_of_raws_for_config(reuse_config_file_path: str):
@@ -374,7 +605,7 @@ def get_list_of_raws_for_config(reuse_config_file_path: str):
     if not os.path.isfile(json_for_reused_config):
         print('___MEGqc___: ',
               'No json file found for the config file used before. Can not add the new raw files to it.')
-        return
+        return [], None
 
     print('___MEGqc___: ', 'json_for_reused_config', json_for_reused_config)
 
@@ -386,9 +617,8 @@ def get_list_of_raws_for_config(reuse_config_file_path: str):
             content = file.read()
         print(f"Error decoding JSON: {e}")
         print(f"File content:\n{content}")
-        # Handle the error appropriately, e.g., set config_json to an empty dict or raise an error
-        config_json = {}
-        return
+        # Handle the error appropriately by returning no previously processed files
+        return [], None
 
     # from file name get desc entity to use it as a key in the json file:
     # after desc- and before the underscores:
@@ -396,12 +626,12 @@ def get_list_of_raws_for_config(reuse_config_file_path: str):
     config_desc = file_name.split('desc-')[1].split('_')[0]
 
     # get what files already were in the config file
-    list_of_files = config_json[config_desc]
+    list_of_files = config_json.get(config_desc, [])
 
     return list_of_files, config_desc
 
 
-def add_raw_to_config_json(derivative, reuse_config_file_path: str, all_taken_raw_files: List[str]):
+def add_raw_to_config_json(root_folder, reuse_config_file_path: str, all_taken_raw_files: List[str]):
     """
     Add the list of all taken raw files to the existing list of used settings in the config file.
 
@@ -419,8 +649,8 @@ def add_raw_to_config_json(derivative, reuse_config_file_path: str, all_taken_ra
 
     Parameters
     ----------
-    derivative : ancpbids.Derivative
-        Derivative object to save the config file.
+    root_folder : ancpbids folder-like object
+        Folder-like node where the ``config`` folder should be created.
     reuse_config_file_path : str
         Path to the config file used for this ds conversion before.
     all_taken_raw_files : list
@@ -444,7 +674,7 @@ def add_raw_to_config_json(derivative, reuse_config_file_path: str, all_taken_ra
     # overwrite the old json (premake ancp bids artifact):
     config_json = {config_desc: list_of_files}
 
-    config_folder = derivative.create_folder(name='config')
+    config_folder = root_folder.create_folder(name='config')
     # TODO: we dont need to create config folder again, already got it, how to get it?
 
     config_json_artifact = config_folder.create_artifact()
@@ -536,22 +766,13 @@ def check_config_saved_ask_user(dataset):
 
     reuse_config_file_path = None
 
-    # Ask the user if he wants to use any of existing config files:
+    # Deprecated helper kept only for API compatibility.
     if used_setting_file_list:
-        print('___MEGqc___: ',
-              'There are already config files used for this data set. Do you want to use any of them again?')
-        print('___MEGqc___: ', 'List of the config files previously used for this data set:')
-        for i, file in enumerate(used_setting_file_list):
-            print('___MEGqc___: ', i, file)
-
-        user_input = input(
-            '___MEGqc___: Enter the number of the config file you want to use, or press Enter to use the default one: ')
-        if user_input:
-            reuse_config_file_path = used_setting_file_list[int(user_input)]
-        else:
-            print('___MEGqc___: ', 'You chose to use the default config file.')
-
-    return reuse_config_file_path
+        print(
+            "___MEGqc___: Prompt-based config reuse is deprecated. "
+            "Use existing_config_policy instead."
+        )
+    return None
 
 
 def check_sub_list(sub_list: Union[List[str], str], dataset):
@@ -609,7 +830,8 @@ def process_one_subject(
         all_qc_params: dict,
         internal_qc_params: dict,
         derivatives_root: str,
-        output_root: str
+        output_root: str,
+        analysis_segments: Optional[List[str]] = None,
 ):
     """
     This function processes a single subject. It contains all the code that was
@@ -632,6 +854,10 @@ def process_one_subject(
     output_root : str
         Base directory used when persisting derivatives (parent of the
         derivatives folder), allowing redirection outside the BIDS dataset.
+    analysis_segments : list of str, optional
+        Extra folder segments inserted between ``Meg_QC`` and ``calculation``.
+        In legacy mode this is ``[]``; in profile mode this is
+        ``["profiles", <analysis_id>]``.
     """
 
     # We replicate everything that was inside the loop.
@@ -642,7 +868,14 @@ def process_one_subject(
 
     print('___MEGqc___: ', 'Take SUB: ', sub)
 
-    calculation_folder = derivative.create_folder(name='calculation')
+    analysis_segments = analysis_segments or []
+    # Keep derivative naming stable (Meg_QC) and insert profile folder(s)
+    # underneath it so existing desc/suffix parsing remains unchanged.
+    root_folder = derivative
+    for seg in analysis_segments:
+        root_folder = root_folder.create_folder(name=str(seg))
+
+    calculation_folder = root_folder.create_folder(name='calculation')
     subject_folder = calculation_folder.create_folder(
         type_=dataset.get_schema().Subject,
         name='sub-' + sub
@@ -1022,7 +1255,8 @@ def process_one_subject_safe(
         all_qc_params: dict,
         internal_qc_params: dict,
         derivatives_root: str,
-        output_root: str):
+        output_root: str,
+        analysis_segments: Optional[List[str]] = None):
     """Wrapper around :func:`process_one_subject` that catches errors.
 
     Parameters are identical to :func:`process_one_subject`.
@@ -1038,6 +1272,7 @@ def process_one_subject_safe(
             internal_qc_params=internal_qc_params,
             derivatives_root=derivatives_root,
             output_root=output_root,
+            analysis_segments=analysis_segments,
         )
         return sub, result
     except Exception as e:  # Catch any error so the parallel job continues
@@ -1156,52 +1391,105 @@ def make_derivative_meg_qc(
         ds_paths: Union[List[str], str],
         sub_list: Union[List[str], str] = 'all',
         n_jobs: int = 5,  # Number of parallel jobs
-        derivatives_base: Optional[str] = None
+        derivatives_base: Optional[str] = None,
+        analysis_mode: str = "legacy",
+        analysis_id: Optional[str] = None,
+        existing_config_policy: str = "provided",
+        processed_subjects_policy: str = "skip",
+        interactive_prompts: bool = False,
+        keep_temp_on_error: bool = False,
 ):
+    """Run MEGqc calculation for one or more datasets.
+
+    Parameters
+    ----------
+    analysis_mode
+        ``legacy`` writes to ``derivatives/Meg_QC``.
+        ``new``/``reuse``/``latest`` write under
+        ``derivatives/Meg_QC/profiles/<analysis_id>``.
+    analysis_id
+        Profile identifier used with ``new`` or ``reuse``.
+    existing_config_policy
+        Policy for choosing config when snapshots already exist in profile.
+    processed_subjects_policy
+        Policy when requested subjects already appear in selected snapshot.
+    interactive_prompts
+        Deprecated (kept for API compatibility). Prompt policies are disabled.
+    keep_temp_on_error
+        If ``True``, temporary preprocessed FIF files are kept when an exception
+        occurs while processing a dataset to aid debugging.
+    """
     start_time = time.time()
 
     ds_paths = check_ds_paths(ds_paths)
     internal_qc_params = get_internal_config_params(internal_config_file_path)
 
+    requested_sub_list = sub_list
+
     for dataset_path in ds_paths:
         print('___MEGqc___: ', 'DS path:', dataset_path)
         dataset = ancpbids.load_dataset(dataset_path, DatasetOptions(lazy_loading=True))
-        schema = dataset.get_schema()
-
-        output_root, derivatives_root = resolve_output_roots(dataset_path, derivatives_base)
-
-        with temporary_dataset_base(dataset, output_root):
-            reuse_config_file_path = check_config_saved_ask_user(dataset)
-        if reuse_config_file_path:
-            config_file_path = reuse_config_file_path
-        else:
-            config_file_path = default_config_file_path
-        print('___MEGqc___: ', 'Using config file: ', config_file_path)
-
-        all_qc_params = get_all_config_params(config_file_path)
-        if all_qc_params is None:
-            return
-
-        # Determine which subjects to run
-        sub_list = check_sub_list(sub_list, dataset)
-        if reuse_config_file_path:
-            sub_list = ask_user_rerun_subs(reuse_config_file_path, sub_list)
-
-        # Parallel execution over subjects
-        # Each subject is processed by process_one_subject_safe() in parallel
-        # with n_jobs specifying how many workers to run simultaneously
-        results = Parallel(n_jobs=n_jobs)(
-            delayed(process_one_subject_safe)(
-                sub=sub,
-                dataset=dataset,
-                dataset_path=dataset_path,
-                all_qc_params=all_qc_params,
-                internal_qc_params=internal_qc_params,
-                derivatives_root=derivatives_root,
-                output_root=output_root
-            )
-            for sub in sub_list
+        (
+            output_root,
+            derivatives_root,
+            megqc_root,
+            resolved_analysis_id,
+            analysis_segments,
+        ) = resolve_analysis_root(
+            dataset_path=dataset_path,
+            external_derivatives_root=derivatives_base,
+            analysis_mode=analysis_mode,
+            analysis_id=analysis_id,
+            create_if_missing=True,
         )
+        config_dir = _config_dir_from_megqc_root(megqc_root)
+        os.makedirs(config_dir, exist_ok=True)
+
+        # Ensure temporary intermediates are cleaned deterministically. On
+        # failures, keep_temp_on_error allows retaining them for debugging.
+        dataset_succeeded = False
+        try:
+            config_file_path = _resolve_config_by_policy(
+                default_config_file_path=default_config_file_path,
+                config_dir=config_dir,
+                existing_config_policy=existing_config_policy,
+                interactive_prompts=interactive_prompts,
+            )
+            print('___MEGqc___: ', 'Using config file: ', config_file_path)
+
+            all_qc_params = get_all_config_params(config_file_path)
+            if all_qc_params is None:
+                return
+
+            # Determine which subjects to run
+            dataset_sub_list = check_sub_list(requested_sub_list, dataset)
+            if dataset_sub_list is None:
+                print('___MEGqc___: ', 'No valid subjects to process for this dataset.')
+                continue
+            overlap = _subjects_overlap_from_config(config_file_path, dataset_sub_list)
+            dataset_sub_list = _apply_processed_subjects_policy(
+                requested_subs=dataset_sub_list,
+                overlap_subs=overlap,
+                processed_subjects_policy=processed_subjects_policy,
+                interactive_prompts=interactive_prompts,
+            )
+
+            # Parallel execution over subjects
+            # Each subject is processed by process_one_subject_safe() in parallel
+            # with n_jobs specifying how many workers to run simultaneously
+            results = Parallel(n_jobs=n_jobs)(
+                delayed(process_one_subject_safe)(
+                    sub=sub,
+                    dataset=dataset,
+                    dataset_path=dataset_path,
+                    all_qc_params=all_qc_params,
+                    internal_qc_params=internal_qc_params,
+                    derivatives_root=megqc_root,
+                    output_root=output_root,
+                    analysis_segments=analysis_segments,
+                )
+                for sub in dataset_sub_list
+            )
 
         # for sub in sub_list:
         #     process_one_subject(
@@ -1222,45 +1510,61 @@ def make_derivative_meg_qc(
         #         global_avg_ecg += ecg_data
         #         global_avg_eog += eog_data
 
-        # Collect results and log subjects that failed
-        excluded_subjects = [sub for sub, files in results if files is None]
+            # Collect results and log subjects that failed
+            excluded_subjects = [sub for sub, files in results if files is None]
 
-        # Remove temporary folder of intermediate files
-        delete_temp_folder(derivatives_root)
+            # Save config file used for this run as a derivative:
+            all_subs_raw_files = []
+            for sub, subj_files in results:
+                if subj_files is not None:
+                    all_subs_raw_files.extend(subj_files)
 
-        # Save config file used for this run as a derivative:
-        all_subs_raw_files = []
-        for sub, subj_files in results:
-            if subj_files is not None:
-                all_subs_raw_files.extend(subj_files)
+            derivative = dataset.create_derivative(name="Meg_QC")
+            derivative.dataset_description.GeneratedBy.Name = "MEG QC Pipeline"
+            root_folder = derivative
+            for seg in analysis_segments:
+                root_folder = root_folder.create_folder(name=str(seg))
 
-        derivative = dataset.create_derivative(name="Meg_QC")
-        derivative.dataset_description.GeneratedBy.Name = "MEG QC Pipeline"
+            # Always persist a timestamped config snapshot to make sensitivity
+            # analyses and profile provenance explicit and auditable.
+            create_config_artifact(root_folder, config_file_path, 'UsedSettings', all_subs_raw_files)
 
-        if reuse_config_file_path is None:
-            # if no config file was used before, save the one used now
-            create_config_artifact(derivative, config_file_path, 'UsedSettings', all_subs_raw_files)
-        else:
-            # otherwise - dont save config again, but add list of all taken raw files to the existing list of used settings:
-            add_raw_to_config_json(derivative, reuse_config_file_path, all_subs_raw_files)
+            # Write the pipeline-level derivative to disk
+            with temporary_dataset_base(dataset, output_root):
+                ancpbids.write_derivative(dataset, derivative)
 
-        # Write the pipeline-level derivative to disk
-        with temporary_dataset_base(dataset, output_root):
-            ancpbids.write_derivative(dataset, derivative)
+            _write_profile_manifest(
+                megqc_root=megqc_root,
+                analysis_mode=analysis_mode,
+                analysis_id=resolved_analysis_id,
+                config_file_path=config_file_path,
+                existing_config_policy=existing_config_policy,
+                processed_subjects_policy=processed_subjects_policy,
+            )
 
-        # Save list of excluded subjects
-        if excluded_subjects:
-            excl_path = os.path.join(derivatives_root, 'Meg_QC', 'excluded_subjects')
-            os.makedirs(os.path.dirname(excl_path), exist_ok=True)
-            with open(excl_path, 'w', encoding='utf-8') as f:
-                for sub in excluded_subjects:
-                    f.write(str(sub) + '\n')
+            # Save list of excluded subjects
+            if excluded_subjects:
+                excl_path = os.path.join(megqc_root, 'excluded_subjects')
+                os.makedirs(os.path.dirname(excl_path), exist_ok=True)
+                with open(excl_path, 'w', encoding='utf-8') as f:
+                    for sub in excluded_subjects:
+                        f.write(str(sub) + '\n')
 
-        # Generate Global Quality Index reports and group table
-        try:
-            generate_gqi_summary(dataset_path, derivatives_root, config_file_path)
-        except Exception as e:
-            print("___MEGqc___: Failed to create global quality reports", e)
+            # Generate Global Quality Index reports and group table
+            try:
+                generate_gqi_summary(dataset_path, megqc_root, config_file_path)
+            except Exception as e:
+                print("___MEGqc___: Failed to create global quality reports", e)
+
+            dataset_succeeded = True
+        finally:
+            if dataset_succeeded or not keep_temp_on_error:
+                delete_temp_folder(megqc_root)
+            else:
+                print(
+                    "___MEGqc___: keep_temp_on_error=True, preserving temporary "
+                    f"files under {os.path.join(megqc_root, '.tmp')}"
+                )
 
     end_time = time.time()
     elapsed_seconds = end_time - start_time
@@ -1271,4 +1575,3 @@ def make_derivative_meg_qc(
     print(f"CALCULATION MODULE FINISHED. Elapsed time: {elapsed_seconds:.2f} seconds.")
 
     return
-

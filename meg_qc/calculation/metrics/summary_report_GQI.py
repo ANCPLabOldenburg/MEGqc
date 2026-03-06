@@ -10,9 +10,6 @@ from statistics import mean
 from typing import Union, Optional, Dict
 
 import pandas as pd
-import matplotlib.pyplot as plt
-import numpy as np
-import matplotlib.cm as cm
 
 from meg_qc.calculation.initial_meg_qc import get_all_config_params
 
@@ -227,9 +224,52 @@ def create_summary_report(
         df.rename(columns={"mag": "MAGNETOMETERS", "grad": "GRADIOMETERS"}, inplace=True)
         return df
 
+    def build_epoch_summary(source):
+        """Return a table summarising noisy and flat epochs."""
+        def _resolve_epoch_totals(data_for_sensor):
+            total_noisy = data_for_sensor.get("total_num_noisy_ep")
+            total_noisy_pct = data_for_sensor.get("total_perc_noisy_ep")
+            total_flat = data_for_sensor.get("total_num_flat_ep")
+            total_flat_pct = data_for_sensor.get("total_perc_flat_ep")
+
+            details = data_for_sensor.get("details")
+            if isinstance(details, list) and details:
+                total_epochs = len(details)
+                noisy_count = sum(1 for item in details if item.get("epoch_too_noisy") is True)
+                flat_count = sum(1 for item in details if item.get("epoch_too_flat") is True)
+                if total_noisy is None:
+                    total_noisy = noisy_count
+                if total_flat is None:
+                    total_flat = flat_count
+                if total_noisy_pct is None:
+                    total_noisy_pct = round(noisy_count / total_epochs * 100, 1)
+                if total_flat_pct is None:
+                    total_flat_pct = round(flat_count / total_epochs * 100, 1)
+
+            return total_noisy, total_noisy_pct, total_flat, total_flat_pct
+
+        rows = []
+        for sensor_type in ["mag", "grad"]:
+            data_for_sensor = _safe_dict(_safe_dict(source).get(sensor_type))
+            total_noisy, total_noisy_pct, total_flat, total_flat_pct = _resolve_epoch_totals(data_for_sensor)
+            rows.append(
+                {
+                    "Sensor Type": "MAGNETOMETERS" if sensor_type == "mag" else "GRADIOMETERS",
+                    "Noisy Epochs": _format_count_percent(
+                        total_noisy,
+                        total_noisy_pct,
+                    ),
+                    "Flat Epochs": _format_count_percent(
+                        total_flat,
+                        total_flat_pct,
+                    ),
+                }
+            )
+        return pd.DataFrame(rows)
+
     if std_present:
         general_df = build_summary_table(data["STD"]["STD_all_time_series"])
-        std_epoch_df = _safe_dataframe(data["STD"].get("STD_epoch", {}))
+        std_epoch_df = build_epoch_summary(_safe_dict(data["STD"].get("STD_epoch", {})))
         std_lvl = _get_sensor_param(data.get("STD", {}), "STD_all_time_series", "std_lvl")
         # ``STD_epoch`` can be ``null`` in the metrics JSON. Applying ``_safe_dict``
         # twice ensures we always operate on a dictionary before requesting the
@@ -245,7 +285,7 @@ def create_summary_report(
 
     if ptp_present:
         ptp_df = build_summary_table(data["PTP_MANUAL"]["ptp_manual_all"])
-        ptp_epoch_df = _safe_dataframe(data["PTP_MANUAL"].get("ptp_manual_epoch", {}))
+        ptp_epoch_df = build_epoch_summary(_safe_dict(data["PTP_MANUAL"].get("ptp_manual_epoch", {})))
         ptp_lvl = _get_sensor_param(data.get("PTP_MANUAL", {}), "ptp_manual_all", "ptp_lvl")
         # ``ptp_manual_epoch`` can also be ``null``. By wrapping the nested
         # ``get`` calls with ``_safe_dict`` we ensure a default dictionary and
@@ -566,113 +606,37 @@ def create_summary_report(
     print(f"HTML successfully generated: {html_output}")
     print(f"JSON summary successfully generated: {json_output}")
 
+def generate_gqi_summary(dataset_path: str, megqc_root: str, config_file: str) -> None:
+    """Generate Global Quality Index summaries from existing metrics.
 
-def create_group_metrics_figure(tsv_path: Union[str, os.PathLike], output_png: Union[str, os.PathLike]) -> None:
-    """Generate violin plot of group GQI metrics."""
-    # Read the table with per-subject metrics
-    df = pd.read_csv(tsv_path, sep="\t")
+    Parameters
+    ----------
+    dataset_path
+        BIDS dataset root (currently used for logging/context only).
+    megqc_root
+        Root directory of one MEGqc analysis space. This is normally either:
+        - ``.../derivatives/Meg_QC`` (legacy mode), or
+        - ``.../derivatives/Meg_QC/profiles/<analysis_id>`` (profile mode).
 
-    cols = [
-        "GQI",
-        "GQI_penalty_ch",
-        "GQI_penalty_corr",
-        "GQI_penalty_mus",
-        "GQI_penalty_psd",
-        "GQI_std_pct",
-        "GQI_ptp_pct",
-        "GQI_ecg_pct",
-        "GQI_eog_pct",
-        "GQI_muscle_pct",
-        "GQI_psd_noise_pct",
-    ]
-
-    label_map = {
-        "GQI": "GQI",
-        "GQI_penalty_ch": "Variability penalty",
-        "GQI_penalty_corr": "Correlational penalty",
-        "GQI_penalty_mus": "Muscle penalty",
-        "GQI_penalty_psd": "PSD penalty",
-        "GQI_std_pct": "STD noise",
-        "GQI_ptp_pct": "PtP noise",
-        "GQI_ecg_pct": "ECG noise",
-        "GQI_eog_pct": "EOG noise",
-        "GQI_muscle_pct": "Muscle noise",
-        "GQI_psd_noise_pct": "PSD noise",
-    }
-    # Only plot metrics present in the table and containing data
-    available_cols = [
-        c for c in cols if c in df.columns and not df[c].dropna().empty
-    ]
-    data = df[available_cols].apply(pd.to_numeric, errors="coerce")
-    violin_data = [data[c].dropna().values for c in available_cols]
-
-    palette = cm.get_cmap("tab10", len(available_cols))
-
-    plt.figure(figsize=(22, 10))
-    # Draw the violin plot with mean lines
-    parts = plt.violinplot(
-        violin_data,
-        showmeans=True,
-        showextrema=True,
-        showmedians=False,
-        widths=0.8,
-    )
-
-    # Colour each violin body for clarity
-    for i, pc in enumerate(parts["bodies"]):
-        color = palette(i)
-        pc.set_facecolor(color)
-        pc.set_edgecolor("black")
-        pc.set_alpha(0.3)
-
-    parts["cmeans"].set_linewidth(3)
-    parts["cmeans"].set_color("black")
-    parts["cbars"].set_color("black")
-
-    # Overlay individual data points with jitter
-    for i, y in enumerate(violin_data, start=1):
-        x = np.random.normal(i, 0.08, size=len(y))
-        plt.scatter(
-            x,
-            y,
-            s=40,
-            alpha=0.3,
-            edgecolor="black",
-            linewidth=0.6,
-            facecolor=palette(i - 1),
-        )
-
-    # Label axes and finalise the figure
-    tick_labels = [label_map.get(c, c) for c in available_cols]
-    plt.xticks(
-        range(1, len(available_cols) + 1),
-        tick_labels,
-        rotation=35,
-        ha="right",
-        fontsize=20,
-        fontweight="bold",
-    )
-    plt.yticks(fontsize=18)
-    plt.ylabel("Percentage of Quality, Penalties and Noise", fontsize=22, fontweight="bold")
-    plt.title("Violin Plot of GQI Metrics with Individual Data Points", fontsize=26, pad=25)
-
-    plt.grid(axis="y", linestyle="--", alpha=0.3)
-    plt.tight_layout()
-    plt.savefig(output_png, dpi=300)
-    plt.close()
-
-
-
-def generate_gqi_summary(dataset_path: str, derivatives_root: str, config_file: str) -> None:
-    """Generate Global Quality Index summaries from existing metrics."""
+        For backward compatibility, callers may still pass a derivatives root
+        (``.../derivatives``). In that case the function auto-resolves
+        ``.../derivatives/Meg_QC``.
+    config_file
+        Settings INI path used to read ``[GlobalQualityIndex]`` parameters.
+    """
     # Load user configuration to retrieve GQI settings
     qc_params = get_all_config_params(config_file)
     if qc_params is None:
         return
     gqi_params = qc_params.get("GlobalQualityIndex")
 
-    calc_dir = os.path.join(derivatives_root, "Meg_QC", "calculation")
-    reports_root = os.path.join(derivatives_root, "Meg_QC", "summary_reports")
+    # Accept both direct Meg_QC roots and legacy derivatives roots.
+    root = os.path.abspath(megqc_root)
+    if os.path.isdir(os.path.join(root, "Meg_QC")):
+        root = os.path.join(root, "Meg_QC")
+
+    calc_dir = os.path.join(root, "calculation")
+    reports_root = os.path.join(root, "summary_reports")
     os.makedirs(reports_root, exist_ok=True)
 
     # Create a new attempt folder using incremental numbering
@@ -696,7 +660,7 @@ def generate_gqi_summary(dataset_path: str, derivatives_root: str, config_file: 
         task_label = _extract_task_label(json_path)
         summary_paths.append((out_json, task_label))
 
-    # Collate per-subject summaries into a group table and figure
+    # Collate per-subject summaries into a group table
     group_dir = os.path.join(reports_root, "group_metrics")
     os.makedirs(group_dir, exist_ok=True)
     from meg_qc.calculation.meg_qc_pipeline import flatten_summary_metrics
@@ -717,9 +681,6 @@ def generate_gqi_summary(dataset_path: str, derivatives_root: str, config_file: 
         df = df[cols]
         tsv_file = os.path.join(group_dir, f"Global_Quality_Index_attempt_{attempt}.tsv")
         df.to_csv(tsv_file, sep="\t", index=False)
-        png_file = os.path.join(group_dir, f"Global_Quality_Index_attempt_{attempt}.png")
-        # Produce violin plot summarising group metrics
-        create_group_metrics_figure(tsv_file, png_file)
 
     # Save configuration used for this attempt
     config_dir = os.path.join(reports_root, "config")

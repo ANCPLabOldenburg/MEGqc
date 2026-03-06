@@ -6,6 +6,7 @@ import mne
 import random
 import copy
 import os
+import re
 from typing import List
 import matplotlib.pyplot as plt
 from mne.preprocessing import compute_average_dev_head_t
@@ -16,6 +17,139 @@ import matplotlib #this is in case we will need to suppress mne matplotlib plots
 # mne.viz.set_browser_backend('matplotlib')
 # matplotlib.use('Agg') 
 #this command will suppress showing matplotlib figures produced by mne. They will still be saved for use in report but not shown when running the pipeline
+
+
+def _add_solid_cap_toggle_to_3d_figure(fig: go.Figure, x_vals, y_vals, z_vals) -> None:
+
+    """
+    Add an optional solid-cap overlay to a 3D channel topomap.
+
+    The cap is off by default and can be toggled on to improve spatial depth
+    perception and channel occlusion, similar to an EEG-cap shell.
+    """
+    if fig is None:
+        return
+
+    xyz = np.column_stack([
+        np.asarray(x_vals, dtype=float).reshape(-1),
+        np.asarray(y_vals, dtype=float).reshape(-1),
+        np.asarray(z_vals, dtype=float).reshape(-1),
+    ])
+    mask = np.all(np.isfinite(xyz), axis=1)
+    xyz = xyz[mask]
+    if xyz.shape[0] < 4:
+        return
+
+    point_trace_idx = len(fig.data) - 1
+    # Inset the shell slightly so markers remain visually outside the cap.
+    center = np.nanmean(xyz, axis=0, keepdims=True)
+    inset_factor = 0.965
+    cap_xyz = center + (xyz - center) * inset_factor
+
+    fig.add_trace(
+        go.Mesh3d(
+            x=cap_xyz[:, 0],
+            y=cap_xyz[:, 1],
+            z=cap_xyz[:, 2],
+            alphahull=0,
+            color='#B0BEC5',
+            opacity=1.0,
+            hoverinfo='skip',
+            showscale=False,
+            name='Solid cap',
+            visible=False,
+            flatshading=True,
+            lighting=dict(ambient=0.45, diffuse=0.55, specular=0.08, roughness=0.85, fresnel=0.03),
+            lightposition=dict(x=100, y=120, z=220),
+        )
+    )
+    cap_trace_idx = len(fig.data) - 1
+    menus = list(fig.layout.updatemenus) if fig.layout.updatemenus else []
+    menus.append(
+        dict(
+            type='buttons',
+            direction='right',
+            x=0.02,
+            y=1.03,
+            xanchor='left',
+            yanchor='bottom',
+            showactive=True,
+            bgcolor='#F7FBFF',
+            bordercolor='#2B6CB0',
+            borderwidth=1.2,
+            font=dict(size=12, color='#0F3D6E'),
+            pad=dict(r=8, t=4, l=8, b=4),
+            buttons=[
+                dict(
+                    label='Cap: Off',
+                    method='restyle',
+                    args=[{'visible': [True, False]}, [point_trace_idx, cap_trace_idx]],
+                ),
+                dict(
+                    label='Cap: On',
+                    method='restyle',
+                    args=[{'visible': [True, True]}, [point_trace_idx, cap_trace_idx]],
+                ),
+            ],
+        )
+    )
+    fig.update_layout(updatemenus=menus)
+
+
+def _norm_colname(name: str) -> str:
+    """Normalize a column name for resilient matching across datasets."""
+    return re.sub(r'[^a-z0-9]+', '', str(name).lower())
+
+
+def _metric_epoch_columns(df: pd.DataFrame, what_data: str) -> List[str]:
+    """Return epoch columns for STD/PtP with robust name matching."""
+    if what_data == 'stds':
+        prefix = 'stdepoch'
+    elif what_data == 'peaks':
+        prefix = 'ptpepoch'
+    else:
+        return []
+
+    cols = [col for col in df.columns if _norm_colname(col).startswith(prefix)]
+
+    def _col_order(name: str) -> tuple:
+        match = re.search(r'(\d+)$', str(name))
+        return (int(match.group(1)) if match else 10**9, str(name))
+
+    return sorted(cols, key=_col_order)
+
+
+def _metric_scalar_series(df: pd.DataFrame, what_data: str) -> pd.Series:
+    """Return one per-channel scalar for STD/PtP, deriving it if needed.
+
+    Priority:
+    1) Existing '* all' scalar column (robust name match).
+    2) Median over available epoch columns for the same metric.
+    """
+    if what_data == 'stds':
+        target = 'stdall'
+    elif what_data == 'peaks':
+        target = 'ptpall'
+    else:
+        return pd.Series(dtype=float)
+
+    scalar_col = None
+    for col in df.columns:
+        if _norm_colname(col) == target:
+            scalar_col = col
+            break
+
+    if scalar_col is not None:
+        return pd.to_numeric(df[scalar_col], errors='coerce')
+
+    epoch_cols = _metric_epoch_columns(df, what_data)
+    if not epoch_cols:
+        return pd.Series(dtype=float)
+    matrix = df[epoch_cols].apply(pd.to_numeric, errors='coerce').to_numpy(dtype=float)
+    if matrix.size == 0:
+        return pd.Series(dtype=float)
+    values = np.nanmedian(matrix, axis=1)
+    return pd.Series(values, index=df.index, dtype=float)
 
 
 def get_tit_and_unit(m_or_g: str, psd: bool = False):
@@ -606,83 +740,129 @@ def plot_sensors_3d_csv(sensors_csv_path: str):
     file_name = os.path.basename(sensors_csv_path)
     if 'ecgchannel' in file_name.lower() or 'eogchannel' in file_name.lower():
         return []
-    #we will get tsv representing ECG/EOG channel itself landed here. We dont need to plot it with this func.
+    # We can receive ECG/EOG channel files here; skip those.
 
     df = pd.read_csv(sensors_csv_path, sep='\t')
 
-    #double check: if there are no lobes in df - skip this plot, it s not the right df:
     if 'Lobe' not in df.columns or 'System' not in df.columns:
         return []
 
     system = get_meg_system(df)
-
     if system.upper() == 'TRIUX':
         fig_desc = "Magnetometers names end with '1' like 'MEG0111'. Gradiometers names end with '2' and '3' like 'MEG0112', 'MEG0113'."
     else:
         fig_desc = ""
 
-    #to not rewrite the whole func, just turn the df back into dic of MEG_channel:
-    
     unique_lobes = df['Lobe'].unique().tolist()
-
-    lobes_dict={}
+    lobes_dict = {}
     for lobe in unique_lobes:
         lobes_dict[lobe] = []
-        for index, row in df.iterrows():
+        for _, row in df.iterrows():
             if row['Lobe'] == lobe:
                 locs = [float(row[col]) for col in df.columns if 'Sensor_location' in col]
-                lobes_dict[lobe].append(MEG_channel(name = row['Name'], type = row['Type'], lobe = row['Lobe'], lobe_color = row['Lobe Color'], system = row ['System'], loc = locs))
+                lobes_dict[lobe].append(
+                    MEG_channel(
+                        name=row['Name'],
+                        type=row['Type'],
+                        lobe=row['Lobe'],
+                        lobe_color=row['Lobe Color'],
+                        system=row['System'],
+                        loc=locs,
+                    )
+                )
 
     traces = []
-
-    #system = df['System'].unique().tolist()
-
-    if len(lobes_dict)>1: 
-        #if there are lobes - we use color coding: one color per each lobe
+    if not lobes_dict:
+        return []
+    if len(lobes_dict) > 1:
+        # Use one color per lobe where lobe metadata is available.
         for lobe in lobes_dict:
             ch_locs, ch_names, ch_color, ch_lobe = keep_unique_locs(lobes_dict[lobe])
             traces.append(make_3d_sensors_trace(ch_locs, ch_names, ch_color[0], 10, ch_lobe[0], 'circle', 'top left'))
-            #here color and lobe must be identical for all channels in 1 trace, thi is why we take the first element of the list
-            # TEXT SIZE set to 10. This works for the "Always show names" option but not for "Show names on hover" option
-
-    else: 
-        #if there are no lobes - the dict will only have one lobe as the key and all channels inside of it
-        # we use random colors previously assigned to channels, channel names will be used instead of lobe names in make_3d_trace function
-        ch_locs, ch_names, ch_color, ch_lobe = keep_unique_locs(lobes_dict[lobe])
+    else:
+        # Fallback: one trace per channel if lobe grouping is not meaningful.
+        only_lobe = next(iter(lobes_dict))
+        ch_locs, ch_names, ch_color, _ = keep_unique_locs(lobes_dict[only_lobe])
         for i, _ in enumerate(ch_locs):
-            traces.append(make_3d_sensors_trace([ch_locs[i]], ch_names[i], ch_color[i], 10, ch_names[i], 'circle', 'top left'))
+            traces.append(make_3d_sensors_trace([ch_locs[i]], [ch_names[i]], ch_color[i], 10, ch_names[i], 'circle', 'top left'))
 
     if not traces:
         return []
-    
-    fig = go.Figure(data=traces)
 
+    # Re-center the sensor cloud so the 3D geometry sits in the middle.
+    recentered_traces = []
+    all_x, all_y, all_z = [], [], []
+    for tr in traces:
+        all_x.extend(list(getattr(tr, "x", []) or []))
+        all_y.extend(list(getattr(tr, "y", []) or []))
+        all_z.extend(list(getattr(tr, "z", []) or []))
+
+    cx = float(np.nanmean(all_x)) if all_x else 0.0
+    cy = float(np.nanmean(all_y)) if all_y else 0.0
+    cz = float(np.nanmean(all_z)) if all_z else 0.0
+
+    for tr in traces:
+        x_vals = list(getattr(tr, "x", []) or [])
+        y_vals = list(getattr(tr, "y", []) or [])
+        z_vals = list(getattr(tr, "z", []) or [])
+        recentered_traces.append(
+            go.Scatter3d(
+                x=[float(v) - cx for v in x_vals],
+                y=[float(v) - cy for v in y_vals],
+                z=[float(v) - cz for v in z_vals],
+                mode=tr.mode,
+                marker=tr.marker,
+                name=tr.name,
+                text=tr.text,
+                hoverinfo=tr.hoverinfo,
+                textfont=getattr(tr, "textfont", None),
+                textposition=getattr(tr, "textposition", None),
+            )
+        )
+
+    fig = go.Figure(data=recentered_traces)
     fig.update_layout(
-        width=900, height=900,
+        height=860,
+        margin=dict(t=38, r=24, b=86, l=24),
         title={
-        'text': 'Sensors positions',
-        'y':0.85,
-        'x':0.5,
-        'xanchor': 'center',
-        'yanchor': 'top'})
-    
+            'text': 'Sensors positions (3D geometry)',
+            'y': 0.98,
+            'x': 0.5,
+            'xanchor': 'center',
+            'yanchor': 'top'
+        },
+        showlegend=True,
+        legend=dict(
+            orientation='h',
+            yanchor='top',
+            y=-0.08,
+            xanchor='center',
+            x=0.5,
+        ),
+    )
     fig.update_layout(
-        scene = dict(
-        xaxis = dict(visible=False),
-        yaxis = dict(visible=False),
-        zaxis =dict(visible=False)
+        scene=dict(
+            domain=dict(x=[0.02, 0.98], y=[0.0, 1.0]),
+            aspectmode='data',
+            xaxis=dict(visible=False),
+            yaxis=dict(visible=False),
+            zaxis=dict(visible=False)
         )
     )
 
+    # Keep channel names only on hover (no always-on labels toggle).
+    fig.update_traces(mode='markers', hoverlabel=dict(font=dict(size=10)))
 
-    # Add the button to have names show up on hover or always:
-    fig = switch_names_on_off(fig)
-
-    fig.update_traces(hoverlabel=dict(font=dict(size=10))) #TEXT SIZE set to 10 again. This works for the "Show names on hover" option, but not for "Always show names" option
-    
-    qc_derivative = [QC_derivative(content=fig, name='Sensors_positions', content_type='plotly', description_for_user=fig_desc, fig_order=-1)]
-
-    return qc_derivative 
+    qc_derivative = [
+        QC_derivative(
+            content=fig,
+            name='Sensors_positions',
+            content_type='plotly',
+            description_for_user=fig_desc,
+            fig_order=-1
+        )
+    ]
+    return qc_derivative
 
 
 def boxplot_epochs(df_mg: pd.DataFrame, ch_type: str, what_data: str, x_axis_boxes: str):
@@ -809,106 +989,341 @@ def boxplot_epoched_xaxis_channels_csv(std_csv_path: str, ch_type: str, what_dat
 
     ch_tit, unit = get_tit_and_unit(ch_type)
 
-    if what_data=='peaks':
-        hover_tit='PtP Amplitude'
-        y_ax_and_fig_title='Peak-to-peak amplitude'
-        fig_name='PP_manual_epoch_per_channel_'+ch_tit
+    if what_data == 'peaks':
+        metric_title = 'PtP'
+        fig_name = 'PP_manual_epoch_per_channel_' + ch_tit
         data_prefix = 'PtP epoch_'
-    elif what_data=='stds':
-        hover_tit='STD'
-        y_ax_and_fig_title='Standard deviation'
-        fig_name='STD_epoch_per_channel_'+ch_tit
+    elif what_data == 'stds':
+        metric_title = 'STD'
+        fig_name = 'STD_epoch_per_channel_' + ch_tit
         data_prefix = 'STD epoch_'
     else:
         print('what_data should be either peaks or stds')
         return []
 
-
-    #Check if df has relevant data for plotting:
-    #find columns with epochs:
-    relevant_columns = [col for col in df.columns if data_prefix in col]
-
-    # Filter rows where 'Type' is the one we need: mag, grad
-    filtered_df = df[df['Type'] == ch_type]
-
-    # Check if all relevant cells are empty
-    all_empty = filtered_df[relevant_columns].isnull().all().all()
-
-    if all_empty:
+    if 'Type' not in df.columns:
+        return []
+    filtered_df = df[df['Type'] == ch_type].copy()
+    epoch_columns = _metric_epoch_columns(filtered_df, what_data)
+    if not epoch_columns:
         return []
 
+    data_matrix = filtered_df[epoch_columns].apply(pd.to_numeric, errors='coerce').to_numpy(dtype=float)
+    if data_matrix.size == 0 or np.isnan(data_matrix).all():
+        return []
 
-    # Figure column names:
-    # Create a list of columns that start with 'STD epoch_'
-    epoch_columns = [col for col in df.columns if col.startswith('STD epoch_') or col.startswith('PtP epoch_')]
+    epoch_labels = []
+    for idx, col in enumerate(epoch_columns):
+        match = re.search(r'(\d+)$', col)
+        epoch_labels.append(int(match.group(1)) if match else idx)
 
-    # Get the number of these columns
-    num_epoch_columns = len(epoch_columns)
-
-    # Create a list of numbers from 0 to that length
-    epochs_names = [i for i in range(num_epoch_columns)]
-
-
-    x_axis_boxes = 'channels'
-    if x_axis_boxes=='channels':
-        hovertemplate='Epoch: %{text}<br>'+hover_tit+': %{y: .2e}'
-    elif x_axis_boxes=='epochs':
-        #legend_title = 'Epochs'
-        hovertemplate='%{text}<br>'+hover_tit+': %{y: .2e}'
+    if 'Name' in filtered_df.columns:
+        channel_labels = filtered_df['Name'].astype(str).tolist()
     else:
-        print('x_axis_boxes should be either channels or epochs')
-        return []
+        channel_labels = [f"{ch_type}_{idx}" for idx in range(data_matrix.shape[0])]
+    n_channels = data_matrix.shape[0]
 
+    # Match group-level style: sort channels by robust channel summary.
+    sort_key = np.nanmedian(data_matrix, axis=1)
+    sort_key = np.nan_to_num(sort_key, nan=-np.inf)
+    sort_idx = np.argsort(sort_key)[::-1]
+    data_matrix = data_matrix[sort_idx, :]
+    channel_labels = [channel_labels[i] for i in sort_idx]
+    channel_idx = np.arange(n_channels)
 
-    fig = go.Figure()
+    # Epoch profile (collapse channels): bands + a central curve with 3 variants.
+    q05_epoch = np.nanquantile(data_matrix, 0.05, axis=0)
+    q25_epoch = np.nanquantile(data_matrix, 0.25, axis=0)
+    q50_epoch = np.nanquantile(data_matrix, 0.50, axis=0)
+    q75_epoch = np.nanquantile(data_matrix, 0.75, axis=0)
+    q95_epoch = np.nanquantile(data_matrix, 0.95, axis=0)
+    mean_epoch = np.nanmean(data_matrix, axis=0)
 
-    #Here each trace is 1 box representing 1 channel. Epochs inside the box are automatically plotted given argument boxpoints="all":
-    #Boxes are groupped by lobe. So first each channel fo lobe 1 is plotted, then each of lobe 2, etc..
-    boxes_names = []
+    # Channel profile (collapse epochs): quantile bands + central curve variants.
+    q05_channel = np.nanquantile(data_matrix, 0.05, axis=1)
+    q25_channel = np.nanquantile(data_matrix, 0.25, axis=1)
+    q50_channel = np.nanquantile(data_matrix, 0.50, axis=1)
+    q75_channel = np.nanquantile(data_matrix, 0.75, axis=1)
+    q95_channel = np.nanquantile(data_matrix, 0.95, axis=1)
+    mean_channel = np.nanmean(data_matrix, axis=1)
 
+    finite_values = data_matrix[np.isfinite(data_matrix)]
+    if finite_values.size:
+        zmin = float(np.nanquantile(finite_values, 0.02))
+        zmax = float(np.nanquantile(finite_values, 0.98))
+        if (not np.isfinite(zmin)) or (not np.isfinite(zmax)) or zmin == zmax:
+            zmin = float(np.nanmin(finite_values))
+            zmax = float(np.nanmax(finite_values))
+    else:
+        zmin, zmax = None, None
 
-    for index, row in df.iterrows():
-        if row['Type'] == ch_type: #plot only mag/grad
-            
-            data = [row[data_prefix+str(n)] for n in epochs_names]
+    fig = make_subplots(
+        rows=2,
+        cols=2,
+        specs=[[{"type": "xy"}, {"type": "xy"}], [{"type": "heatmap"}, {"type": "xy"}]],
+        row_heights=[0.24, 0.76],
+        column_widths=[0.86, 0.14],
+        vertical_spacing=0.18,
+        horizontal_spacing=0.04,
+    )
 
-            boxes_names += [row['Name']]
+    # Top panel quantile bands.
+    fig.add_trace(
+        go.Scatter(x=epoch_labels, y=q95_epoch, mode='lines', line=dict(width=0), name='Middle 90% of channels', hoverinfo='skip'),
+        row=1, col=1
+    )
+    fig.add_trace(
+        go.Scatter(x=epoch_labels, y=q05_epoch, mode='lines', line=dict(width=0), fill='tonexty', fillcolor='rgba(31,119,180,0.15)', name='Middle 90% of channels', hoverinfo='skip', showlegend=False),
+        row=1, col=1
+    )
+    fig.add_trace(
+        go.Scatter(x=epoch_labels, y=q75_epoch, mode='lines', line=dict(width=0), name='Middle 50% of channels', hoverinfo='skip'),
+        row=1, col=1
+    )
+    fig.add_trace(
+        go.Scatter(x=epoch_labels, y=q25_epoch, mode='lines', line=dict(width=0), fill='tonexty', fillcolor='rgba(31,119,180,0.34)', name='Middle 50% of channels', hoverinfo='skip', showlegend=False),
+        row=1, col=1
+    )
+    fig.add_trace(
+        go.Scatter(
+            x=epoch_labels,
+            y=q50_epoch,
+            mode='lines',
+            line=dict(color='#0B3D91', width=2.4),
+            name='Median across channels',
+            hovertemplate='Epoch: %{x}<br>Median: %{y:.3e}<extra></extra>',
+            visible=True,
+        ),
+        row=1, col=1
+    )
+    fig.add_trace(
+        go.Scatter(
+            x=epoch_labels,
+            y=mean_epoch,
+            mode='lines',
+            line=dict(color='#D35400', width=2.4),
+            name='Mean across channels',
+            hovertemplate='Epoch: %{x}<br>Mean: %{y:.3e}<extra></extra>',
+            visible=False,
+        ),
+        row=1, col=1
+    )
+    fig.add_trace(
+        go.Scatter(
+            x=epoch_labels,
+            y=q95_epoch,
+            mode='lines',
+            line=dict(color='#8E44AD', width=2.4),
+            name='Upper tail (q95) across channels',
+            hovertemplate='Epoch: %{x}<br>Upper tail (q95): %{y:.3e}<extra></extra>',
+            visible=False,
+        ),
+        row=1, col=1
+    )
 
-            fig.add_trace(go.Box(y=data, 
-            name=row['Name'], 
-            opacity=0.7, 
-            boxpoints="all", 
-            pointpos=0,
-            marker_color=row['Lobe Color'],
-            marker_size=3,
-            legendgroup=row['Lobe'], 
-            legendgrouptitle=dict(text=row['Lobe'].upper()),
-            line_width=0.8,
-            line_color=row['Lobe Color'],
-            text=epochs_names))
+    fig.add_trace(
+        go.Heatmap(
+            z=data_matrix,
+            x=epoch_labels,
+            y=channel_idx,
+            customdata=np.tile(np.array(channel_labels, dtype=object)[:, None], (1, len(epoch_labels))),
+            colorscale='Turbo',
+            colorbar=dict(title=f'{metric_title} ({unit})', x=1.02, len=0.86),
+            zmin=zmin,
+            zmax=zmax,
+            hovertemplate='Channel: %{customdata}<br>Epoch: %{x}<br>Value: %{z:.3e}<extra></extra>',
+            name=f'{metric_title} heatmap',
+            showscale=True,
+        ),
+        row=2, col=1
+    )
 
-    
-    fig.update_traces(hovertemplate=hovertemplate)
+    # Right-side channel profile with quantile bands (same channel order as heatmap rows).
+    fig.add_trace(
+        go.Scatter(
+            x=q95_channel,
+            y=channel_idx,
+            mode='lines',
+            line=dict(width=0),
+            name='Middle 90% of epochs',
+            showlegend=False,
+            hoverinfo='skip',
+        ),
+        row=2, col=2
+    )
+    fig.add_trace(
+        go.Scatter(
+            x=q05_channel,
+            y=channel_idx,
+            mode='lines',
+            line=dict(width=0),
+            fill='tonextx',
+            fillcolor='rgba(31,119,180,0.15)',
+            name='Middle 90% of epochs',
+            showlegend=False,
+            hoverinfo='skip',
+        ),
+        row=2, col=2
+    )
+    fig.add_trace(
+        go.Scatter(
+            x=q75_channel,
+            y=channel_idx,
+            mode='lines',
+            line=dict(width=0),
+            name='Middle 50% of epochs',
+            showlegend=False,
+            hoverinfo='skip',
+        ),
+        row=2, col=2
+    )
+    fig.add_trace(
+        go.Scatter(
+            x=q25_channel,
+            y=channel_idx,
+            mode='lines',
+            line=dict(width=0),
+            fill='tonextx',
+            fillcolor='rgba(31,119,180,0.34)',
+            name='Middle 50% of epochs',
+            showlegend=False,
+            hoverinfo='skip',
+        ),
+        row=2, col=2
+    )
+    fig.add_trace(
+        go.Scatter(
+            x=q50_channel,
+            y=channel_idx,
+            customdata=np.array(channel_labels, dtype=object),
+            mode='lines',
+            line=dict(color='#17A589', width=2.1),
+            hovertemplate='Channel: %{customdata}<br>Median across epochs: %{x:.3e}<extra></extra>',
+            showlegend=False,
+            visible=True,
+        ),
+        row=2, col=2
+    )
+    fig.add_trace(
+        go.Scatter(
+            x=mean_channel,
+            y=channel_idx,
+            customdata=np.array(channel_labels, dtype=object),
+            mode='lines',
+            line=dict(color='#D35400', width=2.1),
+            hovertemplate='Channel: %{customdata}<br>Mean across epochs: %{x:.3e}<extra></extra>',
+            showlegend=False,
+            visible=False,
+        ),
+        row=2, col=2
+    )
+    fig.add_trace(
+        go.Scatter(
+            x=q95_channel,
+            y=channel_idx,
+            customdata=np.array(channel_labels, dtype=object),
+            mode='lines',
+            line=dict(color='#8E44AD', width=2.1),
+            hovertemplate='Channel: %{customdata}<br>Upper tail (q95) across epochs: %{x:.3e}<extra></extra>',
+            showlegend=False,
+            visible=False,
+        ),
+        row=2, col=2
+    )
+
+    # Buttons for epoch profile central curve.
+    epoch_trace_indices = [4, 5, 6]
+    # Buttons for channel profile side strip.
+    channel_trace_indices = [12, 13, 14]
 
     fig.update_layout(
-        xaxis = dict(
-            tickmode = 'array',
-            tickvals = [v for v in range(0, len(boxes_names))],
-            ticktext = boxes_names,
-            rangeslider=dict(visible=True)),
-        yaxis = dict(
-            showexponent = 'all',
-            exponentformat = 'e'),
-        yaxis_title=y_ax_and_fig_title+' in '+unit,
         title={
-            'text': y_ax_and_fig_title+' over epochs for '+ch_tit,
-            'y':0.85,
-            'x':0.5,
+            'text': metric_title + ' channel x epoch heatmap with top epoch profile for ' + ch_tit,
+            'y': 0.97,
+            'x': 0.5,
             'xanchor': 'center',
-            'yanchor': 'top'},)
-        #legend_title=legend_title)
+            'yanchor': 'top',
+        },
+        margin=dict(t=154, l=80, r=40, b=162),
+        legend=dict(
+            orientation='h',
+            yanchor='bottom',
+            y=1.02,
+            xanchor='left',
+            x=0.0,
+        ),
+        updatemenus=[
+            dict(
+                type='buttons',
+                direction='right',
+                x=0.00,
+                y=-0.18,
+                xanchor='left',
+                yanchor='top',
+                showactive=True,
+                bgcolor='#EAF3FF',
+                bordercolor='#7AA7D9',
+                borderwidth=1,
+                font=dict(size=12, color='#1D4E89'),
+                pad=dict(r=8, t=4, l=4, b=4),
+                buttons=[
+                    dict(label='Top: Median', method='restyle', args=[{'visible': [True, False, False]}, epoch_trace_indices]),
+                    dict(label='Top: Mean', method='restyle', args=[{'visible': [False, True, False]}, epoch_trace_indices]),
+                    dict(label='Top: Upper tail', method='restyle', args=[{'visible': [False, False, True]}, epoch_trace_indices]),
+                ],
+            ),
+            dict(
+                type='buttons',
+                direction='right',
+                x=0.54,
+                y=-0.18,
+                xanchor='left',
+                yanchor='top',
+                showactive=True,
+                bgcolor='#EAF3FF',
+                bordercolor='#7AA7D9',
+                borderwidth=1,
+                font=dict(size=12, color='#1D4E89'),
+                pad=dict(r=8, t=4, l=4, b=4),
+                buttons=[
+                    dict(label='Right: Median', method='restyle', args=[{'visible': [True, False, False]}, channel_trace_indices]),
+                    dict(label='Right: Mean', method='restyle', args=[{'visible': [False, True, False]}, channel_trace_indices]),
+                    dict(label='Right: Upper tail', method='restyle', args=[{'visible': [False, False, True]}, channel_trace_indices]),
+                ],
+            ),
+        ],
+    )
 
-    fig_deriv = [QC_derivative(content=fig, name=fig_name, content_type='plotly')]
+    # Axis cleanup to avoid label collisions.
+    fig.update_xaxes(title_text='Epoch index', row=2, col=1)
+    fig.update_yaxes(
+        title_text='Sorted channel index',
+        row=2,
+        col=1,
+        autorange='reversed',
+        automargin=True,
+        title_standoff=10,
+    )
+    fig.update_yaxes(
+        title_text=f'{metric_title} ({unit})',
+        showticklabels=False,
+        row=1,
+        col=1,
+        automargin=True,
+        title_standoff=10,
+    )
+    fig.update_xaxes(visible=False, row=1, col=2)
+    fig.update_yaxes(visible=False, row=1, col=2)
+    fig.update_xaxes(title_text='Channel profile', row=2, col=2)
+    fig.update_yaxes(showticklabels=False, row=2, col=2, autorange='reversed')
+
+    description = (
+        'Single heatmap summary: rows are channels and columns are epochs. '
+        'Top strip shows epoch profile across channels with quantile bands. '
+        'Right strip shows channel profile across epochs with quantile bands. '
+        'Bottom controls switch median/mean/upper-tail variants independently for top and right profiles.'
+    )
+    fig_deriv = [QC_derivative(content=fig, name=fig_name, content_type='plotly', description_for_user=description)]
 
     return fig_deriv
 
@@ -924,7 +1339,12 @@ def plot_topomap_std_ptp_csv(std_csv_path: str, ch_type: str, what_data: str):
 
     #First, convert scv back into dict with MEG_channel objects:
 
-    df = pd.read_csv(std_csv_path, sep='\t')  
+    df = pd.read_csv(std_csv_path, sep='\t')
+    if 'Type' not in df.columns:
+        return []
+    df = df[df['Type'] == ch_type].copy()
+    if df.empty:
+        return []
 
     ch_tit, unit = get_tit_and_unit(ch_type)
 
@@ -938,53 +1358,59 @@ def plot_topomap_std_ptp_csv(std_csv_path: str, ch_type: str, what_data: str):
         raise ValueError('what_data must be set to "stds" or "peaks"')
 
     
-    data = []
-    names = []
-    pos = np.empty((0, 2))
+    sensor_location_cols = [col for col in df.columns if 'Sensor_location' in col]
+    if len(sensor_location_cols) < 2:
+        return []
 
-    for index, row in df.iterrows():
+    scalars = _metric_scalar_series(df, what_data)
+    if scalars.empty:
+        return []
 
-        if row['Type'] == ch_type: #plot only mag/grad
+    data = pd.to_numeric(scalars, errors='coerce').to_numpy(dtype=float)
+    pos = df[sensor_location_cols[:2]].apply(pd.to_numeric, errors='coerce').to_numpy(dtype=float)
+    if 'Name' in df.columns:
+        names = df['Name'].fillna('').astype(str).tolist()
+    else:
+        names = [f"{ch_type}_{idx}" for idx in range(len(df))]
 
-            if what_data == 'stds':
-                data += [row['STD all']]
-            elif what_data == 'peaks':
-                data += [row['PtP all']]
-                # data: array, shape (n_chan,) The data values to plot.
+    # convert to arrays
+    data = np.asarray(data, dtype=float)
+    pos = np.asarray(pos, dtype=float)
+    valid = np.isfinite(data) & np.isfinite(pos).all(axis=1)
+    data = data[valid]
+    pos = pos[valid]
+    if data.size == 0 or pos.size == 0:
+        return []
 
+    # Small deterministic jitter for overlapping planar gradiometer positions.
+    # This avoids interpolation singularities while preserving layout geometry.
+    rounded = np.round(pos, decimals=10)
+    _, inv, counts = np.unique(rounded, axis=0, return_inverse=True, return_counts=True)
+    if np.any(counts > 1):
+        base = max(np.nanstd(pos[:, 0]), np.nanstd(pos[:, 1]), 1e-6) * 1e-3
+        for group_idx, count in enumerate(counts):
+            if count <= 1:
+                continue
+            inds = np.where(inv == group_idx)[0]
+            shifts = np.linspace(-base, base, num=inds.size)
+            pos[inds, 0] += shifts
 
-            # Filter columns containing 'Sensor_location'
-            sensor_location_cols = [col for col in df.columns if 'Sensor_location' in col]
-            #pos = np.array([[float(row[col]) for col in sensor_location_cols[:2]] for _, row in df.iterrows()])
-            new_pos = np.array([[float(row[col]) for col in sensor_location_cols[:2]]])  # Ensure 2D shape
-            # Append the new row to pos
-            pos = np.vstack([pos, new_pos])
-
-            names += [row['Name']]
-
-    #convert data to array:
-    data = np.array(data)
-    mask = np.array([True for i in range(len(names))])
-
-    mask_params=dict(marker='o', markerfacecolor='k', markeredgecolor='k',
-        linewidth=0, markersize=3)
-    # mask is to change marker look of channels. applied to everything here, 
-    # but in principle it is used to highlight particular channels
-
-    fig, ax = plt.subplots(figsize=(8, 6))  # Create a Matplotlib figure and axes
-
-    mne.viz.plot_topomap(
-    data, pos, ch_type=ch_type, names=names, size=6, mask=mask,
-    mask_params=mask_params, show=False, axes=ax, sphere=(0., 0., 0., 0.1)  
+    fig, ax = plt.subplots(figsize=(7.0, 6.0), layout='constrained')
+    im, _ = mne.viz.plot_topomap(
+        data,
+        pos,
+        ch_type=ch_type,
+        names=None,
+        sensors=True,
+        contours=6,
+        res=256,
+        show=False,
+        axes=ax,
+        sphere=(0.0, 0.0, 0.0, 0.1),
     )
-
-    # It will give warning; 'invalid value encountered in divide'
-    # This is most likely because for grads positions are the same, 
-    # so the division by 0 occurs. But this is normal. 
-    # Can add some jitter to posoitions if this bothers a lot.
-
-
-    ax.set_title(f'{y_ax_and_fig_title} Topomap for {ch_tit}')
+    cbar = fig.colorbar(im, ax=ax, fraction=0.05, pad=0.04)
+    cbar.set_label(f'{y_ax_and_fig_title} ({unit})')
+    ax.set_title(f'{y_ax_and_fig_title} topomap for {ch_tit}')
 
     qc_derivative = [QC_derivative(content=fig, name=fig_name, content_type='matplotlib')]
                  
@@ -1017,9 +1443,12 @@ def plot_3d_topomap_std_ptp_csv(sensors_csv_path: str, ch_type: str, what_data: 
     """
     
     df = pd.read_csv(sensors_csv_path, sep='\t')
-
-    #take only those channels that are of right type:
-    df = df[df['Type'] == ch_type]
+    if 'Type' not in df.columns:
+        return []
+    # take only those channels that are of right type
+    df = df[df['Type'] == ch_type].copy()
+    if df.empty:
+        return []
 
     ch_tit, unit = get_tit_and_unit(ch_type)
 
@@ -1027,17 +1456,25 @@ def plot_3d_topomap_std_ptp_csv(sensors_csv_path: str, ch_type: str, what_data: 
     if what_data=='peaks':
         fig_name='PP_manual_all_data_Topomap_'+ch_tit
         metric = 'PtP'
-        metric_column = 'PtP all'
     elif what_data=='stds':
         fig_name='STD_epoch_all_data_Topomap_'+ch_tit
         metric = 'STD'
-        metric_column = 'STD all'
     else:
         raise ValueError('what_data must be set to "stds" or "peaks"')
     
+    required = {'Sensor_location_0', 'Sensor_location_1', 'Sensor_location_2'}
+    if not required.issubset(set(df.columns)):
+        return []
+    scalar = _metric_scalar_series(df, what_data)
+    if scalar.empty:
+        return []
+    df['__metric_value__'] = pd.to_numeric(scalar, errors='coerce')
+    df = df.dropna(subset=['__metric_value__', 'Sensor_location_0', 'Sensor_location_1', 'Sensor_location_2'])
+    if df.empty:
+        return []
 
     # Create a DataFrame with sensor locations as columns
-    sensor_df = df[['Sensor_location_0', 'Sensor_location_1', 'Sensor_location_2', metric_column, 'Name']]
+    sensor_df = df[['Sensor_location_0', 'Sensor_location_1', 'Sensor_location_2', '__metric_value__', 'Name']]
 
     # Group by sensor locations, this is done in case we got GRADIOMETERS,
     # cos they have 2 sensors located in the same spot.
@@ -1046,13 +1483,15 @@ def plot_3d_topomap_std_ptp_csv(sensors_csv_path: str, ch_type: str, what_data: 
     # We assume that means std/ptp of physically close to each other gardiomeeters is also close in value.
     # Here also create groupped names, later used in hover 
     grouped = sensor_df.groupby(['Sensor_location_0', 'Sensor_location_1', 'Sensor_location_2']).agg({
-        metric_column: 'mean',
-        'Name': lambda x: ', '.join([f"{name} - {metric}: {std:.2e} {unit}" for name, std in zip(x, sensor_df.loc[x.index, metric_column])])
+        '__metric_value__': 'mean',
+        'Name': lambda x: ', '.join([f"{name} - {metric}: {std:.2e} {unit}" for name, std in zip(x, sensor_df.loc[x.index, '__metric_value__'])])
     }).reset_index()
+    if grouped.empty:
+        return []
 
     # Extract the grouped sensor locations and mean metric values
     grouped_sensor_locations = grouped[['Sensor_location_0', 'Sensor_location_1', 'Sensor_location_2']].values
-    mean_metric_values = grouped[metric_column].values
+    mean_metric_values = grouped['__metric_value__'].values
     grouped_names = grouped['Name'].values
 
     # Create the 3D scatter plot
@@ -1066,7 +1505,7 @@ def plot_3d_topomap_std_ptp_csv(sensors_csv_path: str, ch_type: str, what_data: 
         marker=dict(
             size=13,
             color=mean_metric_values,  # Use the mean metric values for the color scale
-            colorscale='Bluered',  # Use the 'Bluered' colorscale
+            colorscale='Turbo',
             colorbar=dict(
                 title=f'{metric}, {unit}',
                 titleside='right',
@@ -1080,23 +1519,25 @@ def plot_3d_topomap_std_ptp_csv(sensors_csv_path: str, ch_type: str, what_data: 
         text=grouped_names,  # Use channel names and formatted mean metric values as hover text
         hoverinfo='text'
     ))
+    _add_solid_cap_toggle_to_3d_figure(
+        fig,
+        grouped_sensor_locations[:, 0],
+        grouped_sensor_locations[:, 1],
+        grouped_sensor_locations[:, 2],
+    )
 
     # Set plot layout
     fig.update_layout(
-        width=900, height=900,
-        title={
-        'text': metric + ' topomap: '+ ch_tit,
-        'y':0.85,
-        'x':0.5,
-        'xanchor': 'center',
-        'yanchor': 'top'})
-    
-    fig.update_layout(
-        scene = dict(
-        xaxis = dict(visible=False),
-        yaxis = dict(visible=False),
-        zaxis =dict(visible=False)
-        )
+        height=860,
+        margin=dict(t=20, r=24, b=16, l=20),
+        scene=dict(
+            domain=dict(x=[0.02, 0.90], y=[0.0, 1.0]),
+            aspectmode='data',
+            xaxis=dict(visible=False),
+            yaxis=dict(visible=False),
+            zaxis=dict(visible=False),
+        ),
+        showlegend=False,
     )
 
     fig.update_traces(hoverlabel=dict(font=dict(size=10))) #TEXT SIZE set to 10 again. This works for the "Show names on hover" option, but not for "Always show names" option
@@ -1104,6 +1545,180 @@ def plot_3d_topomap_std_ptp_csv(sensors_csv_path: str, ch_type: str, what_data: 
     qc_derivative = [QC_derivative(content=fig, name=fig_name, content_type='plotly')]
 
     return qc_derivative
+
+
+def _plot_3d_channel_metric_csv(
+    df: pd.DataFrame,
+    ch_type: str,
+    metric_column: str,
+    *,
+    metric_title: str,
+    unit_title: str,
+    fig_name: str,
+    description_for_user: str = "",
+):
+    """Plot one 3D channel-wise topomap from a per-channel scalar column."""
+    required_cols = {'Name', 'Type', metric_column, 'Sensor_location_0', 'Sensor_location_1', 'Sensor_location_2'}
+    if not required_cols.issubset(set(df.columns)):
+        return []
+
+    df = df[df['Type'] == ch_type].copy()
+    if df.empty:
+        return []
+
+    df[metric_column] = pd.to_numeric(df[metric_column], errors='coerce')
+    df = df.dropna(subset=[metric_column, 'Sensor_location_0', 'Sensor_location_1', 'Sensor_location_2'])
+    if df.empty:
+        return []
+
+    sensor_df = df[['Sensor_location_0', 'Sensor_location_1', 'Sensor_location_2', metric_column, 'Name']].copy()
+    loc_cols = ['Sensor_location_0', 'Sensor_location_1', 'Sensor_location_2']
+
+    def _hover_text(group: pd.DataFrame) -> str:
+        return "<br>".join([f"{row['Name']}: {row[metric_column]:.2e} {unit_title}" for _, row in group.iterrows()])
+
+    grouped_values = sensor_df.groupby(loc_cols)[metric_column].mean()
+    grouped_hover = sensor_df.groupby(loc_cols).apply(_hover_text)
+    grouped = grouped_values.reset_index(name='metric_value')
+    grouped['hover_text'] = grouped_hover.values
+
+    if grouped.empty:
+        return []
+
+    # Re-center point cloud to keep the panel visually centered.
+    x_vals = grouped['Sensor_location_0'] - grouped['Sensor_location_0'].mean()
+    y_vals = grouped['Sensor_location_1'] - grouped['Sensor_location_1'].mean()
+    z_vals = grouped['Sensor_location_2'] - grouped['Sensor_location_2'].mean()
+
+    fig = go.Figure()
+    fig.add_trace(
+        go.Scatter3d(
+            x=x_vals,
+            y=y_vals,
+            z=z_vals,
+            mode='markers',
+            marker=dict(
+                size=12,
+                color=grouped['metric_value'],
+                colorscale='Turbo',
+                colorbar=dict(
+                    title=dict(text=unit_title),
+                    x=0.95,
+                    len=0.82,
+                ),
+                opacity=0.85,
+            ),
+            text=grouped['hover_text'],
+            hovertemplate='%{text}<br>Grouped value: %{marker.color:.3e}<extra></extra>',
+            name=metric_title,
+            showlegend=False,
+        )
+    )
+    _add_solid_cap_toggle_to_3d_figure(fig, x_vals, y_vals, z_vals)
+    fig.update_layout(
+        height=860,
+        margin=dict(t=20, r=24, b=16, l=20),
+        scene=dict(
+            domain=dict(x=[0.02, 0.90], y=[0.0, 1.0]),
+            aspectmode='data',
+            xaxis=dict(visible=False),
+            yaxis=dict(visible=False),
+            zaxis=dict(visible=False),
+        ),
+    )
+    fig.update_traces(hoverlabel=dict(font=dict(size=10)))
+
+    return [
+        QC_derivative(
+            content=fig,
+            name=fig_name,
+            content_type='plotly',
+            description_for_user=description_for_user,
+        )
+    ]
+
+
+def plot_3d_topomap_psd_csv(psd_csv_path: str, ch_type: str):
+    """Create 3D topomap for PSD mains relative power per channel."""
+    base_name = os.path.basename(psd_csv_path).lower()
+    if 'desc-psds' not in base_name:
+        return []
+
+    df = pd.read_csv(psd_csv_path, sep='\t')
+    freq_cols = [col for col in df.columns if col.startswith('PSD_Hz_')]
+    if not freq_cols:
+        return []
+
+    freqs = np.array([float(col.replace('PSD_Hz_', '')) for col in freq_cols], dtype=float)
+    if 'Type' not in df.columns:
+        return []
+    df_ch = df[df['Type'] == ch_type].copy()
+    if df_ch.empty:
+        return []
+
+    psd_matrix = df_ch[freq_cols].apply(pd.to_numeric, errors='coerce').to_numpy(dtype=float)
+    if psd_matrix.size == 0 or np.isnan(psd_matrix).all():
+        return []
+
+    mains_mask = (freqs >= 45.0) & (freqs <= 65.0)
+    if np.any(mains_mask):
+        mains_band = psd_matrix[:, mains_mask]
+        mains_freqs = freqs[mains_mask]
+        mains_idx_local = int(np.nanargmax(np.nanmedian(mains_band, axis=0)))
+        mains_freq = float(mains_freqs[mains_idx_local])
+        mains_idx = int(np.where(mains_mask)[0][mains_idx_local])
+    else:
+        mains_idx = int(np.nanargmax(np.nanmedian(psd_matrix, axis=0)))
+        mains_freq = float(freqs[mains_idx])
+
+    baseline_mask = (freqs >= 1.0) & (freqs <= 40.0) & ((freqs < mains_freq - 2.0) | (freqs > mains_freq + 2.0))
+    if np.any(baseline_mask):
+        baseline = np.nanmedian(psd_matrix[:, baseline_mask], axis=1)
+    else:
+        baseline = np.nanmedian(psd_matrix, axis=1)
+
+    eps = np.nanmedian(np.abs(psd_matrix)) * 1e-9 + 1e-30
+    mains_ratio = psd_matrix[:, mains_idx] / (baseline + eps)
+    df_ch['__psd_mains_ratio__'] = mains_ratio
+
+    ch_tit, _ = get_tit_and_unit(ch_type)
+    return _plot_3d_channel_metric_csv(
+        df_ch,
+        ch_type,
+        '__psd_mains_ratio__',
+        metric_title=f'PSD channel-wise topomap (3D): mains relative power for {ch_tit}',
+        unit_title='ratio',
+        fig_name=f'PSD_channel_wise_topomap_3D_{ch_tit}',
+        description_for_user='Per-channel scalar is mains relative power (mains-band PSD divided by low-frequency baseline PSD).',
+    )
+
+
+def plot_3d_topomap_ecg_eog_csv(f_path: str, ch_type: str, ecg_or_eog: str):
+    """Create 3D topomap for ECG/EOG correlation magnitude per channel."""
+    base_name = os.path.basename(f_path).lower()
+    metric = ecg_or_eog.strip().lower()
+    if metric == 'ecg' and 'desc-ecgs' not in base_name:
+        return []
+    if metric == 'eog' and 'desc-eogs' not in base_name:
+        return []
+
+    corr_col = f'{metric}_corr_coeff'
+    df = pd.read_csv(f_path, sep='\t')
+    if corr_col not in df.columns:
+        return []
+
+    df[corr_col] = pd.to_numeric(df[corr_col], errors='coerce').abs()
+    ch_tit, _ = get_tit_and_unit(ch_type)
+    upper_metric = metric.upper()
+    return _plot_3d_channel_metric_csv(
+        df,
+        ch_type,
+        corr_col,
+        metric_title=f'{upper_metric} correlation-magnitude topomap (3D) for {ch_tit}',
+        unit_title='|r|',
+        fig_name=f'{upper_metric}_channel_wise_topomap_3D_{ch_tit}',
+        description_for_user=f'Per-channel scalar is absolute {upper_metric} correlation magnitude |r|.',
+    )
 
 
 # ______________________PSD__________________________
@@ -1521,95 +2136,66 @@ def boxplot_epoched_xaxis_epochs_csv(std_csv_path: str, ch_type: str, what_data:
 
     """
 
-    # First, get the epochs from csv and convert back into object.
-    df = pd.read_csv(std_csv_path, sep='\t')  
-
-    # Figure column names:
-    # Create a list of columns that start with 'STD epoch_'
-    epoch_columns = [col for col in df.columns if col.startswith('STD epoch_') or col.startswith('PtP epoch_')]
-
-    # Extract the actual epoch names from the column names
-    epochs_names = [int(col.split('_')[-1]) for col in epoch_columns]
+    df = pd.read_csv(std_csv_path, sep='\t')
+    filtered_df = df[df['Type'] == ch_type].copy()
 
     ch_tit, unit = get_tit_and_unit(ch_type)
-
-    if what_data=='peaks':
-        hover_tit='PtP Amplitude'
-        y_ax_and_fig_title='Peak-to-peak amplitude'
-        fig_name='PP_manual_epoch_per_channel_2_'+ch_tit
-    elif what_data=='stds':
-        hover_tit='STD'
-        y_ax_and_fig_title='Standard deviation'
-        fig_name='STD_epoch_per_channel_2_'+ch_tit
+    if what_data == 'peaks':
+        metric_title = 'Peak-to-peak amplitude'
+        fig_name = 'PP_manual_epoch_per_channel_2_' + ch_tit
+        data_prefix = 'PtP epoch_'
+    elif what_data == 'stds':
+        metric_title = 'Standard deviation'
+        fig_name = 'STD_epoch_per_channel_2_' + ch_tit
+        data_prefix = 'STD epoch_'
     else:
         print('what_data should be either peaks or stds')
-
-
-    boxwidth=0.5 #the area around which the data dots are scattered depends on the width of the box.
-
-    # For this plot have to separately create a box (no data points plotted) as 1 trace
-    # Then separately create for each cannel (dot) a separate trace. It s the only way to make them all different lobe colors.
-    # Additionally, the dots are scattered along the x axis inside each box, this is done for visualisation only, x position does not hold information.
-    
-    # Put all data dots in a list of traces groupped by lobe:
-    
-    dot_traces = []
-    box_traces = []    
-
-    for ep in epochs_names:
-        dots_in_1_box=[]
-        for index, row in df.iterrows():
-
-            if row['Type'] == ch_type: #plot only mag/grad
-
-                if what_data == 'stds':
-                    data = row['STD epoch_' + str(ep)]
-                elif what_data == 'peaks':
-                    data = row['PtP epoch_'+ str(ep)]
-                else:
-                    raise ValueError('what_data should be either peaks or stds')    
-
-                dots_in_1_box += [data]
-
-                x = ep + random.uniform(-0.2*boxwidth, 0.2*boxwidth) 
-                #here create random y values for data dots, they dont have a meaning, just used so that dots are scattered around the box plot and not in 1 line.
-                
-                dot_traces += [go.Scatter(x=[x], y=[data], mode='markers', marker=dict(size=4, color=row['Lobe Color']), opacity=0.8, name=row['Name'], text=str(ep), legendgroup=row['Lobe'], legendgrouptitle=dict(text=row['Lobe'].upper()), hovertemplate='Epoch: '+str(ep)+'<br>'+hover_tit+': %{y: .2e}')]
-
-        # create box plot trace
-        box_traces += [go.Box(x0=ep, y=dots_in_1_box, orientation='v', name=ep, line_width=1.8, opacity=0.8, boxpoints=False, width=boxwidth, showlegend=False)]
-    
-    #Collect all traces and add them to the figure:
-
-    all_traces = box_traces+dot_traces
-
-    if not dot_traces:
         return []
-    
-    fig = go.Figure(data=all_traces)
-        
-    #more settings:
-    fig.update_layout(
-        xaxis = dict(
-            tickmode = 'array',
-            tickvals = [v for v in range(0, len(epochs_names))],
-            ticktext = epochs_names,
-            rangeslider=dict(visible=True)
-        ),
-        xaxis_title='Experimental epochs',
-        yaxis = dict(
-            showexponent = 'all',
-            exponentformat = 'e'),
-        yaxis_title=y_ax_and_fig_title+' in '+unit,
-        title={
-            'text': y_ax_and_fig_title+' over epochs for '+ch_tit,
-            'y':0.85,
-            'x':0.5,
-            'xanchor': 'center',
-            'yanchor': 'top'},
-        legend_groupclick='togglegroup') #this setting allowes to select the whole group when clicking on 1 element of the group. But then you can not select only 1 element.
 
-    qc_derivative = [QC_derivative(content=fig, name=fig_name, content_type='plotly')]
+    epoch_columns = [col for col in filtered_df.columns if col.startswith(data_prefix)]
+    if not epoch_columns:
+        return []
+
+    data_matrix = filtered_df[epoch_columns].apply(pd.to_numeric, errors='coerce').to_numpy(dtype=float)
+    if data_matrix.size == 0 or np.isnan(data_matrix).all():
+        return []
+
+    epoch_labels = [int(col.split('_')[-1]) if col.split('_')[-1].isdigit() else idx for idx, col in enumerate(epoch_columns)]
+    channel_labels = filtered_df['Name'].astype(str).tolist()
+
+    # Transposed orientation: rows are epochs, columns are channels.
+    transposed = data_matrix.T
+    fig = go.Figure(
+        data=[
+            go.Heatmap(
+                z=transposed,
+                x=channel_labels,
+                y=epoch_labels,
+                colorscale='Turbo',
+                colorbar=dict(title=f'{metric_title} ({unit})'),
+                hovertemplate='Epoch: %{y}<br>Channel: %{x}<br>Value: %{z:.3e}<extra></extra>',
+            )
+        ]
+    )
+    fig.update_layout(
+        xaxis_title=f'{ch_tit} channels',
+        yaxis_title='Epoch index',
+        title={
+            'text': metric_title + ' heatmap (channels within epochs) for ' + ch_tit,
+            'y': 0.85,
+            'x': 0.5,
+            'xanchor': 'center',
+            'yanchor': 'top',
+        },
+        xaxis=dict(automargin=True),
+        yaxis=dict(automargin=True),
+    )
+
+    description = (
+        'Heatmap view replaces dense box traces for faster rendering. '
+        'Rows are epochs, columns are channels, color encodes metric magnitude.'
+    )
+    qc_derivative = [QC_derivative(content=fig, name=fig_name, content_type='plotly', description_for_user=description)]
 
     return qc_derivative
 
@@ -1641,7 +2227,12 @@ def boxplot_all_time_csv(std_csv_path: str, ch_type: str, what_data: str):
 
     #First, convert scv back into dict with MEG_channel objects:
 
-    df = pd.read_csv(std_csv_path, sep='\t')  
+    df = pd.read_csv(std_csv_path, sep='\t')
+    if 'Type' not in df.columns:
+        return []
+    df = df[df['Type'] == ch_type].copy()
+    if df.empty:
+        return []
 
     ch_tit, unit = get_tit_and_unit(ch_type)
 
@@ -1666,22 +2257,38 @@ def boxplot_all_time_csv(std_csv_path: str, ch_type: str, what_data: str):
     values_all=[]
     traces = []
 
-    for index, row in df.iterrows():
+    scalars = _metric_scalar_series(df, what_data)
+    if scalars.empty:
+        return []
 
-        if row['Type'] == ch_type: #plot only mag/grad
+    default_color = '#2B6CB0'
+    for idx, row in df.iterrows():
+        data = float(scalars.get(idx, np.nan))
+        if not np.isfinite(data):
+            continue
 
-            if what_data == 'stds':
-                data = row['STD all']
-            elif what_data == 'peaks':
-                data = row['PtP all']
+        values_all += [data]
 
-            values_all += [data]
+        y = random.uniform(-0.2 * boxwidth, 0.2 * boxwidth)
+        # Here random Y is visualization-only to spread points around the box.
+        lobe = str(row.get('Lobe', 'channels'))
+        lobe_color = row.get('Lobe Color', default_color)
+        ch_name = str(row.get('Name', f'{ch_type}_{idx}'))
+        traces += [
+            go.Scatter(
+                x=[data],
+                y=[y],
+                mode='markers',
+                marker=dict(size=5, color=lobe_color),
+                name=ch_name,
+                legendgroup=lobe,
+                legendgrouptitle=dict(text=lobe.upper()),
+            )
+        ]
 
-            y = random.uniform(-0.2*boxwidth, 0.2*boxwidth) 
-            #here create random y values for data dots, they dont have a meaning, just used so that dots are scattered around the box plot and not in 1 line.
-            
-            traces += [go.Scatter(x=[data], y=[y], mode='markers', marker=dict(size=5, color=row['Lobe Color']), name=row['Name'], legendgroup=row['Lobe'], legendgrouptitle=dict(text=row['Lobe'].upper()))]
 
+    if not values_all:
+        return []
 
     # create box plot trace
     box_trace = go.Box(x=values_all, y0=0, orientation='h', name='box', line_width=1, opacity=0.7, boxpoints=False, width=boxwidth, showlegend=False)
@@ -2525,3 +3132,104 @@ def plot_ecg_eog_mne(channels: dict, ecg_epochs: mne.Epochs, m_or_g: str, tmin: 
     mne_ecg_derivs += [QC_derivative(fig_ecg_sensors, 'ECG_field_pattern_sensors_'+m_or_g, 'matplotlib')]
 
     return mne_ecg_derivs
+
+
+def build_metric_derivatives_from_tsv(metric: str, tsv_paths: List[str], m_or_g_chosen: List[str], include_sensor_plots: bool = True):
+    """Backend dispatcher to build QC derivatives for one metric from TSV files.
+
+    This function centralizes the figure-generation logic inside
+    ``universal_plots.py`` so orchestration modules can stay lean and focused on
+    I/O and report assembly.
+    """
+    time_series_derivs, sensors_derivs, ptp_manual_derivs, pp_auto_derivs, ecg_derivs, eog_derivs, std_derivs, psd_derivs, muscle_derivs, head_derivs = [], [], [], [], [], [], [], [], [], []
+    stim_derivs = []
+
+    for tsv_path in tsv_paths:
+        basename = os.path.basename(tsv_path)
+
+        def _extend_safe(target: list, func, *args, **kwargs) -> None:
+            """Run one plotting builder safely; keep other figures on failure."""
+            try:
+                out = func(*args, **kwargs)
+            except Exception as exc:
+                print(f"___MEGqc___: Skipping plot '{func.__name__}' for '{basename}': {exc}")
+                return
+            if out:
+                target += out
+
+        if 'desc-stimulus' in basename:
+            _extend_safe(stim_derivs, plot_stim_csv, tsv_path)
+
+        if 'STD' in metric.upper():
+            if include_sensor_plots:
+                _extend_safe(std_derivs, plot_sensors_3d_csv, tsv_path)
+            for m_or_g in m_or_g_chosen:
+                _extend_safe(std_derivs, plot_3d_topomap_std_ptp_csv, tsv_path, ch_type=m_or_g, what_data='stds')
+                _extend_safe(std_derivs, boxplot_all_time_csv, tsv_path, ch_type=m_or_g, what_data='stds')
+                _extend_safe(std_derivs, boxplot_epoched_xaxis_channels_csv, tsv_path, ch_type=m_or_g, what_data='stds')
+
+        if 'PTP' in metric.upper():
+            if include_sensor_plots:
+                _extend_safe(ptp_manual_derivs, plot_sensors_3d_csv, tsv_path)
+            for m_or_g in m_or_g_chosen:
+                _extend_safe(ptp_manual_derivs, plot_3d_topomap_std_ptp_csv, tsv_path, ch_type=m_or_g, what_data='peaks')
+                _extend_safe(ptp_manual_derivs, boxplot_all_time_csv, tsv_path, ch_type=m_or_g, what_data='peaks')
+                _extend_safe(ptp_manual_derivs, boxplot_epoched_xaxis_channels_csv, tsv_path, ch_type=m_or_g, what_data='peaks')
+
+        elif 'PSD' in metric.upper():
+            method = 'welch'
+            if include_sensor_plots:
+                _extend_safe(psd_derivs, plot_sensors_3d_csv, tsv_path)
+            for m_or_g in m_or_g_chosen:
+                _extend_safe(psd_derivs, Plot_psd_csv, m_or_g, tsv_path, method)
+                _extend_safe(psd_derivs, plot_pie_chart_freq_csv, tsv_path, m_or_g=m_or_g, noise_or_waves='noise')
+                _extend_safe(psd_derivs, plot_pie_chart_freq_csv, tsv_path, m_or_g=m_or_g, noise_or_waves='waves')
+                _extend_safe(psd_derivs, plot_3d_topomap_psd_csv, tsv_path, ch_type=m_or_g)
+
+        elif 'ECG' in metric.upper():
+            if include_sensor_plots:
+                _extend_safe(ecg_derivs, plot_sensors_3d_csv, tsv_path)
+            _extend_safe(ecg_derivs, plot_ECG_EOG_channel_csv, tsv_path)
+            _extend_safe(ecg_derivs, plot_mean_rwave_csv, tsv_path, 'ECG')
+            for m_or_g in m_or_g_chosen:
+                _extend_safe(ecg_derivs, plot_artif_per_ch_3_groups, tsv_path, m_or_g, 'ECG', flip_data=False)
+                _extend_safe(ecg_derivs, plot_3d_topomap_ecg_eog_csv, tsv_path, m_or_g, 'ECG')
+
+        elif 'EOG' in metric.upper():
+            if include_sensor_plots:
+                _extend_safe(eog_derivs, plot_sensors_3d_csv, tsv_path)
+            _extend_safe(eog_derivs, plot_ECG_EOG_channel_csv, tsv_path)
+            _extend_safe(eog_derivs, plot_mean_rwave_csv, tsv_path, 'EOG')
+            for m_or_g in m_or_g_chosen:
+                _extend_safe(eog_derivs, plot_artif_per_ch_3_groups, tsv_path, m_or_g, 'EOG', flip_data=False)
+                _extend_safe(eog_derivs, plot_3d_topomap_ecg_eog_csv, tsv_path, m_or_g, 'EOG')
+
+        elif 'MUSCLE' in metric.upper():
+            _extend_safe(muscle_derivs, plot_muscle_csv, tsv_path)
+
+        elif 'HEAD' in metric.upper():
+            try:
+                head_pos_derivs, _ = plot_head_pos_csv(tsv_path)
+                if head_pos_derivs:
+                    head_derivs += head_pos_derivs
+            except Exception as exc:
+                print(f"___MEGqc___: Skipping plot 'plot_head_pos_csv' for '{basename}': {exc}")
+
+    qc_derivs = {
+        'TIME_SERIES': time_series_derivs,
+        'STIMULUS': stim_derivs,
+        'SENSORS': sensors_derivs,
+        'STD': std_derivs,
+        'PSD': psd_derivs,
+        'PTP_MANUAL': ptp_manual_derivs,
+        'PTP_AUTO': pp_auto_derivs,
+        'ECG': ecg_derivs,
+        'EOG': eog_derivs,
+        'HEAD': head_derivs,
+        'MUSCLE': muscle_derivs,
+        'REPORT_MNE': []
+    }
+    for metric_key, values in qc_derivs.items():
+        if values:
+            qc_derivs[metric_key] = sorted(values, key=lambda x: x.fig_order)
+    return qc_derivs

@@ -38,7 +38,12 @@ def get_all_config_params(config_file_path: str):
     config = configparser.ConfigParser()
     config.read(config_file_path)
 
-    default_section = config['DEFAULT']
+    # Backward/forward compatible handling:
+    # older configs relied on DEFAULT, while newer public configs use [GENERAL].
+    if "GENERAL" in config:
+        default_section = config["GENERAL"]
+    else:
+        default_section = config["DEFAULT"]
 
     m_or_g_chosen = default_section['ch_types']
     m_or_g_chosen = [chosen.strip() for chosen in m_or_g_chosen.split(",")]
@@ -79,9 +84,6 @@ def get_all_config_params(config_file_path: str):
             'run_EOG': run_EOG,
             'run_Head': run_Head,
             'run_Muscle': run_Muscle,
-            'plot_mne_butterfly': default_section.getboolean('plot_mne_butterfly'),
-            'plot_interactive_time_series': default_section.getboolean('plot_interactive_time_series'),
-            'plot_interactive_time_series_average': default_section.getboolean('plot_interactive_time_series_average'),
             'crop_tmin': tmin,
             'crop_tmax': tmax})
         all_qc_params['default'] = default_params
@@ -116,7 +118,10 @@ def get_all_config_params(config_file_path: str):
             'epoch_tmin': epoching_section.getfloat('epoch_tmin'),
             'epoch_tmax': epoching_section.getfloat('epoch_tmax'),
             'stim_channel': stim_channel,
-            'event_repeated': epoching_section['event_repeated']})
+            'event_repeated': epoching_section['event_repeated'],
+            'use_fixed_length_epochs': epoching_section.getboolean('use_fixed_length_epochs'),
+            'fixed_epoch_duration': epoching_section.getfloat('fixed_epoch_duration'),
+            'fixed_epoch_overlap': epoching_section.getfloat('fixed_epoch_overlap')})
         all_qc_params['Epoching'] = epoching_params
 
         std_section = config['STD']
@@ -165,6 +170,8 @@ def get_all_config_params(config_file_path: str):
             'min_duration': ptp_mne_section.getfloat('min_duration')})
 
         ecg_section = config['ECG']
+        ecg_fixed_ch = ecg_section.get('fixed_channel_names', '')
+        ecg_fixed_ch = [name.strip() for name in ecg_fixed_ch.split(',') if name.strip()]
         all_qc_params['ECG'] = dict({
             'drop_bad_ch': ecg_section.getboolean('drop_bad_ch'),
             'n_breaks_bursts_allowed_per_10min': ecg_section.getint('n_breaks_bursts_allowed_per_10min'),
@@ -172,15 +179,19 @@ def get_all_config_params(config_file_path: str):
             'norm_lvl': ecg_section.getfloat('norm_lvl'),
             'gaussian_sigma': ecg_section.getint('gaussian_sigma'),
             'thresh_lvl_peakfinder': ecg_section.getfloat('thresh_lvl_peakfinder'),
-            'height_multiplier': ecg_section.getfloat('height_multiplier')})
+            'height_multiplier': ecg_section.getfloat('height_multiplier'),
+            'fixed_channel_names': ecg_fixed_ch})
 
         eog_section = config['EOG']
+        eog_fixed_ch = eog_section.get('fixed_channel_names', '')
+        eog_fixed_ch = [name.strip() for name in eog_fixed_ch.split(',') if name.strip()]
         all_qc_params['EOG'] = dict({
             'n_breaks_bursts_allowed_per_10min': eog_section.getint('n_breaks_bursts_allowed_per_10min'),
             'allowed_range_of_peaks_stds': eog_section.getfloat('allowed_range_of_peaks_stds'),
             'norm_lvl': eog_section.getfloat('norm_lvl'),
             'gaussian_sigma': ecg_section.getint('gaussian_sigma'),
-            'thresh_lvl_peakfinder': eog_section.getfloat('thresh_lvl_peakfinder'), })
+            'thresh_lvl_peakfinder': eog_section.getfloat('thresh_lvl_peakfinder'),
+            'fixed_channel_names': eog_fixed_ch})
 
         head_section = config['Head_movement']
         all_qc_params['Head'] = dict({})
@@ -357,6 +368,10 @@ def Epoch_meg(epoching_params, data: mne.io.Raw):
     epoch_tmin = epoching_params['epoch_tmin']
     epoch_tmax = epoching_params['epoch_tmax']
     stim_channel = epoching_params['stim_channel']
+    use_fixed_length_epochs = epoching_params['use_fixed_length_epochs']
+    fixed_epoch_duration = epoching_params['fixed_epoch_duration']
+    fixed_epoch_overlap = epoching_params['fixed_epoch_overlap']
+    min_event_count = 2 if use_fixed_length_epochs else 1
 
     if stim_channel is None:
         picks_stim = mne.pick_types(data.info, stim=True)
@@ -376,27 +391,69 @@ def Epoch_meg(epoching_params, data: mne.io.Raw):
         # even if stim is None, mne will check once more when creating events.
 
     epochs_grad, epochs_mag = None, None
+    epoching_mode = 'stim'
 
-    try:
-        events = mne.find_events(data, stim_channel=stim_channel, min_duration=event_dur)
-
-        if len(events) < 1:
+    def _make_fixed_length_epochs(picks, channel_type):
+        """Create fixed-length epochs for a channel type when no stim events are available."""
+        if fixed_epoch_duration <= 0:
             print('___MEGqc___: ',
-                  'No events with set minimum duration were found using all stimulus channels. No epoching can be done. Try different event duration in config file.')
-        else:
-            print('___MEGqc___: ', 'Events found:', len(events))
-            epochs_mag = mne.Epochs(data, events, picks=picks_magn, tmin=epoch_tmin, tmax=epoch_tmax, preload=True,
-                                    baseline=None, event_repeated=epoching_params['event_repeated'])
-            epochs_grad = mne.Epochs(data, events, picks=picks_grad, tmin=epoch_tmin, tmax=epoch_tmax, preload=True,
-                                     baseline=None, event_repeated=epoching_params['event_repeated'])
+                  'Fixed-length epoch duration must be positive. No fixed-length epoching will be done.')
+            return None
+        if fixed_epoch_overlap < 0:
+            print('___MEGqc___: ',
+                  'Fixed-length epoch overlap must be >= 0. No fixed-length epoching will be done.')
+            return None
+        if fixed_epoch_overlap >= fixed_epoch_duration:
+            print('___MEGqc___: ',
+                  'Fixed-length epoch overlap must be smaller than duration. No fixed-length epoching will be done.')
+            return None
 
-    except:  # case when we use stim_channel=None, mne checks once more,  finds no other stim ch and no events and throws error:
-        print('___MEGqc___: ', 'No stim channels detected, no events found.')
-        pass  # go to returning empty dict
+        epochs = mne.make_fixed_length_epochs(
+            data,
+            duration=fixed_epoch_duration,
+            overlap=fixed_epoch_overlap,
+            preload=True)
+        if picks:
+            epochs.pick(picks)
+        print('___MEGqc___: ',
+              f'Fixed-length epochs created for {channel_type}: {len(epochs)} epochs.')
+        return epochs
+
+    def _apply_fixed_length_fallback(reason):
+        if not use_fixed_length_epochs:
+            print('___MEGqc___: ', reason)
+            return
+        print('___MEGqc___: ', f'{reason} Falling back to fixed-length epoching.')
+        nonlocal epoching_mode, epochs_mag, epochs_grad
+        epoching_mode = 'fixed_length'
+        epochs_mag = _make_fixed_length_epochs(picks_magn, 'magnetometers')
+        epochs_grad = _make_fixed_length_epochs(picks_grad, 'gradiometers')
+
+    if stim_channel is None:
+        _apply_fixed_length_fallback('No stimulus channels detected.')
+    else:
+        try:
+            events = mne.find_events(data, stim_channel=stim_channel, min_duration=event_dur)
+
+            if len(events) < min_event_count:
+                _apply_fixed_length_fallback(
+                    f'Only {len(events)} event(s) were found using all stimulus channels '
+                    f'(minimum required: {min_event_count}).'
+                )
+            else:
+                print('___MEGqc___: ', 'Events found:', len(events))
+                epochs_mag = mne.Epochs(data, events, picks=picks_magn, tmin=epoch_tmin, tmax=epoch_tmax,
+                                        preload=True, baseline=None, event_repeated=epoching_params['event_repeated'])
+                epochs_grad = mne.Epochs(data, events, picks=picks_grad, tmin=epoch_tmin, tmax=epoch_tmax,
+                                         preload=True, baseline=None, event_repeated=epoching_params['event_repeated'])
+
+        except Exception:
+            _apply_fixed_length_fallback('No stim channels detected, no events found.')
 
     dict_epochs_mg = {
         'mag': epochs_mag,
-        'grad': epochs_grad}
+        'grad': epochs_grad,
+        'epoching_mode': epoching_mode}
 
     return dict_epochs_mg
 
@@ -972,7 +1029,7 @@ def save_meg_with_suffix(
     """
     Save an MNE raw object alongside the derivatives with a custom suffix.
 
-    The output directory is constructed as ``<derivatives_root>/temp/<subject>``
+    The output directory is constructed as ``<derivatives_root>/.tmp/<subject>``
     where ``subject`` is inferred from the first path component starting with
     ``sub-`` in ``file_path``. Using ``derivatives_root`` allows callers to place
     temporary files outside the read-only BIDS directory if needed.
@@ -985,7 +1042,9 @@ def save_meg_with_suffix(
     if subject is None:
         raise ValueError("Unable to determine subject from file path for temporary output")
 
-    output_dir = os.path.join(derivatives_root, 'temp', subject)
+    # Profile-scoped temporary intermediates are stored in ".tmp" to make
+    # their transient nature explicit for users inspecting derivatives.
+    output_dir = os.path.join(derivatives_root, '.tmp', subject)
     output_dir = os.path.abspath(output_dir)
     print("Output directory:", output_dir)
 
@@ -1091,11 +1150,13 @@ def delete_temp_folder(derivatives_root: str) -> str:
          Absolute path to the dataset's derivatives directory (either inside
          the BIDS dataset or in an external location).
     """
-    temp_dir = os.path.join(derivatives_root, 'temp')
-    temp_dir = os.path.abspath(temp_dir)
-    if os.path.isdir(temp_dir):
-        shutil.rmtree(temp_dir)
-        print("Removing directory:", temp_dir)
+    # Prefer modern ".tmp" folder and also clean legacy "temp" if present.
+    for folder_name in ('.tmp', 'temp'):
+        temp_dir = os.path.join(derivatives_root, folder_name)
+        temp_dir = os.path.abspath(temp_dir)
+        if os.path.isdir(temp_dir):
+            shutil.rmtree(temp_dir)
+            print("Removing directory:", temp_dir)
 
     return
 
@@ -1280,7 +1341,12 @@ def initial_processing(default_settings: dict, filtering_settings: dict, epochin
 
     dict_epochs_mg = Epoch_meg(epoching_params, data=raw_cropped_filtered)
     epoching_str = ''
-    if dict_epochs_mg['mag'] is None and dict_epochs_mg['grad'] is None:
+    if dict_epochs_mg.get('epoching_mode') == 'fixed_length':
+        epoching_str = (
+            '<p>No stimulus channels were detected. The data was epoched into fixed-length segments with '
+            f'duration {epoching_params["fixed_epoch_duration"]} s and overlap '
+            f'{epoching_params["fixed_epoch_overlap"]} s.</p><br></br>')
+    elif dict_epochs_mg['mag'] is None and dict_epochs_mg['grad'] is None:
         epoching_str = ''' <p>No epoching could be done in this data set: no events found. Quality measurement were only performed on the entire time series. If this was not expected, try: 1) checking the presence of stimulus channel in the data set, 2) setting stimulus channel explicitly in config file, 3) setting different event duration in config file.</p><br></br>'''
 
     resample_str = '<p>' + resample_str + '</p>'
