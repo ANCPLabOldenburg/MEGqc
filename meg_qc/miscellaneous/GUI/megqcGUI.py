@@ -13,9 +13,13 @@ import os
 import signal
 import json
 import time
+import subprocess
 import configparser
 import hashlib
 import shutil
+import ssl
+from urllib.request import Request, urlopen
+from urllib.error import URLError, HTTPError
 from pathlib import Path
 from typing import Dict, List, Optional, Union, Tuple
 
@@ -56,6 +60,7 @@ from meg_qc.test import (
     validate_plot_request,
 )
 from meg_qc.calculation.meg_qc_pipeline import list_analysis_profiles
+from meg_qc import __version__ as MEGQC_VERSION
 
 # Use Qt5 widget integration and not the OS integrations (This will prevent incompatibilities)
 QCoreApplication.setAttribute(Qt.ApplicationAttribute.AA_DontUseNativeDialogs)
@@ -846,6 +851,7 @@ class MainWindow(QMainWindow):
         self.themes = self._build_theme_dict()
         self.cpu_count, self.total_ram_gb = self._detect_system_resources()
         self.active_theme_name = "Ocean"
+        self.installed_megqc_version = str(MEGQC_VERSION)
 
         # Bottom execution status controls (rendered inside main layout).
         self.spinner_frames = ["|", "/", "-", "\\"]
@@ -1236,6 +1242,153 @@ class MainWindow(QMainWindow):
         )
         if dialog.exec() == QDialog.DialogCode.Accepted:
             self.apply_theme(dialog.theme_combo.currentText(), persist=True)
+
+    def _fetch_latest_pypi_version(self) -> str:
+        """Query PyPI for the latest published meg_qc version string.
+
+        SSL strategy:
+        1. Try certifi CA bundle when available.
+        2. Fall back to system default CA context.
+        3. Final fallback (read-only check): unverified SSL context.
+        """
+        req = Request(
+            "https://pypi.org/pypi/meg_qc/json",
+            headers={"User-Agent": "MEGqc-GUI-update-check"},
+        )
+        contexts = []
+        try:
+            import certifi  # Optional dependency
+            contexts.append(ssl.create_default_context(cafile=certifi.where()))
+        except Exception:
+            pass
+
+        contexts.append(ssl.create_default_context())
+        last_exc: Optional[Exception] = None
+
+        for ctx in contexts:
+            try:
+                with urlopen(req, timeout=8, context=ctx) as resp:
+                    payload = json.loads(resp.read().decode("utf-8"))
+                return str(payload.get("info", {}).get("version", "")).strip()
+            except Exception as exc:
+                last_exc = exc
+
+        # Final fallback: for update *check* only, tolerate missing local CA.
+        try:
+            insecure_ctx = ssl._create_unverified_context()
+            with urlopen(req, timeout=8, context=insecure_ctx) as resp:
+                payload = json.loads(resp.read().decode("utf-8"))
+            self._log("Update check used unverified SSL fallback (certificate validation unavailable).")
+            return str(payload.get("info", {}).get("version", "")).strip()
+        except Exception as exc:
+            if last_exc is not None:
+                raise last_exc
+            raise exc
+
+    @staticmethod
+    def _is_newer_version(latest: str, current: str) -> bool:
+        """Best-effort version comparison with graceful fallback."""
+        try:
+            from packaging.version import Version
+            return Version(latest) > Version(current)
+        except Exception:
+            # Fallback: if parsing support is unavailable, treat inequality as update hint.
+            return bool(latest and latest != current)
+
+    def _run_megqc_self_update(self) -> Tuple[bool, str]:
+        """Run pip upgrade for meg_qc in the same Python environment."""
+        cmd = [sys.executable, "-m", "pip", "install", "--upgrade", "meg_qc"]
+        try:
+            proc = subprocess.run(
+                cmd,
+                capture_output=True,
+                text=True,
+                timeout=600,
+                check=False,
+            )
+        except Exception as exc:
+            return False, str(exc)
+
+        if proc.returncode == 0:
+            return True, (proc.stdout or "").strip()
+        stderr_text = (proc.stderr or "").strip()
+        stdout_text = (proc.stdout or "").strip()
+        return False, stderr_text or stdout_text or "Unknown pip error."
+
+    def _check_for_updates(self) -> None:
+        """Check PyPI and optionally upgrade MEGqc from the GUI."""
+        current = self.installed_megqc_version
+        self._log(f"Checking PyPI for updates (installed: {current})...")
+        try:
+            latest = self._fetch_latest_pypi_version()
+        except (URLError, HTTPError, TimeoutError, ValueError) as exc:
+            QMessageBox.warning(
+                self,
+                "Check updates",
+                f"Could not check PyPI for updates.\n\n{exc}",
+            )
+            self._log(f"Update check failed: {exc}")
+            return
+        except Exception as exc:
+            QMessageBox.warning(
+                self,
+                "Check updates",
+                f"Unexpected error while checking updates.\n\n{exc}",
+            )
+            self._log(f"Update check failed: {exc}")
+            return
+
+        if not latest:
+            QMessageBox.warning(
+                self,
+                "Check updates",
+                "PyPI responded without a valid version string.",
+            )
+            self._log("Update check failed: empty PyPI version response.")
+            return
+
+        self._log(f"PyPI latest version: {latest}")
+        if not self._is_newer_version(latest, current):
+            QMessageBox.information(
+                self,
+                "Check updates",
+                f"You are up to date.\nInstalled: {current}\nPyPI: {latest}",
+            )
+            return
+
+        answer = QMessageBox.question(
+            self,
+            "Update available",
+            (
+                f"A newer MEGqc version is available.\n\n"
+                f"Installed: {current}\n"
+                f"PyPI: {latest}\n\n"
+                "Do you want to update now using pip?"
+            ),
+        )
+        if answer != QMessageBox.StandardButton.Yes:
+            self._log("Update skipped by user.")
+            return
+
+        self._log("Running self-update: pip install --upgrade meg_qc")
+        ok, out = self._run_megqc_self_update()
+        if ok:
+            QMessageBox.information(
+                self,
+                "Update completed",
+                (
+                    "MEGqc was updated successfully.\n"
+                    "Please restart the GUI to load the new version."
+                ),
+            )
+            self._log("Self-update completed successfully.")
+        else:
+            QMessageBox.warning(
+                self,
+                "Update failed",
+                f"pip update failed.\n\n{out}",
+            )
+            self._log(f"Self-update failed: {out}")
 
     def _animate_spinner(self) -> None:
         if not self.task_started_at:
@@ -1683,13 +1836,19 @@ class MainWindow(QMainWindow):
         bottom_lay = QHBoxLayout(bottom_row)
         bottom_lay.setContentsMargins(0, 0, 0, 0)
         bottom_lay.setSpacing(10)
+        self.lbl_version = QLabel(f"MEGqc v{self.installed_megqc_version}")
+        self.lbl_version.setToolTip("Installed package version.")
+        self.btn_check_updates = QPushButton("Check updates")
+        self.btn_check_updates.setToolTip("Check PyPI for newer MEGqc versions and optionally update.")
+        self.btn_check_updates.clicked.connect(self._check_for_updates)
+        bottom_lay.addWidget(self.lbl_version)
+        bottom_lay.addWidget(self.btn_check_updates)
         bottom_lay.addStretch(1)
         self.btn_gui_settings = QPushButton("GUI settings")
         self.btn_gui_settings.clicked.connect(self._open_gui_settings_dialog)
         bottom_lay.addWidget(self.btn_gui_settings)
         bottom_lay.addWidget(self.spinner_label)
         bottom_lay.addWidget(self.elapsed_label)
-        bottom_lay.addStretch(1)
         lay.addWidget(bottom_row)
 
         self._refresh_calc_jobs_table()

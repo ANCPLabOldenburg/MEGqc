@@ -2,6 +2,7 @@ import sys
 import os
 import ancpbids
 import json
+import csv
 import datetime as dt
 import html
 from prompt_toolkit.shortcuts import checkboxlist_dialog
@@ -1240,51 +1241,518 @@ def _build_subject_overview_section(
     return overview_html
 
 
-def _build_subject_summary_section(summary_payload: List[Dict[str, Any]]) -> str:
-    """Build summary tab with HTML-formatted run summaries.
+def _build_subject_summary_section(
+    *,
+    subject: str,
+    summary_payload: List[Dict[str, Any]],
+) -> str:
+    """Build metric-oriented QC summary tabs for one subject.
 
-    The section uses ``make_summary_qc_report`` so presentation matches the
-    dedicated summary report style, instead of exposing raw JSON blocks.
+    Layout:
+    - Top-level tabs by metric (GQI, PSD, ECG, EOG, ...)
+    - For each metric, nested tabs by run/task
     """
-    if not summary_payload:
-        return "<p>No summary material is available for this subject.</p>"
-
-    run_tabs: List[Tuple[str, str]] = []
+    run_payloads: List[Dict[str, Any]] = []
     for item in summary_payload:
-        run_label = item["run_label"]
         report_strings_path = item.get("report_strings_path")
         simple_metrics_path = item.get("simple_metrics_path")
+        run_payloads.append(
+            {
+                "run_label": str(item.get("run_label", "run")),
+                "report_strings_path": report_strings_path,
+                "simple_metrics_path": simple_metrics_path,
+                "report_strings": _safe_read_json(report_strings_path),
+                "simple_metrics": _safe_read_json(simple_metrics_path),
+                "source_paths": item.get("source_paths", []) or [],
+            }
+        )
 
-        blocks = []
-        if report_strings_path and simple_metrics_path:
-            try:
-                summary_html = make_summary_qc_report(report_strings_path, simple_metrics_path)
-                iframe_id = f"summary-frame-{_sanitize_token(run_label)}"
-                blocks.append(_build_lazy_summary_iframe(summary_html, frame_id=iframe_id))
-            except Exception as exc:
-                blocks.append(
-                    "<p>Formatted summary could not be rendered for this run: "
-                    f"{html.escape(str(exc))}</p>"
+    gqi_rows = _collect_subject_gqi_task_rows(subject=subject, summary_payload=summary_payload)
+    metric_tabs: List[Tuple[str, str]] = [
+        ("GQI", _build_subject_gqi_metric_panel(gqi_rows))
+    ]
+
+    metric_order = [
+        "PSD",
+        "ECG",
+        "EOG",
+        "STD",
+        "PTP_MANUAL",
+        "PTP_AUTO",
+        "MUSCLE",
+        "HEAD",
+        "STIMULUS",
+        "INITIAL_INFO",
+    ]
+    metric_labels = {
+        "PTP_MANUAL": "PtP (manual)",
+        "PTP_AUTO": "PtP (auto)",
+    }
+
+    for metric in metric_order:
+        run_tabs: List[Tuple[str, str]] = []
+        for run_item in run_payloads:
+            run_label = run_item["run_label"]
+            report_strings = run_item.get("report_strings", {}) or {}
+            simple_metrics = run_item.get("simple_metrics", {}) or {}
+            report_text = str(report_strings.get(metric, "") or "")
+            metric_data = simple_metrics.get(metric)
+
+            panel_html = _build_subject_qc_metric_run_panel(
+                metric=metric,
+                run_label=run_label,
+                report_text=report_text,
+                metric_data=metric_data,
+                gqi_rows=gqi_rows,
+                source_paths=run_item.get("source_paths", []),
+                report_strings_path=run_item.get("report_strings_path"),
+                simple_metrics_path=run_item.get("simple_metrics_path"),
+            )
+            if panel_html:
+                run_tabs.append((run_label, panel_html))
+
+        if run_tabs:
+            metric_tabs.append(
+                (
+                    metric_labels.get(metric, metric),
+                    _build_subtabs_html(
+                        group_id=f"subject-qc-metric-{_sanitize_token(metric)}",
+                        tabs=run_tabs,
+                        level=3,
+                    ),
                 )
+            )
+
+    if not metric_tabs:
+        return "<p>No QC summary material is available for this subject.</p>"
+
+    return _build_subtabs_html("subject-qc-summary-metrics", metric_tabs, level=2)
+
+
+def _resolve_analysis_root_from_artifact(artifact_path: str) -> Optional[Path]:
+    """Resolve the MEGqc analysis root from one derivative artifact path.
+
+    Supports both layouts:
+    - legacy: ``.../derivatives/Meg_QC/...``
+    - profile: ``.../derivatives/Meg_QC/profiles/<analysis_id>/...``
+    """
+    if not artifact_path:
+        return None
+    p = Path(artifact_path)
+    parts = p.parts
+    if "Meg_QC" not in parts:
+        return None
+
+    idx = max(i for i, seg in enumerate(parts) if seg == "Meg_QC")
+    root = Path(*parts[: idx + 1])
+    if idx + 2 < len(parts) and parts[idx + 1] == "profiles":
+        return root / "profiles" / parts[idx + 2]
+    return root
+
+
+def _collect_subject_gqi_task_rows(
+    *,
+    subject: str,
+    summary_payload: List[Dict[str, Any]],
+) -> List[Dict[str, Any]]:
+    """Collect subject-level GQI rows (task x attempt) from attempt TSV files."""
+    subject_tokens = {str(subject), f"sub-{subject}"}
+    analysis_roots: List[Path] = []
+    for item in summary_payload:
+        report_strings_path = item.get("report_strings_path")
+        simple_metrics_path = item.get("simple_metrics_path")
+        for p in [report_strings_path, simple_metrics_path]:
+            root = _resolve_analysis_root_from_artifact(str(p) if p else "")
+            if root and root not in analysis_roots:
+                analysis_roots.append(root)
+
+    rows: List[Dict[str, Any]] = []
+    for root in analysis_roots:
+        group_metrics_dir = root / "summary_reports" / "group_metrics"
+        if not group_metrics_dir.exists():
+            continue
+
+        for tsv_path in sorted(group_metrics_dir.glob("Global_Quality_Index_attempt_*.tsv")):
+            match = re.search(r"attempt_(\d+)\.tsv$", tsv_path.name)
+            if not match:
+                continue
+            attempt = int(match.group(1))
+
+            try:
+                with tsv_path.open("r", encoding="utf-8") as f:
+                    reader = csv.DictReader(f, delimiter="\t")
+                    for record in reader:
+                        subj_val = str(record.get("subject", "")).strip()
+                        if subj_val not in subject_tokens:
+                            continue
+                        rows.append(
+                            {
+                                "attempt": attempt,
+                                "task": str(record.get("task", "")).strip(),
+                                "GQI": str(record.get("GQI", "")).strip(),
+                                "ECG_mag_high_corr_num": str(record.get("ECG_mag_high_corr_num", "")).strip(),
+                                "ECG_mag_high_corr_percentage": str(record.get("ECG_mag_high_corr_percentage", "")).strip(),
+                                "ECG_grad_high_corr_num": str(record.get("ECG_grad_high_corr_num", "")).strip(),
+                                "ECG_grad_high_corr_percentage": str(record.get("ECG_grad_high_corr_percentage", "")).strip(),
+                                "EOG_mag_high_corr_num": str(record.get("EOG_mag_high_corr_num", "")).strip(),
+                                "EOG_mag_high_corr_percentage": str(record.get("EOG_mag_high_corr_percentage", "")).strip(),
+                                "EOG_grad_high_corr_num": str(record.get("EOG_grad_high_corr_num", "")).strip(),
+                                "EOG_grad_high_corr_percentage": str(record.get("EOG_grad_high_corr_percentage", "")).strip(),
+                                "tsv_path": str(tsv_path),
+                            }
+                        )
+            except Exception:
+                continue
+
+    rows.sort(key=lambda x: (x.get("attempt", 0), x.get("task", "")))
+    return rows
+
+
+def _build_subject_gqi_metric_panel(rows: List[Dict[str, Any]]) -> str:
+    """Render GQI metric panel with clean task-level rows."""
+    if not rows:
+        return (
+            "<div class='overview-card'>"
+            "<h3>Global Quality Index (GQI)</h3>"
+            "<p>No GQI attempt tables were found, or no rows matched this subject.</p>"
+            "</div>"
+        )
+
+    body_rows = []
+    source_paths = []
+    for row in rows:
+        source_path = str(row.get("tsv_path", "") or "")
+        source_name = os.path.basename(source_path) if source_path else "-"
+        if source_path:
+            source_paths.append(source_path)
+        body_rows.append(
+            "<tr>"
+            f"<td>{row['attempt']}</td>"
+            f"<td>{html.escape(row.get('task', '') or '-')}</td>"
+            f"<td>{row.get('GQI', '') or '-'}</td>"
+            f"<td><code>{html.escape(source_name)}</code></td>"
+            "</tr>"
+        )
+
+    table_html = (
+        "<table>"
+        "<thead><tr>"
+        "<th>Attempt</th><th>Task</th><th>GQI</th><th>Source TSV</th>"
+        "</tr></thead>"
+        f"<tbody>{''.join(body_rows)}</tbody>"
+        "</table>"
+    )
+    sources_details = ""
+    unique_sources = sorted(set(source_paths))
+    if unique_sources:
+        src_items = "".join(
+            f"<li><code>{html.escape(p)}</code></li>" for p in unique_sources
+        )
+        sources_details = (
+            "<details><summary>Source file paths</summary>"
+            f"<ul>{src_items}</ul></details>"
+        )
+    return (
+        "<div class='overview-card'>"
+        "<h3>Global Quality Index (GQI)</h3>"
+        "<p>Task-level rows discovered from "
+        "<code>summary_reports/group_metrics/Global_Quality_Index_attempt_&lt;n&gt;.tsv</code>. "
+        "Values shown are filtered for this subject.</p>"
+        f"{table_html}"
+        f"{sources_details}"
+        "</div>"
+    )
+
+
+def _safe_read_json(path: Optional[str]) -> Dict[str, Any]:
+    """Read JSON file with a tolerant fallback."""
+    if not path:
+        return {}
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+            return data if isinstance(data, dict) else {}
+    except Exception:
+        return {}
+
+
+def _normalize_task_token(task: str) -> str:
+    """Normalize task/run labels so run tabs match GQI task rows."""
+    token = str(task or "").strip().lower()
+    token = token.replace("task-", "").replace("run-", "")
+    token = re.sub(r"[_\\s]+", "", token)
+    return token
+
+
+def _html_table(headers: List[str], rows: List[List[str]]) -> str:
+    """Render a compact HTML table."""
+    head = "".join(f"<th>{html.escape(h)}</th>" for h in headers)
+    body = []
+    for row in rows:
+        body.append("<tr>" + "".join(f"<td>{cell}</td>" for cell in row) + "</tr>")
+    return (
+        "<table>"
+        f"<thead><tr>{head}</tr></thead>"
+        f"<tbody>{''.join(body)}</tbody>"
+        "</table>"
+    )
+
+
+def _build_psd_summary_from_simple_metrics(metric_data: Any) -> str:
+    """Build concise PSD summary from SimpleMetrics JSON."""
+    if not isinstance(metric_data, dict):
+        return "<p>No PSD simple-metrics block is available for this run.</p>"
+
+    rows: List[List[str]] = []
+    rows.append(["Unit (MAG)", html.escape(str(metric_data.get("measurement_unit_mag", "-")))])
+    rows.append(["Unit (GRAD)", html.escape(str(metric_data.get("measurement_unit_grad", "-")))])
+    for ch_type in ("mag", "grad"):
+        global_block = ((metric_data.get("PSD_global") or {}).get(ch_type) or {})
+        local_block = ((metric_data.get("PSD_local") or {}).get(ch_type) or {})
+
+        noisy_freq_count = global_block.get("noisy_frequencies_count: ", "-")
+        local_details = (local_block.get("details") or {})
+        total_ch = len(local_details) if isinstance(local_details, dict) else 0
+        affected_ch = 0
+        if isinstance(local_details, dict):
+            for _, channel_payload in local_details.items():
+                if isinstance(channel_payload, dict) and channel_payload:
+                    affected_ch += 1
+        affected_pct = (100.0 * affected_ch / total_ch) if total_ch else 0.0
+
+        rows.append([f"{ch_type.upper()} global noisy-frequency count", html.escape(str(noisy_freq_count))])
+        rows.append(
+            [
+                f"{ch_type.upper()} local noisy-channel burden",
+                html.escape(f"{affected_ch}/{total_ch} ({affected_pct:.1f}%)"),
+            ]
+        )
+
+    return (
+        "<h4>PSD summary (from SimpleMetrics)</h4>"
+        + _html_table(["Field", "Value"], rows)
+    )
+
+
+def _build_ecg_eog_affected_summary(
+    *,
+    metric: str,
+    run_label: str,
+    gqi_rows: List[Dict[str, Any]],
+) -> str:
+    """Return ECG/EOG affected-channel summary for one task from GQI rows."""
+    task_norm = _normalize_task_token(run_label)
+    matched = [
+        r for r in gqi_rows
+        if _normalize_task_token(r.get("task", "")) == task_norm
+    ]
+    if not matched:
+        return (
+            f"<p>{metric}: affected-channel counts/percentages are unavailable for this run "
+            "(no matching GQI task row).</p>"
+        )
+
+    # Prefer latest attempt when multiple attempts exist for the same task.
+    row = sorted(matched, key=lambda x: int(x.get("attempt", 0)))[-1]
+    prefix = metric.upper()
+    rows = [
+        ["Attempt", html.escape(str(row.get("attempt", "-")))],
+        ["Task", html.escape(str(row.get("task", "-")))],
+        ["MAG affected channels", html.escape(f"{row.get(f'{prefix}_mag_high_corr_num', '-')}"
+                                              f" ({row.get(f'{prefix}_mag_high_corr_percentage', '-')}%)")],
+        ["GRAD affected channels", html.escape(f"{row.get(f'{prefix}_grad_high_corr_num', '-')}"
+                                               f" ({row.get(f'{prefix}_grad_high_corr_percentage', '-')}%)")],
+    ]
+    return (
+        f"<h4>{metric.upper()} affected-channel summary (from GQI task row)</h4>"
+        + _html_table(["Field", "Value"], rows)
+    )
+
+
+def _extract_channel_names_for_table(channel_dict: Any) -> str:
+    """Format noisy/flat channel dict payload as a comma-separated string."""
+    if not isinstance(channel_dict, dict):
+        return html.escape(str(channel_dict))
+    if not channel_dict:
+        return "-"
+    return html.escape(", ".join(channel_dict.keys()))
+
+
+def _render_mag_grad_rows(sensor_kind: str, payload: Dict[str, Any]) -> List[str]:
+    """Render metric-specific mag/grad subsection rows (STD/PtP style)."""
+    rows: List[str] = []
+    sensor_label = "MAGNETOMETERS" if sensor_kind == "mag" else "GRADIOMETERS"
+    rows.append(
+        f"<tr><td colspan='2' style='border:1px solid #ccc; text-align:center; padding:6px;'><strong>{sensor_label}</strong></td></tr>"
+    )
+
+    if "number_of_noisy_ch" in payload:
+        for key in [
+            "number_of_noisy_ch",
+            "percent_of_noisy_ch",
+            "number_of_flat_ch",
+            "percent_of_flat_ch",
+            "std_lvl",
+        ]:
+            val = payload.get(key, "N/A")
+            rows.append(
+                f"<tr><td style='border:1px solid #ccc; padding:6px;'><strong>{html.escape(str(key))}</strong></td>"
+                f"<td style='border:1px solid #ccc; padding:6px;'>{html.escape(str(val))}</td></tr>"
+            )
+        details = payload.get("details", {}) or {}
+        rows.append(
+            "<tr><td style='border:1px solid #ccc; padding:6px;'><strong>noisy_ch</strong></td>"
+            f"<td style='border:1px solid #ccc; padding:6px;'>{_extract_channel_names_for_table(details.get('noisy_ch', {}))}</td></tr>"
+        )
+        rows.append(
+            "<tr><td style='border:1px solid #ccc; padding:6px;'><strong>flat_ch</strong></td>"
+            f"<td style='border:1px solid #ccc; padding:6px;'>{_extract_channel_names_for_table(details.get('flat_ch', {}))}</td></tr>"
+        )
+        return rows
+
+    if "total_num_noisy_ep" in payload:
+        for key in [
+            "allow_percent_noisy_flat_epochs",
+            "noisy_channel_multiplier",
+            "flat_multiplier",
+            "total_num_noisy_ep",
+            "total_perc_noisy_ep",
+            "total_num_flat_ep",
+            "total_perc_flat_ep",
+        ]:
+            val = payload.get(key, "N/A")
+            rows.append(
+                f"<tr><td style='border:1px solid #ccc; padding:6px;'><strong>{html.escape(str(key))}</strong></td>"
+                f"<td style='border:1px solid #ccc; padding:6px;'>{html.escape(str(val))}</td></tr>"
+            )
+        return rows
+
+    rows.append(
+        "<tr><td colspan='2' style='border:1px solid #ccc; padding:6px;'>No issues found here</td></tr>"
+    )
+    return rows
+
+
+def _render_detailed_metric_rows(data: Any, *, parent_metric: str) -> List[str]:
+    """Recursively render metric payload into rich table rows."""
+    rows: List[str] = []
+    if isinstance(data, list):
+        if not data:
+            rows.append("<tr><td style='border:1px solid #ccc; padding:6px;'><strong>data</strong></td>"
+                        "<td style='border:1px solid #ccc; padding:6px;'>No data</td></tr>")
+            return rows
+        rows.append(
+            "<tr><td style='border:1px solid #ccc; padding:6px;'><strong>items</strong></td>"
+            f"<td style='border:1px solid #ccc; padding:6px;'>{html.escape(str(len(data)))}</td></tr>"
+        )
+        return rows
+
+    if not isinstance(data, dict):
+        rows.append(
+            "<tr><td style='border:1px solid #ccc; padding:6px;'><strong>value</strong></td>"
+            f"<td style='border:1px solid #ccc; padding:6px;'>{html.escape(str(data))}</td></tr>"
+        )
+        return rows
+
+    for key, value in data.items():
+        key_txt = html.escape(str(key))
+        if isinstance(value, dict):
+            rows.append(
+                f"<tr><td colspan='2' style='border:1px solid #ccc; padding:8px; background:#e0f7fa;'><strong>{key_txt}</strong></td></tr>"
+            )
+            if key in {"mag", "grad"}:
+                rows.extend(_render_mag_grad_rows(key, value))
+                continue
+            if key == "details" and parent_metric in {"STD", "PTP_MANUAL", "PTP_AUTO"}:
+                rows.append(
+                    "<tr><td style='border:1px solid #ccc; padding:6px;'><strong>noisy_ch</strong></td>"
+                    f"<td style='border:1px solid #ccc; padding:6px;'>{_extract_channel_names_for_table(value.get('noisy_ch', {}))}</td></tr>"
+                )
+                rows.append(
+                    "<tr><td style='border:1px solid #ccc; padding:6px;'><strong>flat_ch</strong></td>"
+                    f"<td style='border:1px solid #ccc; padding:6px;'>{_extract_channel_names_for_table(value.get('flat_ch', {}))}</td></tr>"
+                )
+                continue
+            rows.extend(_render_detailed_metric_rows(value, parent_metric=parent_metric))
+            continue
+
+        if isinstance(value, list):
+            val_txt = html.escape(", ".join(str(v) for v in value)) if value else "-"
         else:
-            blocks.append(
-                "<p>Summary files are missing for this run "
-                "(report strings and/or simple metrics).</p>"
+            val_txt = html.escape(str(value))
+        rows.append(
+            f"<tr><td style='border:1px solid #ccc; padding:6px;'><strong>{key_txt}</strong></td>"
+            f"<td style='border:1px solid #ccc; padding:6px;'>{val_txt}</td></tr>"
+        )
+    return rows
+
+
+def _build_detailed_metric_table(metric: str, metric_data: Any) -> str:
+    """Build a detailed metric table preserving nested channel/epoch info."""
+    if metric_data is None:
+        return "<p>No SimpleMetrics payload is available for this metric/run.</p>"
+    rows = _render_detailed_metric_rows(metric_data, parent_metric=metric)
+    return (
+        "<table style='width:100%; border-collapse:collapse;'>"
+        "<thead><tr style='background:#f2f2f2;'>"
+        "<th style='border:1px solid #ccc; padding:6px; text-align:left;'>Field</th>"
+        "<th style='border:1px solid #ccc; padding:6px; text-align:left;'>Value</th>"
+        "</tr></thead>"
+        f"<tbody>{''.join(rows)}</tbody>"
+        "</table>"
+    )
+
+
+def _build_subject_qc_metric_run_panel(
+    *,
+    metric: str,
+    run_label: str,
+    report_text: str,
+    metric_data: Any,
+    gqi_rows: List[Dict[str, Any]],
+    source_paths: List[str],
+    report_strings_path: Optional[str],
+    simple_metrics_path: Optional[str],
+) -> str:
+    """Build one run panel for one QC summary metric."""
+    if not report_text and metric_data is None:
+        return ""
+
+    blocks: List[str] = []
+    if report_text:
+        blocks.append(
+            "<p><strong>Report summary:</strong> "
+            f"{_format_metric_note_html(report_text)}</p>"
+        )
+
+    if metric == "PSD":
+        blocks.append(_build_psd_summary_from_simple_metrics(metric_data))
+    elif metric in {"ECG", "EOG"}:
+        blocks.append(
+            _build_ecg_eog_affected_summary(
+                metric=metric,
+                run_label=run_label,
+                gqi_rows=gqi_rows,
             )
+        )
 
-        source_paths = item.get("source_paths", []) or []
-        summary_sources = [p for p in [report_strings_path, simple_metrics_path] if p]
-        all_sources = sorted(set([str(p) for p in source_paths] + [str(p) for p in summary_sources]))
-        if all_sources:
-            src_items = "".join(
-                f"<li><code>{html.escape(str(p))}</code></li>"
-                for p in all_sources
-            )
-            blocks.append(f"<details><summary>Derivative sources</summary><ul>{src_items}</ul></details>")
+    if metric_data is not None:
+        blocks.append("<h4>SimpleMetrics details</h4>")
+        blocks.append(_build_detailed_metric_table(metric, metric_data))
 
-        run_tabs.append((run_label, "".join(blocks)))
+    all_sources = sorted(
+        set(
+            [str(p) for p in (source_paths or [])]
+            + [str(p) for p in [report_strings_path, simple_metrics_path] if p]
+        )
+    )
+    if all_sources:
+        src_items = "".join(
+            f"<li><code>{html.escape(str(p))}</code></li>" for p in all_sources
+        )
+        blocks.append(f"<details><summary>Derivative sources</summary><ul>{src_items}</ul></details>")
 
-    return _build_subtabs_html("subject-summary-runs", run_tabs, level=2)
+    return "".join(blocks)
 
 
 def _build_subject_report_html(
@@ -1345,7 +1813,15 @@ def _build_subject_report_html(
             )
         )
 
-    top_tabs.append(("Summary", _build_subject_summary_section(summary_payload)))
+    top_tabs.append(
+        (
+            "QC summary",
+            _build_subject_summary_section(
+                subject=subject,
+                summary_payload=summary_payload,
+            ),
+        )
+    )
 
     tab_buttons = []
     tab_panels = []
@@ -2127,7 +2603,7 @@ def process_subject(
     overview_payload: List[Dict[str, Any]] = []
 
     # ``summary_payload`` stores run-level metadata and JSON references used
-    # by the "Summary" tab.
+    # by the "QC summary" tab.
     summary_payload: List[Dict[str, Any]] = []
 
     for raw_entity_name in existing_raws_per_sub:

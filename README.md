@@ -28,9 +28,19 @@ It is designed for large cohorts and reproducible workflows, and provides both:
 
 ## Installation
 
-Use the official installation guide:
+### Option 1: Installer-based (recommended for most users)
 
-[https://ancplaboldenburg.github.io/megqc_documentation/book/installation2.html](https://ancplaboldenburg.github.io/megqc_documentation/book/installation2.html)
+Download the installer bundle from the [MEGqc releases](https://github.com/ANCPLabOldenburg/MEGqc/raw/main/installers/installers.zip) and follow the platform-specific instructions in the [installation guide](https://ancplaboldenburg.github.io/megqc_documentation/installation/gui.html).
+
+### Option 2: CLI-based (Conda + pip)
+
+```bash
+conda create -n megqc-py310 python=3.10 pip -y
+conda activate megqc-py310
+pip install meg-qc
+```
+
+For detailed installation instructions, see the [CLI installation guide](https://ancplaboldenburg.github.io/megqc_documentation/installation/cli.html).
 
 ## Quick Start (CLI)
 
@@ -43,7 +53,7 @@ get-megqc-config --target_directory ./config
 2. Run QA/QC calculation:
 
 ```bash
-run-megqc   --inputdata /path/to/bids_dataset   --config ./config/settings.ini
+run-megqc --inputdata /path/to/bids_dataset --config ./config/settings.ini
 ```
 
 3. Build plotting reports:
@@ -61,7 +71,7 @@ globalqualityindex --inputdata /path/to/bids_dataset
 5. Run full pipeline in one command (calculation + plotting):
 
 ```bash
-run-megqc   --inputdata /path/to/bids_dataset   --config ./config/settings.ini   --run-all
+run-megqc --inputdata /path/to/bids_dataset --config ./config/settings.ini --run-all
 ```
 
 ## Launch GUI
@@ -76,14 +86,17 @@ The GUI uses the same backend logic as CLI dispatchers and writes the same deriv
 
 MEGqc writes outputs under BIDS derivatives (default):
 
-- `derivatives/Meg_QC/calculation/...` (metric tables + JSON summaries)
-- `derivatives/Meg_QC/reports/...` (interactive HTML reports)
-- `derivatives/Meg_QC/...` QC summaries including GQI artifacts
+- `derivatives/Meg_QC/calculation/` — metric tables + JSON summaries
+- `derivatives/Meg_QC/reports/` — interactive HTML reports
+- `derivatives/Meg_QC/summary_reports/` — QC summaries including GQI artifacts
 
 ## Documentation
 
-- Main documentation: [https://ancplaboldenburg.github.io/megqc_documentation/index.html](https://ancplaboldenburg.github.io/megqc_documentation/index.html)
-- Tutorial: [https://ancplaboldenburg.github.io/megqc_documentation/book/tutorial.html](https://ancplaboldenburg.github.io/megqc_documentation/book/tutorial.html)
+- **Installation (Installer-based):** [https://ancplaboldenburg.github.io/megqc_documentation/installation/gui.html](https://ancplaboldenburg.github.io/megqc_documentation/installation/gui.html)
+- **Installation (CLI-based):** [https://ancplaboldenburg.github.io/megqc_documentation/installation/cli.html](https://ancplaboldenburg.github.io/megqc_documentation/installation/cli.html)
+- **Tutorial:** [https://ancplaboldenburg.github.io/megqc_documentation/book/tutorial.html](https://ancplaboldenburg.github.io/megqc_documentation/book/tutorial.html)
+- **HTML Reports guide:** [https://ancplaboldenburg.github.io/megqc_documentation/book/report.html](https://ancplaboldenburg.github.io/megqc_documentation/book/report.html)
+- **Full documentation:** [https://ancplaboldenburg.github.io/megqc_documentation/](https://ancplaboldenburg.github.io/megqc_documentation/)
 
 ## Source Code
 

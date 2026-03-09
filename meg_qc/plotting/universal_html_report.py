@@ -462,13 +462,11 @@ def _dict_to_plotly_tables(data, level: int = 0) -> str:
 
 
 def make_summary_qc_report(report_strings_path: str, simple_metrics_path: str) -> str:
-    """Create an HTML summary report using :class:`mne.Report`.
+    """Create an embeddable HTML QC summary fragment.
 
-    The original implementation produced a very small static HTML file.  The new
-    version mirrors the behaviour of the stand-alone script preferred by users
-    and leverages the rendering capabilities of :mod:`mne`.  The function
-    returns the rendered HTML as a string so that the calling code can store it
-    as an artifact.
+    The returned HTML is intentionally plain (no nested MNE report wrapper) so
+    it can be embedded into the subject report without recursive navigation
+    controls. Metric tables are rendered directly from ``SimpleMetrics`` JSON.
     """
 
     # ------------------------------------------------------------------
@@ -602,16 +600,18 @@ def make_summary_qc_report(report_strings_path: str, simple_metrics_path: str) -
     with open(simple_metrics_path, "r", encoding="utf-8") as f:
         simplemetrics = json.load(f)
 
-    report = mne.Report(title="MEG QC Report")
-
-    # Add report strings section
-    rs_html = '<h2 style="text-align:center; font-family:sans-serif;">Summary: Report Strings</h2>'
+    # Build plain HTML (no MNE report wrapper) so embedding in the subject report
+    # stays lightweight and does not add nested MNE navigation controls.
+    report_blocks = []
+    report_blocks.append(
+        '<h2 style="text-align:center; font-family:sans-serif;">QC summary: report strings</h2>'
+    )
     for metric, content in reportstrings.items():
         if content and str(content).strip():
-            rs_html += build_text_block(metric, str(content).replace("\n", "<br>"))
-    report.add_html(rs_html, title="Report Strings", section="reportstrings")
+            report_blocks.append(build_text_block(metric, str(content).replace("\n", "<br>")))
 
-    # Add tables for simple metrics
+    # Add tables for simple metrics (including PSD/ECG/EOG even when no
+    # "description" field is present).
     for metric, metric_data in simplemetrics.items():
         if isinstance(metric_data, list):
             table_html = (
@@ -624,19 +624,15 @@ def make_summary_qc_report(report_strings_path: str, simple_metrics_path: str) -
                 + table_html
                 + "<br>"
             )
-            report.add_html(full_html, title=f"{metric} Table", section=f"text_{metric}")
+            report_blocks.append(full_html)
             continue
 
         if not isinstance(metric_data, dict):
             continue
 
         description = metric_data.get("description")
-        if description is not None and not str(description).strip():
-            continue
-
-        if description:
-            desc_html = build_text_block(metric, description.replace("\n", "<br>"))
-            report.add_html(desc_html, title=f"{metric}", section=f"text_{metric}")
+        if description and str(description).strip():
+            report_blocks.append(build_text_block(metric, str(description).replace("\n", "<br>")))
 
         table_html = build_generic_table(metric_data, parent_metric=metric)
         full_html = (
@@ -644,15 +640,11 @@ def make_summary_qc_report(report_strings_path: str, simple_metrics_path: str) -
             + table_html
             + "<br>"
         )
-        report.add_html(full_html, title=f"{metric} Table", section=f"text_{metric}")
+        report_blocks.append(full_html)
 
-    # Render to a temporary file and return as string
-    import tempfile, os
-    with tempfile.NamedTemporaryFile(suffix=".html", delete=False) as tmp:
-        tmp_name = tmp.name
-    report.save(tmp_name, overwrite=True, open_browser=False)
-    with open(tmp_name, "r", encoding="utf-8") as f:
-        html_out = f.read()
-    os.remove(tmp_name)
-
-    return html_out
+    # Return an embeddable HTML fragment.
+    return (
+        "<div class='qc-summary-fragment'>"
+        + "".join(report_blocks)
+        + "</div>"
+    )

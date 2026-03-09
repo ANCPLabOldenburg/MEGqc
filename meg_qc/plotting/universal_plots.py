@@ -375,33 +375,36 @@ def plot_stim_csv(f_path: str) -> List[QC_derivative]:
             unique_values = y_data[y_data > 0].unique()
             if 1 < len(unique_values) <= 30:
                 fig = go.Figure()
+                ordered_ids = sorted([int(v) for v in unique_values])
+                category_labels = [f'ID-{v}' for v in ordered_ids]
 
-                # Transform y values to 0 (no stimulus) and 1 (all other stimulus IDs)
-                transformed_y = y_data.apply(lambda y: 0 if y == 0 else 1)
-
-                # Plot the entire line first
-                fig.add_trace(go.Scatter(
-                    x=time, y=transformed_y, mode='lines', name=col,
-                    line=dict(color='grey'),  # Default color for the entire line
-                    hoverinfo='text',
-                    text=[f'Value-{y}, time-{t}s' for y, t in zip(y_data, time)]
-                ))
-
-                # Group repeated values and assign colors
-                group_ids = {value: idx for idx, value in enumerate(unique_values)}
-                for value, group_id in group_ids.items():
-                    indices = y_data == value
-                    fig.add_trace(go.Scatter(
-                        x=time[indices], y=transformed_y[indices], mode='markers', name=f'ID-{int(value)}',
-                        marker=dict(color=colors[group_id % len(colors)]),
-                        hoverinfo='text',
-                        text=[f'ID-{int(value)}, time-{t}s' for t in time[indices]]
-                    ))
+                # Plot each stimulus ID on its own categorical y row.
+                for idx, stim_id in enumerate(ordered_ids):
+                    indices = y_data == stim_id
+                    if not np.any(indices):
+                        continue
+                    fig.add_trace(
+                        go.Scatter(
+                            x=time[indices],
+                            y=[f'ID-{stim_id}'] * int(np.sum(indices)),
+                            mode='markers',
+                            name=f'ID-{stim_id}',
+                            marker=dict(color=colors[idx % len(colors)], size=6),
+                            hoverinfo='text',
+                            text=[f'ID-{stim_id}, time-{t}s' for t in time[indices]],
+                        )
+                    )
 
                 fig.update_layout(
                     title=col,
                     title_x=0.5,  # Center the title
                     xaxis_title='Time (s)',
+                    yaxis_title='Stimulus ID',
+                    yaxis=dict(
+                        type='category',
+                        categoryorder='array',
+                        categoryarray=category_labels[::-1],  # keep first ID on top
+                    ),
                     showlegend=True,
                     legend=dict(title='Stim IDs', x=1, y=1)
                 )
