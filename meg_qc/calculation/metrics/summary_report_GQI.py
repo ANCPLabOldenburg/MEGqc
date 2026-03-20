@@ -63,17 +63,23 @@ def _format_count_percent(count: Optional[float], percent: Optional[float]) -> s
 
 
 def _extract_task_label(path: str) -> str:
-    """Return the BIDS task label encoded in ``path`` if present.
+    """Return a BIDS task label, augmented with run when present.
 
     Filenames produced by the MEG QC pipeline follow the BIDS convention and
-    often include a ``task-<label>`` entity. This helper extracts that label so
-    group-level tables can display which task each row corresponds to. When no
-    task entity is found, an empty string is returned to avoid introducing a
-    placeholder that might be misinterpreted as a valid task name.
+    often include ``task-<label>`` and optional ``run-<idx>`` entities. This
+    helper keeps the label concise while still distinguishing repeated runs of
+    the same task.
     """
+    base = os.path.basename(path)
+    task_match = re.search(r"(?<=_task-)[^_]+", base)
+    if not task_match:
+        return ""
+    task = task_match.group(0)
 
-    match = re.search(r"(?<=_task-)[^_]+", os.path.basename(path))
-    return match.group(0) if match else ""
+    run_match = re.search(r"(?<=_run-)[^_]+", base)
+    if not run_match:
+        return task
+    return f"{task} (run-{run_match.group(0)})"
 
 
 def _get_sensor_param(section: dict, subsection: str, param: str, preferred: str = "mag", fallback: str = "grad"):

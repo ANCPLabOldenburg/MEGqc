@@ -7,7 +7,7 @@ name = "meg_qc"
 description = "Tool for automated MEG data quality control"
 readme = "README.md"
 requires-python = "==3.10.*"
-version = "0.7.1"
+version = "0.7.8"
 license = "MIT"
 authors = [
     {name = "Karel Lopez Vilaret", email = "karel.mauricio.lopez.vilaret@uni-oldenburg.de"},

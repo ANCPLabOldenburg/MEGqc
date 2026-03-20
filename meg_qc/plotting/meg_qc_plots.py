@@ -18,7 +18,7 @@ from pathlib import Path
 import time
 from typing import Tuple, Optional
 from contextlib import contextmanager
-import tempfile
+import shutil
 
 import plotly.graph_objects as go
 from plotly.utils import PlotlyJSONEncoder
@@ -91,36 +91,49 @@ def resolve_output_roots(
     dataset_derivatives_root = os.path.join(dataset_path, 'derivatives')
     output_derivatives_root = os.path.join(output_root, 'derivatives')
     os.makedirs(output_derivatives_root, exist_ok=True)
+
+    # When output is external, ensure output_root has a dataset_description.json
+    # so that ancpbids.load_dataset(output_root) works reliably in the plotting
+    # step (no symlink overlay required).
+    if external_derivatives_root is not None:
+        _ensure_output_root_bids_description(output_root, dataset_path)
+
     return output_root, dataset_derivatives_root, output_derivatives_root
 
 
-def build_overlay_dataset(dataset_path: str, derivatives_root: str):
-    """Create a temporary overlay so ANCPBIDS sees external derivatives.
+def _ensure_output_root_bids_description(output_root: str, original_dataset_path: str) -> None:
+    """Ensure output_root has a root-level dataset_description.json.
 
-    ANCPBIDS expects the derivatives folder to live under the dataset root. When
-    users direct outputs to an external path, we mirror the original dataset via
-    symlinks into a temporary directory and drop a ``derivatives`` link that
-    points to the external location. All symlinks stay outside the original
-    dataset, so read-only datasets remain untouched.
+    ancpbids.load_dataset() uses this file to resolve the BIDS schema version.
+    When an external output path is used, the directory is newly created and may
+    not have this file yet.  We copy it from the original dataset; if that is not
+    possible we write a minimal stub so load_dataset() always succeeds.
+
+    This is idempotent — if the file already exists it is left untouched.
     """
+    desc_path = os.path.join(output_root, "dataset_description.json")
+    if os.path.exists(desc_path):
+        return
 
-    overlay_tmp = tempfile.TemporaryDirectory(prefix='megqc_bids_overlay_')
-    overlay_root = overlay_tmp.name
+    # Prefer copying from the source dataset (preserves Name, BIDSVersion, …).
+    original_desc = os.path.join(original_dataset_path, "dataset_description.json")
+    if os.path.exists(original_desc):
+        try:
+            shutil.copy2(original_desc, desc_path)
+            return
+        except OSError:
+            pass  # Fall through to stub creation.
 
-    for entry in os.listdir(dataset_path):
-        if entry == 'derivatives':
-            # Never point back to the original derivatives tree; we want the
-            # external one to be used instead.
-            continue
+    # Write a minimal BIDS stub so ancpbids.load_dataset() can determine the schema.
+    ds_name = os.path.basename(os.path.normpath(output_root))
+    stub = {"Name": ds_name, "BIDSVersion": "1.8.0"}
+    try:
+        with open(desc_path, 'w', encoding='utf-8') as fh:
+            json.dump(stub, fh, indent=2)
+    except OSError:
+        pass  # Non-fatal; ancpbids falls back to earliest schema when file missing.
 
-        src = os.path.join(dataset_path, entry)
-        dst = os.path.join(overlay_root, entry)
 
-        if not os.path.exists(dst):
-            os.symlink(src, dst)
-
-    os.symlink(derivatives_root, os.path.join(overlay_root, 'derivatives'))
-    return overlay_tmp, overlay_root
 
 
 @contextmanager
@@ -483,9 +496,11 @@ def _build_run_tab_labels(raw_entity_names: Sequence[str]) -> Dict[str, str]:
     """Create concise, task-first labels for run tabs.
 
     Preference:
-    1. Task name only when unique.
-    2. Task name with run/session suffix when duplicated.
-    3. Fallback to original run identifier when task is missing.
+    1. Task name with run suffix when run is available.
+    2. Task name only when unique and no run is present.
+    3. Task name with disambiguating session/acq/rec suffix when duplicated
+       and run is missing.
+    4. Fallback to original run identifier when task is missing.
     """
     task_counts: Dict[str, int] = defaultdict(int)
     parsed: Dict[str, Dict[str, Optional[str]]] = {}
@@ -508,12 +523,15 @@ def _build_run_tab_labels(raw_entity_names: Sequence[str]) -> Dict[str, str]:
         if not task:
             out[key] = _human_run_label(key)
             continue
+        run_val = parsed[key]["run"]
         if task_counts[task] <= 1:
-            out[key] = task
+            out[key] = f"{task} (run-{run_val})" if run_val else task
             continue
 
         suffix_parts = []
-        for ent in ("run", "ses", "acq", "rec"):
+        if run_val:
+            suffix_parts.append(f"run-{run_val}")
+        for ent in ("ses", "acq", "rec"):
             val = parsed[key][ent]
             if val:
                 suffix_parts.append(f"{ent}-{val}")
@@ -2608,7 +2626,7 @@ def process_subject(
 
     for raw_entity_name in existing_raws_per_sub:
         derivs_for_this_raw = [
-            d for d in derivs_to_plot if d.raw_entity_name == raw_entity_name
+            d for d in derivs_to_plot if d.subject == sub and d.raw_entity_name == raw_entity_name
         ]
         if not derivs_for_this_raw:
             continue
@@ -2760,15 +2778,23 @@ def make_plots_meg_qc(
 
     query_dataset = dataset
     query_base = dataset_path
-    overlay_tmp = None
 
-    # If query derivatives are not the dataset-local derivatives, build a
-    # lightweight overlay so ANCPBIDS can resolve scope='derivatives/...'.
+    # When derivatives are at an external location, load ANCPBIDS directly from
+    # output_root rather than building a symlink overlay.  output_root already
+    # contains derivatives/Meg_QC/calculation/ (written by the calculation step),
+    # so a fresh load_dataset() scan will find all TSV/JSON files there natively.
+    #
+    # Advantages over the old symlink-overlay approach:
+    #   • No os.symlink() calls  →  no WinError 1314 on locked-down Windows
+    #   • No temp directory or cleanup required
+    #   • Simpler code path, same result
     if os.path.abspath(source_derivatives_root) != os.path.abspath(dataset_derivatives_root):
-        overlay_tmp, overlay_root = build_overlay_dataset(dataset_path, source_derivatives_root)
-        query_base = overlay_root
-        query_dataset = ancpbids.load_dataset(overlay_root, DatasetOptions(lazy_loading=True))
-        print(f"___MEGqc___: Using overlay dataset for queries at: {overlay_root}")
+        # dataset_description.json at output_root is guaranteed by resolve_output_roots
+        # (called earlier) but we double-check here in case plotting runs standalone.
+        _ensure_output_root_bids_description(output_root, dataset_path)
+        query_base = output_root
+        query_dataset = ancpbids.load_dataset(output_root, DatasetOptions(lazy_loading=True))
+        print(f"___MEGqc___: External output detected. Loading ANCPBIDS from output_root: {output_root}")
 
     calculated_derivs_folder = os.path.join(
         'derivatives', 'Meg_QC', *analysis_segments, 'calculation'
@@ -2874,11 +2900,9 @@ def make_plots_meg_qc(
             else:
                 query_args['desc'] = [metric]
 
-            # Optional session/run
-            if chosen_entities['session']:
-                query_args['session'] = chosen_entities['session']
-            if chosen_entities['run']:
-                query_args['run'] = chosen_entities['run']
+            # Do not constrain optional entities (session/run) globally in
+            # all-subject report generation. Applying a global run filter here
+            # can silently drop valid recordings that omit ``run-*`` in BIDS.
 
             with temporary_dataset_base(query_dataset, query_base):
                 tsv_paths = list(query_dataset.query(**query_args))
@@ -2933,10 +2957,9 @@ def make_plots_meg_qc(
         print("---------------------------------------------------------------")
         print("---------------------------------------------------------------")
         print(f"PLOTTING MODULE FINISHED. Elapsed time: {elapsed_seconds:.2f} seconds.")
-    finally:
-        # Ensure the temporary overlay is cleaned up.
-        if overlay_tmp is not None:
-            overlay_tmp.cleanup()
+    except Exception as e:
+        print(f"___MEGqc___: ERROR in plotting module: {e}")
+        raise
     return
 
 

@@ -208,7 +208,7 @@ def _resolve_input_paths(
         derivatives_root,
         megqc_root,
         _resolved_analysis_id,
-        _analysis_segments,
+        analysis_segments,
     ) = resolve_analysis_root(
         dataset_path=dataset_path,
         external_derivatives_root=derivatives_base,
@@ -217,11 +217,32 @@ def _resolve_input_paths(
         create_if_missing=True,
     )
 
+    # Reports always go to the resolved (external) path.
+    reports_dir = Path(megqc_root) / "reports"
+    reports_dir.mkdir(parents=True, exist_ok=True)
+
     summary_root = Path(megqc_root) / "summary_reports"
     group_metrics_dir = summary_root / "group_metrics"
     config_dir = summary_root / "config"
-    reports_dir = Path(megqc_root) / "reports"
-    reports_dir.mkdir(parents=True, exist_ok=True)
+
+    # Scenario C: if GQI data lives in the original BIDS dataset (calc ran without
+    # external path), fall back to reading from there while still writing to the
+    # external reports_dir.
+    if not group_metrics_dir.exists() and derivatives_base is not None:
+        original_megqc_root = os.path.join(
+            dataset_path, "derivatives", "Meg_QC", *analysis_segments
+        )
+        original_summary_root = Path(original_megqc_root) / "summary_reports"
+        original_group_metrics_dir = original_summary_root / "group_metrics"
+        if original_group_metrics_dir.exists():
+            megqc_root = original_megqc_root
+            summary_root = original_summary_root
+            group_metrics_dir = original_group_metrics_dir
+            config_dir = original_summary_root / "config"
+            print(
+                "___MEGqc___: QC group report: Scenario C — "
+                f"reading GQI from original dataset: {group_metrics_dir}"
+            )
 
     if input_tsv:
         tsv_path = Path(input_tsv)

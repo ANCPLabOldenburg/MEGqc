@@ -1243,13 +1243,17 @@ class MainWindow(QMainWindow):
         if dialog.exec() == QDialog.DialogCode.Accepted:
             self.apply_theme(dialog.theme_combo.currentText(), persist=True)
 
-    def _fetch_latest_pypi_version(self) -> str:
-        """Query PyPI for the latest published meg_qc version string.
+    # ------------------------------------------------------------------
+    # PyPI helpers
+    # ------------------------------------------------------------------
+
+    def _fetch_pypi_payload(self) -> dict:
+        """Fetch the raw PyPI JSON payload for meg_qc (shared SSL retry logic).
 
         SSL strategy:
-        1. Try certifi CA bundle when available.
-        2. Fall back to system default CA context.
-        3. Final fallback (read-only check): unverified SSL context.
+        1. certifi CA bundle when available.
+        2. System default CA context.
+        3. Unverified fallback (read-only check — does not install anything).
         """
         req = Request(
             "https://pypi.org/pypi/meg_qc/json",
@@ -1257,138 +1261,256 @@ class MainWindow(QMainWindow):
         )
         contexts = []
         try:
-            import certifi  # Optional dependency
+            import certifi
             contexts.append(ssl.create_default_context(cafile=certifi.where()))
         except Exception:
             pass
-
         contexts.append(ssl.create_default_context())
-        last_exc: Optional[Exception] = None
 
+        last_exc: Optional[Exception] = None
         for ctx in contexts:
             try:
                 with urlopen(req, timeout=8, context=ctx) as resp:
-                    payload = json.loads(resp.read().decode("utf-8"))
-                return str(payload.get("info", {}).get("version", "")).strip()
+                    return json.loads(resp.read().decode("utf-8"))
             except Exception as exc:
                 last_exc = exc
 
-        # Final fallback: for update *check* only, tolerate missing local CA.
         try:
             insecure_ctx = ssl._create_unverified_context()
             with urlopen(req, timeout=8, context=insecure_ctx) as resp:
                 payload = json.loads(resp.read().decode("utf-8"))
             self._log("Update check used unverified SSL fallback (certificate validation unavailable).")
-            return str(payload.get("info", {}).get("version", "")).strip()
+            return payload
         except Exception as exc:
-            if last_exc is not None:
-                raise last_exc
-            raise exc
+            raise (last_exc or exc)
+
+    def _fetch_latest_pypi_version(self, include_pre: bool = False) -> str:
+        """Return the latest meg_qc version string from PyPI.
+
+        When *include_pre* is False (default) this returns ``info.version``
+        which PyPI always sets to the latest *stable* release.  When True, the
+        full ``releases`` dict is scanned so pre-releases are considered too.
+        """
+        payload = self._fetch_pypi_payload()
+        if not include_pre:
+            return str(payload.get("info", {}).get("version", "")).strip()
+        try:
+            from packaging.version import Version
+            versions = [Version(v) for v in payload.get("releases", {}).keys()]
+            return str(max(versions)) if versions else str(payload.get("info", {}).get("version", "")).strip()
+        except Exception:
+            return str(payload.get("info", {}).get("version", "")).strip()
+
+    def _fetch_all_pypi_versions(self, include_pre: bool = True) -> List[str]:
+        """Return every published meg_qc version, sorted newest → oldest.
+
+        Parameters
+        ----------
+        include_pre:
+            When False, alpha/beta/rc releases are omitted.
+        """
+        payload = self._fetch_pypi_payload()
+        raw = list(payload.get("releases", {}).keys())
+        try:
+            from packaging.version import Version
+            parsed = []
+            for v in raw:
+                try:
+                    parsed.append(Version(v))
+                except Exception:
+                    pass
+            if not include_pre:
+                parsed = [v for v in parsed if not v.is_prerelease]
+            parsed.sort(reverse=True)
+            return [str(v) for v in parsed]
+        except Exception:
+            # packaging unavailable — crude filter + sort
+            if not include_pre:
+                raw = [v for v in raw if not any(t in v for t in ("a", "b", "rc", "dev", "post"))]
+            return sorted(raw, reverse=True)
 
     @staticmethod
     def _is_newer_version(latest: str, current: str) -> bool:
-        """Best-effort version comparison with graceful fallback."""
+        """Return True when *latest* is strictly newer than *current*."""
         try:
             from packaging.version import Version
             return Version(latest) > Version(current)
         except Exception:
-            # Fallback: if parsing support is unavailable, treat inequality as update hint.
             return bool(latest and latest != current)
 
-    def _run_megqc_self_update(self) -> Tuple[bool, str]:
-        """Run pip upgrade for meg_qc in the same Python environment."""
-        cmd = [sys.executable, "-m", "pip", "install", "--upgrade", "meg_qc"]
+    def _run_megqc_install(
+        self,
+        version: Optional[str] = None,
+        include_pre: bool = False,
+    ) -> Tuple[bool, str]:
+        """Run pip to install meg_qc.
+
+        Parameters
+        ----------
+        version:
+            Pin to this exact version (``pip install meg_qc==X.Y.Z``).
+            When *None*, upgrades to the latest release.
+        include_pre:
+            Append ``--pre`` when *version* is *None* (upgrade path only).
+        """
+        if version:
+            cmd = [sys.executable, "-m", "pip", "install", f"meg_qc=={version}"]
+        else:
+            cmd = [sys.executable, "-m", "pip", "install", "--upgrade", "meg_qc"]
+            if include_pre:
+                cmd.append("--pre")
         try:
-            proc = subprocess.run(
-                cmd,
-                capture_output=True,
-                text=True,
-                timeout=600,
-                check=False,
-            )
+            proc = subprocess.run(cmd, capture_output=True, text=True, timeout=600, check=False)
         except Exception as exc:
             return False, str(exc)
-
         if proc.returncode == 0:
             return True, (proc.stdout or "").strip()
-        stderr_text = (proc.stderr or "").strip()
-        stdout_text = (proc.stdout or "").strip()
-        return False, stderr_text or stdout_text or "Unknown pip error."
+        return False, (proc.stderr or proc.stdout or "Unknown pip error.").strip()
+
+    def _finish_install(self, ok: bool, out: str) -> None:
+        """Show success / failure dialog after any pip install."""
+        if ok:
+            QMessageBox.information(
+                self, "Update completed",
+                "MEGqc was updated successfully.\n"
+                "Please restart the GUI to load the new version.",
+            )
+            self._log("Self-update completed successfully.")
+        else:
+            QMessageBox.warning(self, "Update failed", f"pip update failed.\n\n{out}")
+            self._log(f"Self-update failed: {out}")
+
+    # ------------------------------------------------------------------
+    # Main update entry point
+    # ------------------------------------------------------------------
 
     def _check_for_updates(self) -> None:
-        """Check PyPI and optionally upgrade MEGqc from the GUI."""
+        """Check PyPI and optionally upgrade MEGqc from the GUI.
+
+        Three paths are offered via an initial choice dialog:
+        • Latest stable   — upgrade to the latest non-pre-release.
+        • Latest (β/rc)   — upgrade to the highest version including betas.
+        • Choose version… — pick any published version from a dropdown list.
+        """
         current = self.installed_megqc_version
-        self._log(f"Checking PyPI for updates (installed: {current})...")
-        try:
-            latest = self._fetch_latest_pypi_version()
-        except (URLError, HTTPError, TimeoutError, ValueError) as exc:
-            QMessageBox.warning(
-                self,
-                "Check updates",
-                f"Could not check PyPI for updates.\n\n{exc}",
-            )
-            self._log(f"Update check failed: {exc}")
+
+        # ── Initial choice dialog ──────────────────────────────────────
+        msg = QMessageBox(self)
+        msg.setWindowTitle("Check updates")
+        msg.setText(
+            f"Installed: MEGqc  {current}\n\n"
+            "How would you like to check for updates?"
+        )
+        btn_stable  = msg.addButton("Latest stable",        QMessageBox.ButtonRole.AcceptRole)
+        btn_pre     = msg.addButton("Latest (incl. beta)",  QMessageBox.ButtonRole.AcceptRole)
+        btn_pick    = msg.addButton("Choose version…",      QMessageBox.ButtonRole.ActionRole)
+        _btn_cancel = msg.addButton("Cancel",               QMessageBox.ButtonRole.RejectRole)
+        msg.setDefaultButton(btn_stable)
+        msg.exec()
+
+        clicked = msg.clickedButton()
+        if clicked is _btn_cancel or clicked is None:
             return
-        except Exception as exc:
-            QMessageBox.warning(
+
+        # ── "Choose version…" path ─────────────────────────────────────
+        if clicked is btn_pick:
+            self._log("Fetching all available versions from PyPI…")
+            try:
+                all_versions = self._fetch_all_pypi_versions(include_pre=True)
+            except Exception as exc:
+                QMessageBox.warning(self, "Check updates", f"Could not fetch version list.\n\n{exc}")
+                self._log(f"Version fetch failed: {exc}")
+                return
+
+            if not all_versions:
+                QMessageBox.warning(self, "Check updates", "No versions found on PyPI.")
+                return
+
+            # Mark the installed version so the user can spot it easily.
+            labelled = [
+                f"{v}  ← installed" if v == current else v
+                for v in all_versions
+            ]
+
+            picked_label, ok = QInputDialog.getItem(
                 self,
-                "Check updates",
-                f"Unexpected error while checking updates.\n\n{exc}",
+                "Choose MEGqc version",
+                f"Select a version to install  (installed: {current}):",
+                labelled,
+                0,      # default selection: newest
+                False,  # not editable
             )
+            if not ok or not picked_label:
+                return
+
+            # Strip annotation back to a plain version string.
+            picked_version = picked_label.split("  ←")[0].strip()
+
+            if picked_version == current:
+                QMessageBox.information(
+                    self, "No change",
+                    f"Version {picked_version} is already installed."
+                )
+                return
+
+            try:
+                from packaging.version import Version as _V
+                is_pre = _V(picked_version).is_prerelease
+            except Exception:
+                is_pre = any(t in picked_version for t in ("a", "b", "rc", "dev"))
+
+            pre_note = "\n⚠️  This is a pre-release (beta / rc) version." if is_pre else ""
+            answer = QMessageBox.question(
+                self, "Install version",
+                f"Install MEGqc  {picked_version}?{pre_note}\n\n"
+                f"Currently installed: {current}",
+            )
+            if answer != QMessageBox.StandardButton.Yes:
+                return
+
+            self._log(f"Running: pip install meg_qc=={picked_version}")
+            self._finish_install(*self._run_megqc_install(version=picked_version))
+            return
+
+        # ── "Latest stable" / "Latest incl. beta" path ────────────────
+        include_pre = (clicked is btn_pre)
+        self._log(f"Checking PyPI for updates (installed: {current}, include_pre={include_pre})…")
+
+        try:
+            latest = self._fetch_latest_pypi_version(include_pre=include_pre)
+        except Exception as exc:
+            QMessageBox.warning(self, "Check updates", f"Could not check PyPI for updates.\n\n{exc}")
             self._log(f"Update check failed: {exc}")
             return
 
         if not latest:
-            QMessageBox.warning(
-                self,
-                "Check updates",
-                "PyPI responded without a valid version string.",
-            )
+            QMessageBox.warning(self, "Check updates", "PyPI responded without a valid version string.")
             self._log("Update check failed: empty PyPI version response.")
             return
 
-        self._log(f"PyPI latest version: {latest}")
+        self._log(f"PyPI latest: {latest}  (pre-release channel: {include_pre})")
+
         if not self._is_newer_version(latest, current):
             QMessageBox.information(
-                self,
-                "Check updates",
+                self, "Check updates",
                 f"You are up to date.\nInstalled: {current}\nPyPI: {latest}",
             )
             return
 
+        pre_note = "\n⚠️  This is a pre-release (beta / rc) version." if include_pre else ""
         answer = QMessageBox.question(
-            self,
-            "Update available",
-            (
-                f"A newer MEGqc version is available.\n\n"
-                f"Installed: {current}\n"
-                f"PyPI: {latest}\n\n"
-                "Do you want to update now using pip?"
-            ),
+            self, "Update available",
+            f"A newer MEGqc version is available.{pre_note}\n\n"
+            f"Installed: {current}\n"
+            f"PyPI:      {latest}\n\n"
+            "Do you want to update now using pip?",
         )
         if answer != QMessageBox.StandardButton.Yes:
             self._log("Update skipped by user.")
             return
 
-        self._log("Running self-update: pip install --upgrade meg_qc")
-        ok, out = self._run_megqc_self_update()
-        if ok:
-            QMessageBox.information(
-                self,
-                "Update completed",
-                (
-                    "MEGqc was updated successfully.\n"
-                    "Please restart the GUI to load the new version."
-                ),
-            )
-            self._log("Self-update completed successfully.")
-        else:
-            QMessageBox.warning(
-                self,
-                "Update failed",
-                f"pip update failed.\n\n{out}",
-            )
-            self._log(f"Self-update failed: {out}")
+        self._log(f"Running: pip install --upgrade meg_qc{' --pre' if include_pre else ''}")
+        self._finish_install(*self._run_megqc_install(include_pre=include_pre))
 
     def _animate_spinner(self) -> None:
         if not self.task_started_at:

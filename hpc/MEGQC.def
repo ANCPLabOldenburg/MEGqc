@@ -1,0 +1,178 @@
+# MEGQC.def  —  Apptainer / Singularity definition file for MEGqc
+#
+# Original Singularity definition by:
+#   Alexandre Pastor-Bernier, alexandre.pastor@mcgill.ca
+#   Montreal Neurological Institute (MNI) / McGill University, March 2026
+#
+# Production version (Qt fix, OS libraries, smoke tests, runscript) by:
+#   ANCPLab Oldenburg — University of Oldenburg
+#   karel.mauricio.lopez.vilaret@uni-oldenburg.de
+#
+# This definition file is the official deployment artifact for MEGqc on CBRAIN
+# (https://cbrain.ca/) and any Linux HPC system (Slurm, PBS, SGE, bare-metal).
+#
+# Build:
+#   apptainer build MEGqc.sif MEGQC.def
+#
+# Quick run:
+#   apptainer run --containall \
+#     --bind /path/to/bids:/mnt_IN \
+#     --bind /path/to/config:/mnt_config \
+#     --bind /path/to/outputs:/mnt_OUT \
+#     MEGqc.sif \
+#     --inputdata /mnt_IN --config /mnt_config/settings.ini \
+#     --derivatives_output /mnt_OUT --analysis_mode new --run-all --all
+
+Bootstrap: docker
+From: continuumio/miniconda3
+
+%labels
+    Author      "ANCPLab Oldenburg – University of Oldenburg"
+    Tool        "MEGqc"
+    Version     "0.7.8"
+    Maintainer  "karel.mauricio.lopez.vilaret@uni-oldenburg.de"
+    Description "MEGqc containerized for HPC / CBRAIN via Apptainer/Singularity"
+    Reference   "https://github.com/ANCPLabOldenburg/MEGqc"
+
+%post
+    # ── 1. Update conda, pin Python to 3.10 (exact version meg_qc requires) ─
+    conda update -y conda
+    conda install -y python=3.10
+
+    # ── 2. OS runtime libraries needed by the MEG scientific stack ───────────
+    # Required even in headless/offscreen mode (matplotlib, MNE, Qt internals).
+    # Qt6/XCB libraries are also included so the MEGqc GUI can run on a desktop
+    # with a real display (DISPLAY=:0, QT_QPA_PLATFORM=xcb).
+    # Note: on CBRAIN / headless HPC nodes QT_QPA_PLATFORM=offscreen (see
+    # %environment) ensures these libraries are never invoked for rendering.
+    apt-get update && apt-get install -y --no-install-recommends \
+        libglib2.0-0 \
+        libgl1 \
+        libxext6 \
+        libsm6 \
+        libxrender1 \
+        libxkbcommon0 \
+        libxkbcommon-x11-0 \
+        libxcb-icccm4 \
+        libxcb-image0 \
+        libxcb-keysyms1 \
+        libxcb-randr0 \
+        libxcb-render-util0 \
+        libxcb-xinerama0 \
+        libxcb-xkb1 \
+        libxcb-cursor0 \
+        libxcb-shape0 \
+        libegl1 \
+        libdbus-1-3 \
+        libfontconfig1 \
+        libfreetype6 \
+        && rm -rf /var/lib/apt/lists/*
+
+    # ── 3. Install MEGqc from PyPI ───────────────────────────────────────────
+    pip install --upgrade pip
+    pip install "meg_qc==0.7.8"
+
+    # ── 4. Smoke-test all CLI entry points (build fails here if broken) ──────
+    run-megqc --help          > /dev/null
+    run-megqc-plotting --help > /dev/null
+    globalqualityindex --help > /dev/null
+    get-megqc-config --help   > /dev/null
+
+%environment
+    # Conda / Python on PATH
+    export PATH="/opt/conda/bin:$PATH"
+
+    # Locale — ensures consistent behaviour across all systems
+    # (fix initiated by Alexandre Pastor-Bernier, MNI/McGill)
+    export LC_ALL=C
+
+    # ── Headless rendering — no display server required ──────────────────────
+    # DEFAULT: offscreen — safe for every HPC / CBRAIN node with no display.
+    #
+    # To launch the GUI on a desktop with a real display, override at runtime:
+    #   apptainer exec --env QT_QPA_PLATFORM=xcb ... MEGqc.sif megqc
+    # See CLI_REFERENCE.md section 13 for the full GUI launch command.
+    #
+    # Note: QT_QPA_PLATFORM=xcb cannot be the baked-in default because CBRAIN
+    # and HPC nodes have no display — the container would crash on every
+    # headless run. The offscreen default stays; users override only for GUI.
+    export QT_QPA_PLATFORM=offscreen
+    export MPLBACKEND=Agg
+
+    # Python housekeeping
+    export PYTHONDONTWRITEBYTECODE=1
+    export PYTHONUNBUFFERED=1
+
+%runscript
+    # Default command: run-megqc
+    # All arguments passed to `apptainer run MEGqc.sif ...` are forwarded here.
+    exec run-megqc "$@"
+
+%help
+    MEGqc 0.7.8 — HPC / CBRAIN container (Apptainer / Singularity)
+    ================================================================
+    Developed in collaboration with the Montreal Neurological Institute (MNI) /
+    McGill University for deployment on CBRAIN (https://cbrain.ca/) and any
+    Linux HPC system.
+
+    Full analysis + all reports
+    ---------------------------
+    apptainer run \
+      --containall \
+      --bind /path/to/bids:/mnt_IN \
+      --bind /path/to/config:/mnt_config \
+      --bind /path/to/outputs:/mnt_OUT \
+      MEGqc.sif \
+      --inputdata /mnt_IN \
+      --config /mnt_config/settings.ini \
+      --derivatives_output /mnt_OUT \
+      --analysis_mode new --run-all --all
+
+    Single subject
+    --------------
+    apptainer run \
+      --containall \
+      --bind /path/to/bids:/mnt_IN \
+      --bind /path/to/config:/mnt_config \
+      --bind /path/to/outputs:/mnt_OUT \
+      MEGqc.sif \
+      --inputdata /mnt_IN \
+      --config /mnt_config/settings.ini \
+      --derivatives_output /mnt_OUT \
+      --subs 009 \
+      --analysis_mode new --run-all --qa-subject
+
+    Plotting only (after calculation)
+    ----------------------------------
+    apptainer exec \
+      --containall \
+      --bind /path/to/bids:/mnt_IN \
+      --bind /path/to/outputs:/mnt_OUT \
+      MEGqc.sif \
+      run-megqc-plotting \
+      --inputdata /mnt_IN \
+      --derivatives_output /mnt_OUT \
+      --analysis_mode latest --all
+
+    Get default config file
+    -----------------------
+    apptainer exec \
+      --containall \
+      --bind /path/to/config:/mnt_config \
+      MEGqc.sif \
+      get-megqc-config --target_directory /mnt_config
+
+    Launch GUI (desktop only — requires a display)
+    -----------------------------------------------
+    apptainer exec \
+      --env QT_QPA_PLATFORM=xcb \
+      --bind /tmp/.X11-unix:/tmp/.X11-unix \
+      --bind /etc/machine-id:/etc/machine-id:ro \
+      --bind /run/user/$(id -u):/run/user/$(id -u) \
+      --bind "${XAUTHORITY:-$HOME/.Xauthority}":/tmp/.Xauthority:ro \
+      --bind "$HOME":"$HOME" \
+      MEGqc.sif \
+      megqc
+
+    For full documentation see: https://github.com/ANCPLabOldenburg/MEGqc/tree/main/hpc
+

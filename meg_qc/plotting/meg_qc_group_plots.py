@@ -7893,7 +7893,7 @@ def make_group_plots_meg_qc(
         derivatives_root,
         megqc_root,
         _resolved_analysis_id,
-        _analysis_segments,
+        analysis_segments,
     ) = resolve_analysis_root(
         dataset_path=dataset_path,
         external_derivatives_root=derivatives_base,
@@ -7903,9 +7903,26 @@ def make_group_plots_meg_qc(
     )
     dataset_name = os.path.basename(os.path.normpath(dataset_path))
 
-    calculation_dir = Path(megqc_root) / "calculation"
+    # Reports always go to the resolved (external) path.
     reports_dir = Path(megqc_root) / "reports"
     reports_dir.mkdir(parents=True, exist_ok=True)
+
+    # Source: prefer the external path, but fall back to the original dataset
+    # when calculation was run without an external output path (Scenario C).
+    source_megqc_root = megqc_root
+    calculation_dir = Path(source_megqc_root) / "calculation"
+    if not calculation_dir.exists() and derivatives_base is not None:
+        original_megqc_root = os.path.join(
+            dataset_path, "derivatives", "Meg_QC", *analysis_segments
+        )
+        original_calc_dir = Path(original_megqc_root) / "calculation"
+        if original_calc_dir.exists():
+            source_megqc_root = original_megqc_root
+            calculation_dir = original_calc_dir
+            print(
+                f"___MEGqc___: Group QA: Scenario C — "
+                f"reading calculation from original dataset: {calculation_dir}"
+            )
 
     if not calculation_dir.exists():
         print(f"___MEGqc___: Group QA: calculation folder not found: {calculation_dir}")
@@ -7918,7 +7935,7 @@ def make_group_plots_meg_qc(
 
     acc_by_type = _build_accumulators_for_runs(run_records, n_jobs=n_jobs)
 
-    settings_snapshot = _load_settings_snapshot(megqc_root)
+    settings_snapshot = _load_settings_snapshot(source_megqc_root)
     combined_acc = _combine_accumulators(acc_by_type)
 
     tab_accumulators: Dict[str, ChTypeAccumulator] = {

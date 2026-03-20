@@ -95,20 +95,37 @@ def resolve_output_roots(dataset_path: str, external_derivatives_root: Optional[
     output_root = dataset_path if external_derivatives_root is None else os.path.join(external_derivatives_root, ds_name)
     derivatives_root = os.path.join(output_root, 'derivatives')
     os.makedirs(derivatives_root, exist_ok=True)
+
+    # When output is external, seed output_root with a dataset_description.json.
+    # The plotting module loads ANCPBIDS directly from output_root (no symlink
+    # overlay) so this file must be present for schema-version detection.
+    if external_derivatives_root is not None:
+        desc_dst = os.path.join(output_root, "dataset_description.json")
+        if not os.path.exists(desc_dst):
+            desc_src = os.path.join(dataset_path, "dataset_description.json")
+            if os.path.exists(desc_src):
+                try:
+                    import shutil as _shutil
+                    _shutil.copy2(desc_src, desc_dst)
+                except OSError:
+                    pass
+            if not os.path.exists(desc_dst):
+                import json as _json
+                stub = {"Name": os.path.basename(output_root), "BIDSVersion": "1.8.0"}
+                try:
+                    with open(desc_dst, 'w', encoding='utf-8') as _fh:
+                        _json.dump(stub, _fh, indent=2)
+                except OSError:
+                    pass  # Non-fatal; ancpbids falls back gracefully.
+
     return output_root, derivatives_root
 
 
-def list_analysis_profiles(
-    dataset_path: str,
-    external_derivatives_root: Optional[str] = None,
-) -> List[str]:
-    """List available MEGqc profile IDs for one dataset.
+def _scan_profile_dir(profiles_root: str) -> List[Tuple[str, float]]:
+    """Scan one profiles directory and return ``(name, mtime)`` pairs sorted by mtime desc.
 
-    Profiles are discovered under ``derivatives/Meg_QC/profiles/<analysis_id>``.
-    Returned IDs are sorted by latest modification time first.
+    Returns an empty list when the directory does not exist.
     """
-    _, derivatives_root = resolve_output_roots(dataset_path, external_derivatives_root)
-    profiles_root = os.path.join(derivatives_root, "Meg_QC", "profiles")
     if not os.path.isdir(profiles_root):
         return []
     candidates = []
@@ -121,6 +138,47 @@ def list_analysis_profiles(
                 mtime = 0.0
             candidates.append((entry, mtime))
     candidates.sort(key=lambda item: item[1], reverse=True)
+    return candidates
+
+
+def list_analysis_profiles(
+    dataset_path: str,
+    external_derivatives_root: Optional[str] = None,
+) -> List[str]:
+    """List available MEGqc profile IDs for one dataset.
+
+    Profiles are discovered under ``derivatives/Meg_QC/profiles/<analysis_id>``.
+    Returned IDs are sorted by latest modification time first.
+
+    When an external derivatives root is provided **both** the external output
+    location and the original dataset's derivatives folder are searched.
+    External profiles take precedence; original-dataset profiles are appended
+    for any IDs not already found in the external location.
+
+    This makes profile mode work correctly for Scenario C: the user ran
+    calculation without an external path (so profiles live inside the original
+    BIDS dataset) but now wants to direct plotting reports to an external
+    output path.  Without this dual search the GUI "Load profiles" dialog shows
+    nothing and ``resolve_analysis_root`` raises ``FileNotFoundError``.
+    """
+    _, derivatives_root = resolve_output_roots(dataset_path, external_derivatives_root)
+    primary_profiles_root = os.path.join(derivatives_root, "Meg_QC", "profiles")
+    candidates = _scan_profile_dir(primary_profiles_root)
+
+    # Also search the original dataset when an external path is set and the two
+    # locations differ (covers the case where calc ran without --derivatives_output).
+    if external_derivatives_root is not None:
+        original_profiles_root = os.path.join(
+            dataset_path, "derivatives", "Meg_QC", "profiles"
+        )
+        if os.path.abspath(original_profiles_root) != os.path.abspath(primary_profiles_root):
+            original_candidates = _scan_profile_dir(original_profiles_root)
+            existing_names = {name for name, _ in candidates}
+            for name, mtime in original_candidates:
+                if name not in existing_names:
+                    candidates.append((name, mtime))
+            candidates.sort(key=lambda item: item[1], reverse=True)
+
     return [name for name, _ in candidates]
 
 
@@ -248,6 +306,28 @@ def temporary_dataset_base(dataset, base_dir: str):
         yield
     finally:
         dataset.base_dir_ = original_base
+
+
+def _ensure_derivative_dataset_description_filename(derivative) -> None:
+    """Guarantee a writable dataset_description filename for ANCPBIDS writes.
+
+    Some datasets contain partially written legacy ``derivatives/Meg_QC`` trees.
+    In that state ANCPBIDS can materialize ``derivative.dataset_description``
+    with ``name=None``. During ``write_derivative`` this makes the writer target
+    the folder path (``.../derivatives/Meg_QC``) as if it were a file, which
+    triggers ``No file writer registered``.
+
+    We normalize this eagerly so repeated runs remain robust regardless of
+    pre-existing derivative state.
+    """
+
+    dataset_description = getattr(derivative, "dataset_description", None)
+    if dataset_description is None:
+        return
+
+    # Only patch missing/blank names; preserve explicit names if present.
+    if not getattr(dataset_description, "name", None):
+        dataset_description.name = "dataset_description.json"
 
 def ctf_workaround(dataset, sid):
     artifacts = dataset.query(suffix="meg", return_type="object", subj=sid, scope='raw')
@@ -823,6 +903,56 @@ def check_sub_list(sub_list: Union[List[str], str], dataset):
     return sub_list
 
 
+def _run_metric_safe(metric_name: str, func, *args, n_outputs: int, empty_outputs: list, **kwargs):
+    """Call *func* with *args*/*kwargs* and catch any exception.
+
+    Parameters
+    ----------
+    metric_name : str
+        Human-readable label used in log messages and error records.
+    func : callable
+        The metric function to call.
+    *args :
+        Positional arguments forwarded to *func*.
+    n_outputs : int
+        Expected number of return values from *func* (used for safety).
+    empty_outputs : list
+        Fallback values to return when *func* raises, one per return value.
+        Must have length == *n_outputs*.
+    **kwargs :
+        Keyword arguments forwarded to *func*.
+
+    Returns
+    -------
+    tuple
+        ``(*outputs, error_info)`` where *outputs* are the metric results
+        (or the empty fallbacks on failure) and *error_info* is ``None``
+        on success or a dict with keys ``error_type``, ``error_message``,
+        ``traceback``, and ``timestamp`` on failure.
+    """
+    import traceback as _traceback
+    try:
+        result = func(*args, **kwargs)
+        # Normalise single-value returns to a tuple so the caller can always unpack
+        if not isinstance(result, tuple):
+            result = (result,)
+        return (*result, None)
+    except Exception as exc:
+        tb_str = _traceback.format_exc()
+        error_info = {
+            "metric": metric_name,
+            "error_type": type(exc).__qualname__,
+            "error_message": str(exc),
+            "traceback": tb_str,
+            "timestamp": dt.datetime.utcnow().isoformat(timespec="seconds") + "Z",
+        }
+        print(
+            f"___MEGqc___: Metric '{metric_name}' FAILED — subject will continue "
+            f"without this metric.\n  {type(exc).__name__}: {exc}\n{tb_str}"
+        )
+        return (*empty_outputs, error_info)
+
+
 def process_one_subject(
         sub: str,
         dataset,
@@ -864,6 +994,7 @@ def process_one_subject(
 
     # CREATE DERIVATIVE FOR THIS SUBJECT
     derivative = dataset.create_derivative(name="Meg_QC")
+    _ensure_derivative_dataset_description_filename(derivative)
     derivative.dataset_description.GeneratedBy.Name = "MEG QC Pipeline"
 
     print('___MEGqc___: ', 'Take SUB: ', sub)
@@ -957,20 +1088,29 @@ def process_one_subject(
         simple_metrics_ecg, simple_metrics_eog = [], []
         simple_metrics_head, simple_metrics_muscle = [], []
 
+        # Collects per-metric error dicts for this file; injected into the
+        # report so users can see exactly which metric failed and why.
+        metric_errors = []
+
         # 1) STD
         if all_qc_params['default']['run_STD'] is True:
             print('___MEGqc___: ', 'Starting STD...')
             start_time = time.time()
-            (std_derivs,
-             simple_metrics_std,
-             std_str) = STD_meg_qc(
+            std_derivs, simple_metrics_std, std_str, _err = _run_metric_safe(
+                'STD',
+                STD_meg_qc,
                 all_qc_params['STD'],
                 channels,
                 chs_by_lobe,
                 dict_epochs_mg,
                 raw_cropped_filtered_resampled,
-                m_or_g_chosen
+                m_or_g_chosen,
+                n_outputs=3,
+                empty_outputs=[[], [], '⚠ STD metric failed — see excluded_subjects_errors.json for details.'],
             )
+            if _err:
+                metric_errors.append(_err)
+                std_str = f"⚠ STD metric failed: {_err['error_type']}: {_err['error_message']}"
             print('___MEGqc___: ',
                   "Finished STD. --- Execution %s seconds ---"
                   % (time.time() - start_time))
@@ -979,18 +1119,22 @@ def process_one_subject(
         if all_qc_params['default']['run_PSD'] is True:
             print('___MEGqc___: ', 'Starting PSD...')
             start_time = time.time()
-            (psd_derivs,
-             simple_metrics_psd,
-             psd_str,
-             noisy_freqs_global) = PSD_meg_qc(
+            psd_derivs, simple_metrics_psd, psd_str, noisy_freqs_global, _err = _run_metric_safe(
+                'PSD',
+                PSD_meg_qc,
                 all_qc_params['PSD'],
                 internal_qc_params['PSD'],
                 channels,
                 chs_by_lobe,
                 raw_cropped_filtered,
                 m_or_g_chosen,
-                helper_plots=False
+                n_outputs=4,
+                empty_outputs=[[], [], '⚠ PSD metric failed — see excluded_subjects_errors.json for details.', None],
+                helper_plots=False,
             )
+            if _err:
+                metric_errors.append(_err)
+                psd_str = f"⚠ PSD metric failed: {_err['error_type']}: {_err['error_message']}"
             print('___MEGqc___: ',
                   "Finished PSD. --- Execution %s seconds ---"
                   % (time.time() - start_time))
@@ -1008,16 +1152,21 @@ def process_one_subject(
                 func = PP_manual_meg_qc  # standard version
             # -------------------------------------------------------------
 
-            (pp_manual_derivs,
-             simple_metrics_pp_manual,
-             pp_manual_str) = func(
+            pp_manual_derivs, simple_metrics_pp_manual, pp_manual_str, _err = _run_metric_safe(
+                'PTP_manual',
+                func,
                 all_qc_params['PTP_manual'],
                 channels,
                 chs_by_lobe,
                 dict_epochs_mg,
                 raw_cropped_filtered_resampled,
-                m_or_g_chosen
+                m_or_g_chosen,
+                n_outputs=3,
+                empty_outputs=[[], [], '⚠ PTP manual metric failed — see excluded_subjects_errors.json for details.'],
             )
+            if _err:
+                metric_errors.append(_err)
+                pp_manual_str = f"⚠ PTP manual metric failed: {_err['error_type']}: {_err['error_message']}"
 
             print('___MEGqc___: ',
                   "Finished Peak‑to‑Peak manual. --- Execution %s seconds ---"
@@ -1027,14 +1176,19 @@ def process_one_subject(
         if all_qc_params['default']['run_PTP_auto_mne'] is True:
             print('___MEGqc___: ', 'Starting Peak-to-Peak auto...')
             start_time = time.time()
-            (pp_auto_derivs,
-             bad_channels,
-             pp_auto_str) = PP_auto_meg_qc(
+            pp_auto_derivs, bad_channels, pp_auto_str, _err = _run_metric_safe(
+                'PTP_auto',
+                PP_auto_meg_qc,
                 all_qc_params['PTP_auto'],
                 channels,
                 raw_cropped_filtered_resampled,
-                m_or_g_chosen
+                m_or_g_chosen,
+                n_outputs=3,
+                empty_outputs=[[], [], '⚠ PTP auto metric failed — see excluded_subjects_errors.json for details.'],
             )
+            if _err:
+                metric_errors.append(_err)
+                pp_auto_str = f"⚠ PTP auto metric failed: {_err['error_type']}: {_err['error_message']}"
             print('___MEGqc___: ',
                   "Finished Peak-to-Peak auto. --- Execution %s seconds ---"
                   % (time.time() - start_time))
@@ -1043,52 +1197,68 @@ def process_one_subject(
         if all_qc_params['default']['run_ECG'] is True:
             print('___MEGqc___: ', 'Starting ECG...')
             start_time = time.time()
-            (ecg_derivs,
-             simple_metrics_ecg,
-             ecg_str,
-             avg_objects_ecg) = ECG_meg_qc(
+            ecg_derivs, simple_metrics_ecg, ecg_str, avg_objects_ecg, _err = _run_metric_safe(
+                'ECG',
+                ECG_meg_qc,
                 all_qc_params['ECG'],
                 internal_qc_params['ECG'],
                 raw_cropped,
                 channels,
                 chs_by_lobe,
-                m_or_g_chosen
+                m_or_g_chosen,
+                n_outputs=4,
+                empty_outputs=[[], [], '⚠ ECG metric failed — see excluded_subjects_errors.json for details.', []],
             )
+            if _err:
+                metric_errors.append(_err)
+                ecg_str = f"⚠ ECG metric failed: {_err['error_type']}: {_err['error_message']}"
+            else:
+                avg_ecg += avg_objects_ecg
             print('___MEGqc___: ',
                   "Finished ECG. --- Execution %s seconds ---"
                   % (time.time() - start_time))
 
-            avg_ecg += avg_objects_ecg
 
         # 6) EOG
         if all_qc_params['default']['run_EOG'] is True:
             print('___MEGqc___: ', 'Starting EOG...')
             start_time = time.time()
-            (eog_derivs,
-             simple_metrics_eog,
-             eog_str,
-             avg_objects_eog) = EOG_meg_qc(
+            eog_derivs, simple_metrics_eog, eog_str, avg_objects_eog, _err = _run_metric_safe(
+                'EOG',
+                EOG_meg_qc,
                 all_qc_params['EOG'],
                 internal_qc_params['EOG'],
                 raw_cropped,
                 channels,
                 chs_by_lobe,
-                m_or_g_chosen
+                m_or_g_chosen,
+                n_outputs=4,
+                empty_outputs=[[], [], '⚠ EOG metric failed — see excluded_subjects_errors.json for details.', []],
             )
+            if _err:
+                metric_errors.append(_err)
+                eog_str = f"⚠ EOG metric failed: {_err['error_type']}: {_err['error_message']}"
+            else:
+                avg_eog += avg_objects_eog
             print('___MEGqc___: ',
                   "Finished EOG. --- Execution %s seconds ---"
                   % (time.time() - start_time))
 
-            avg_eog += avg_objects_eog
 
         # 7) Head movement artifacts
         if all_qc_params['default']['run_Head'] is True:
             print('___MEGqc___: ', 'Starting Head movement calculation...')
-            (head_derivs,
-             simple_metrics_head,
-             head_str,
-             df_head_pos,
-             head_pos) = HEAD_movement_meg_qc(raw_cropped)
+            start_time = time.time()
+            head_derivs, simple_metrics_head, head_str, df_head_pos, head_pos, _err = _run_metric_safe(
+                'Head',
+                HEAD_movement_meg_qc,
+                raw_cropped,
+                n_outputs=5,
+                empty_outputs=[[], [], '⚠ Head metric failed — see excluded_subjects_errors.json for details.', None, None],
+            )
+            if _err:
+                metric_errors.append(_err)
+                head_str = f"⚠ Head metric failed: {_err['error_type']}: {_err['error_message']}"
             print('___MEGqc___: ',
                   "Finished Head movement calculation. --- Execution %s seconds ---"
                   % (time.time() - start_time))
@@ -1097,10 +1267,9 @@ def process_one_subject(
         if all_qc_params['default']['run_Muscle'] is True:
             print('___MEGqc___: ', 'Starting Muscle artifacts calculation...')
             start_time = time.time()
-            (muscle_derivs,
-             simple_metrics_muscle,
-             muscle_str,
-             scores_muscle_all3) = MUSCLE_meg_qc(
+            muscle_derivs, simple_metrics_muscle, muscle_str, scores_muscle_all3, _err = _run_metric_safe(
+                'Muscle',
+                MUSCLE_meg_qc,
                 all_qc_params['Muscle'],
                 all_qc_params['PSD'],
                 internal_qc_params['PSD'],
@@ -1109,18 +1278,24 @@ def process_one_subject(
                 noisy_freqs_global,
                 m_or_g_chosen,
                 derivatives_root,
+                n_outputs=4,
+                empty_outputs=[[], [], '⚠ Muscle metric failed — see excluded_subjects_errors.json for details.', None],
                 attach_dummy=True,
-                cut_dummy=True
+                cut_dummy=True,
             )
-            # Store the total number of events analyzed so we can later express
-            # the number of detected artifacts as a percentage.  The first
-            # derivative contains a TSV table where each row corresponds to one
-            # event that was evaluated during muscle detection.
-            if muscle_derivs:
-                total_events_for_muscle = muscle_derivs[0].content.shape[0]
-                simple_metrics_muscle["total_number_of_events"] = int(
-                    total_events_for_muscle
-                )
+            if _err:
+                metric_errors.append(_err)
+                muscle_str = f"⚠ Muscle metric failed: {_err['error_type']}: {_err['error_message']}"
+            else:
+                # Store the total number of events analyzed so we can later express
+                # the number of detected artifacts as a percentage.  The first
+                # derivative contains a TSV table where each row corresponds to one
+                # event that was evaluated during muscle detection.
+                if muscle_derivs:
+                    total_events_for_muscle = muscle_derivs[0].content.shape[0]
+                    simple_metrics_muscle["total_number_of_events"] = int(
+                        total_events_for_muscle
+                    )
             print('___MEGqc___: ',
                   "Finished Muscle artifacts calculation. --- Execution %s seconds ---"
                   % (time.time() - start_time))
@@ -1139,6 +1314,17 @@ def process_one_subject(
             'MUSCLE': muscle_str,
             'STIMULUS': 'If the data was cropped for this calculation, the stimulus data is also cropped.'
         }
+
+        # Embed per-metric error summaries into the report strings so that
+        # the HTML report clearly communicates which metrics failed and why,
+        # even when the subject overall succeeded (partial failure scenario).
+        if metric_errors:
+            failed_names = ', '.join(e['metric'] for e in metric_errors)
+            report_strings['METRIC_ERRORS'] = (
+                f"⚠ {len(metric_errors)} metric(s) failed for this recording "
+                f"({failed_names}). The subject report is partial. "
+                f"Full tracebacks are in excluded_subjects_errors.json."
+            )
 
         report_str_derivs = [QC_derivative(report_strings, 'ReportStrings', 'json')]
 
@@ -1230,8 +1416,6 @@ def process_one_subject(
     with temporary_dataset_base(dataset, output_root):
         ancpbids.write_derivative(dataset, derivative)
 
-
-
     # Removes intermediate trash objects
     del meg_artifact, derivative
     gc.collect()
@@ -1240,12 +1424,13 @@ def process_one_subject(
     try:
         if raw is None:
             print('___MEGqc___: ', 'No data files could be processed for subject:', sub)
-            return
-    except:
+            return None, metric_errors
+    except Exception:
         print('___MEGqc___: ', 'No data files could be processed for subject:', sub)
 
-    # You can return whatever you want from here
-    return all_taken_raw_files
+    # Return raw file list plus any per-metric errors collected during processing.
+    # metric_errors is [] when all metrics succeeded.
+    return all_taken_raw_files, metric_errors
 
 
 def process_one_subject_safe(
@@ -1260,9 +1445,25 @@ def process_one_subject_safe(
     """Wrapper around :func:`process_one_subject` that catches errors.
 
     Parameters are identical to :func:`process_one_subject`.
-    The function returns a tuple ``(sub, result)`` where ``result`` is
-    ``None`` if the processing failed for this subject.
+
+    Returns
+    -------
+    tuple
+        ``(sub, files, error_info)`` where:
+
+        * ``files`` is the list of processed raw filenames on success, or
+          ``None`` when the subject failed entirely (initial processing or
+          an unexpected error).
+        * ``error_info`` is ``None`` when the subject completed without any
+          issue.  When the subject **failed entirely**, it is a dict with
+          keys ``error_type``, ``error_message``, ``traceback``, and
+          ``timestamp``.  When the subject **completed partially** (one or
+          more metrics failed but overall processing continued), it is a dict
+          with key ``metric_errors`` containing the list of per-metric error
+          dicts — each with keys ``metric``, ``error_type``,
+          ``error_message``, ``traceback``, and ``timestamp``.
     """
+    import traceback as _traceback
     try:
         result = process_one_subject(
             sub=sub,
@@ -1274,10 +1475,40 @@ def process_one_subject_safe(
             output_root=output_root,
             analysis_segments=analysis_segments,
         )
-        return sub, result
+        # process_one_subject now returns (files, metric_errors)
+        if result is None:
+            files, metric_errors = None, []
+        else:
+            files, metric_errors = result
+
+        if metric_errors:
+            # Subject succeeded overall but some metrics failed — report as
+            # partial failure so the caller can write it to the error log.
+            failed_names = ', '.join(e['metric'] for e in metric_errors)
+            print(
+                f"___MEGqc___: Subject {sub} completed with "
+                f"{len(metric_errors)} metric failure(s): {failed_names}"
+            )
+            error_info = {"metric_errors": metric_errors}
+        else:
+            error_info = None
+
+        return sub, files, error_info
+
     except Exception as e:  # Catch any error so the parallel job continues
-        print(f"___MEGqc___: Error processing subject {sub}: {e}")
-        return sub, None
+        tb_str = _traceback.format_exc()
+        error_info = {
+            "error_type": type(e).__qualname__,
+            "error_message": str(e),
+            "traceback": tb_str,
+            "timestamp": dt.datetime.utcnow().isoformat(timespec="seconds") + "Z",
+        }
+        print(
+            f"___MEGqc___: Error processing subject {sub}:\n"
+            f"  {type(e).__name__}: {e}\n"
+            f"{tb_str}"
+        )
+        return sub, None, error_info
 
 
 def _parse_count_percent(val: str):
@@ -1511,15 +1742,31 @@ def make_derivative_meg_qc(
         #         global_avg_eog += eog_data
 
             # Collect results and log subjects that failed
-            excluded_subjects = [sub for sub, files in results if files is None]
+            # results is a list of (sub, files, error_info) 3-tuples.
+            # files is None for total failures; error_info carries either a
+            # whole-subject error dict or {"metric_errors": [...]} for partial
+            # failures where the subject completed but some metrics did not.
+            excluded_subjects = [sub for sub, files, _err in results if files is None]
+            failed_subjects_errors = {
+                sub: err
+                for sub, files, err in results
+                if files is None and err is not None
+            }
+            # Partial failures: subject succeeded overall but ≥1 metric failed
+            partial_subjects_errors = {
+                sub: err
+                for sub, files, err in results
+                if files is not None and err is not None and "metric_errors" in err
+            }
 
             # Save config file used for this run as a derivative:
             all_subs_raw_files = []
-            for sub, subj_files in results:
-                if subj_files is not None:
-                    all_subs_raw_files.extend(subj_files)
+            for sub, files, _err in results:
+                if files is not None:
+                    all_subs_raw_files.extend(files)
 
             derivative = dataset.create_derivative(name="Meg_QC")
+            _ensure_derivative_dataset_description_filename(derivative)
             derivative.dataset_description.GeneratedBy.Name = "MEG QC Pipeline"
             root_folder = derivative
             for seg in analysis_segments:
@@ -1546,9 +1793,59 @@ def make_derivative_meg_qc(
             if excluded_subjects:
                 excl_path = os.path.join(megqc_root, 'excluded_subjects')
                 os.makedirs(os.path.dirname(excl_path), exist_ok=True)
+                # Plain text list – kept for backward compatibility
                 with open(excl_path, 'w', encoding='utf-8') as f:
                     for sub in excluded_subjects:
                         f.write(str(sub) + '\n')
+
+            # Write structured JSON error log for ALL failure types:
+            #   • Total failures  → subject completely excluded
+            #   • Partial failures → subject processed but ≥1 metric skipped
+            has_any_errors = excluded_subjects or partial_subjects_errors
+            if has_any_errors:
+                excl_json_path = os.path.join(megqc_root, 'excluded_subjects_errors.json')
+                error_log = []
+
+                # --- Total failures ---
+                for sub in excluded_subjects:
+                    entry = {"subject": sub, "failure_type": "total"}
+                    err = failed_subjects_errors.get(sub)
+                    if err:
+                        entry.update(err)
+                    else:
+                        entry["error_type"] = "NoDataError"
+                        entry["error_message"] = (
+                            "Subject returned no results. Possible causes: "
+                            "no raw files found, or all files were skipped."
+                        )
+                        entry["traceback"] = None
+                        entry["timestamp"] = dt.datetime.utcnow().isoformat(timespec="seconds") + "Z"
+                    error_log.append(entry)
+
+                # --- Partial failures (metric-level) ---
+                for sub, err in partial_subjects_errors.items():
+                    entry = {
+                        "subject": sub,
+                        "failure_type": "partial",
+                        "metric_errors": err.get("metric_errors", []),
+                    }
+                    error_log.append(entry)
+
+                with open(excl_json_path, 'w', encoding='utf-8') as f:
+                    json.dump(error_log, f, indent=4)
+
+                summary_parts = []
+                if excluded_subjects:
+                    summary_parts.append(f"{len(excluded_subjects)} total failure(s): {excluded_subjects}")
+                if partial_subjects_errors:
+                    summary_parts.append(
+                        f"{len(partial_subjects_errors)} partial failure(s): {list(partial_subjects_errors.keys())}"
+                    )
+                print(
+                    f"___MEGqc___: Subject errors detected — "
+                    + " | ".join(summary_parts)
+                    + f"\n  Detailed errors → {excl_json_path}"
+                )
 
             # Generate Global Quality Index reports and group table
             try:

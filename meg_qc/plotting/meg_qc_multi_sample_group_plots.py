@@ -107,7 +107,7 @@ def _collect_sample_bundle(
         derivatives_root,
         megqc_root,
         _resolved_analysis_id,
-        _analysis_segments,
+        analysis_segments,
     ) = resolve_analysis_root(
         dataset_path=dataset_path,
         external_derivatives_root=derivatives_base,
@@ -117,8 +117,24 @@ def _collect_sample_bundle(
     )
     sample_id = _safe_sample_id(dataset_path)
 
-    calculation_dir = Path(megqc_root) / "calculation"
+    # Reports always go to the resolved (external) path.
     reports_dir = Path(megqc_root) / "reports"
+
+    # Source: prefer external path, fall back to original dataset (Scenario C).
+    source_megqc_root = megqc_root
+    calculation_dir = Path(source_megqc_root) / "calculation"
+    if not calculation_dir.exists() and derivatives_base is not None:
+        original_megqc_root = os.path.join(
+            dataset_path, "derivatives", "Meg_QC", *analysis_segments
+        )
+        original_calc_dir = Path(original_megqc_root) / "calculation"
+        if original_calc_dir.exists():
+            source_megqc_root = original_megqc_root
+            calculation_dir = original_calc_dir
+            print(
+                f"___MEGqc___: Multi-sample QA: Scenario C — "
+                f"reading calculation from original dataset: {calculation_dir}"
+            )
 
     if not calculation_dir.exists():
         print(f"___MEGqc___: Multi-sample QA: skipping {sample_id}, calculation folder missing: {calculation_dir}")
@@ -146,7 +162,7 @@ def _collect_sample_bundle(
         dataset_path=dataset_path,
         derivatives_root=derivatives_root,
         reports_dir=reports_dir,
-        settings_snapshot=_load_settings_snapshot(megqc_root),
+        settings_snapshot=_load_settings_snapshot(source_megqc_root),
         tab_accumulators=tab_accumulators,
     )
 

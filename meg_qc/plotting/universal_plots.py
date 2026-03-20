@@ -1416,7 +1416,7 @@ def plot_topomap_std_ptp_csv(std_csv_path: str, ch_type: str, what_data: str):
     ax.set_title(f'{y_ax_and_fig_title} topomap for {ch_tit}')
 
     qc_derivative = [QC_derivative(content=fig, name=fig_name, content_type='matplotlib')]
-                 
+
     return qc_derivative
 
 

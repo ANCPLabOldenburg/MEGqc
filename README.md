@@ -82,6 +82,41 @@ megqc
 
 The GUI uses the same backend logic as CLI dispatchers and writes the same derivative/report outputs.
 
+## HPC and CBRAIN Deployment (Apptainer)
+
+MEGqc can be containerized with [Apptainer](https://apptainer.org/) and deployed
+on any Linux HPC system, including **[CBRAIN](https://cbrain.ca/)** — the distributed
+computing platform at the Montreal Neurological Institute (MNI) / McGill University,
+which MEGqc is being integrated into as part of an active collaboration.
+
+The [`hpc/`](hpc/) folder contains the complete deployment materials:
+
+| File | Description |
+|------|-------------|
+| [`hpc/MEGQC.def`](hpc/MEGQC.def) | Apptainer definition file (source of truth for building the image) |
+| [`hpc/BUILD_APPTAINER_IMAGE.md`](hpc/BUILD_APPTAINER_IMAGE.md) | Build guide: prerequisites, image creation, GUI launch, distribution |
+| [`hpc/CLI_REFERENCE.md`](hpc/CLI_REFERENCE.md) | Full CLI reference + CBRAIN/Slurm job script template |
+
+**Quick start:**
+
+```bash
+# Build the image
+apptainer build MEGqc.sif hpc/MEGQC.def
+
+# Run full analysis on a BIDS dataset
+apptainer run --containall \
+  --bind /path/to/bids_dataset:/mnt_IN \
+  --bind "$PWD/settings.ini":/mnt_config/settings.ini \
+  --bind "$PWD/outputs":/mnt_OUT \
+  MEGqc.sif \
+  --inputdata /mnt_IN --config /mnt_config/settings.ini \
+  --derivatives_output /mnt_OUT --analysis_mode new --run-all --all
+```
+
+See [`hpc/README.md`](hpc/README.md) for the full overview and attribution.
+
+---
+
 ## Typical Outputs
 
 MEGqc writes outputs under BIDS derivatives (default):
