@@ -192,8 +192,8 @@ def make_simple_metric_ptp_manual(
     else:
         metric_local_description = 'Not calculated. No epochs found'
 
-    metric_global_content = {'mag': None, 'grad': None}
-    metric_local_content  = {'mag': None, 'grad': None}
+    metric_global_content = {'mag': None, 'grad': None, 'eeg': None}
+    metric_local_content  = {'mag': None, 'grad': None, 'eeg': None}
 
     for m_or_g in m_or_g_chosen:
         metric_global_content[m_or_g] = make_dict_global_std_ptp(
@@ -221,7 +221,9 @@ def make_simple_metric_ptp_manual(
         metric_local_name,
         metric_local_description,
         metric_local_content['mag'],
-        metric_local_content['grad']
+        metric_local_content['grad'],
+        metric_global_content_eeg=metric_global_content.get('eeg'),
+        metric_local_content_eeg=metric_local_content.get('eeg'),
     )
     return simple_metric
 
@@ -238,7 +240,7 @@ def PP_manual_meg_qc_numba(
     Main PtP QC function: global and per-epoch peak-to-peak amplitudes.
     """
     # Load data
-    data, shielding_str, meg_system = load_data(data_path)
+    data, shielding_str, meg_system, _modality = load_data(data_path)
     sfreq = data.info['sfreq']
 
     big_ptp_with_value_all_data = {}
@@ -272,7 +274,7 @@ def PP_manual_meg_qc_numba(
 
     # Local PtP per epoch, if available
     metric_local = False
-    if dict_epochs_mg.get('mag') is not None or dict_epochs_mg.get('grad') is not None:
+    if dict_epochs_mg.get('mag') is not None or dict_epochs_mg.get('grad') is not None or dict_epochs_mg.get('eeg') is not None:
         metric_local = True
         for m_or_g in m_or_g_chosen:
             df_ptp = get_ptp_epochs(

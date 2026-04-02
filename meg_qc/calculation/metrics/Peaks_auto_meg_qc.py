@@ -77,8 +77,10 @@ def PP_auto_meg_qc(ptp_auto_params: dict, channels:list, data: mne.io.Raw, m_or_
         
     """
 
-    peaks = {'grad': ptp_auto_params['peak_g'], 'mag': ptp_auto_params['peak_m']}
-    flats = {'grad': ptp_auto_params['flat_g'], 'mag': ptp_auto_params['flat_m']}
+    peaks = {'grad': ptp_auto_params['peak_g'], 'mag': ptp_auto_params['peak_m'],
+             'eeg': ptp_auto_params.get('peak_eeg', 200e-6)}
+    flats = {'grad': ptp_auto_params['flat_g'], 'mag': ptp_auto_params['flat_m'],
+             'eeg': ptp_auto_params.get('flat_eeg', 1e-6)}
     bad_channels = {}
 
     deriv_ptp_auto= []

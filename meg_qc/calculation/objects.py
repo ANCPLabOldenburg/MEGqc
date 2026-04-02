@@ -6,11 +6,11 @@ import numpy as np
 import pandas as pd
 from typing import List, Union
 
-class MEG_channel:
+class QC_channel:
 
     """ 
-    Channel with calculated data, used also for plotting. 
-
+    Channel with calculated data, used also for plotting.
+    Supports MEG channels (mag, grad) and EEG channels.
     """
 
     def __init__(self, name: str, type: str, lobe: str = None, lobe_color: str = None, system: str = None, loc: List = None, time_series: Union[List, np.ndarray] = None, std_overall: float = None, std_epoch: Union[List, np.ndarray] = None, ptp_overall: float = None, ptp_epoch: Union[List, np.ndarray] = None, psd: Union[List, np.ndarray] = None, freq: Union[List, np.ndarray] = None, mean_ecg: Union[List, np.ndarray] = None, mean_ecg_smoothed: Union[List, np.ndarray] = None, mean_eog: Union[List, np.ndarray] = None, mean_eog_smoothed: Union[List, np.ndarray] = None, ecg_time = None, eog_time = None, ecg_corr_coeff = None, ecg_pval = None, ecg_amplitude_ratio = None, ecg_similarity_score = None, eog_corr_coeff = None, eog_pval = None, eog_amplitude_ratio = None, eog_similarity_score = None, muscle = None, head = None, muscle_time = None, head_time = None):
@@ -23,7 +23,7 @@ class MEG_channel:
         name : str
             The name of the channel.
         type : str
-            The type of the channel: 'mag', 'grad'
+            The type of the channel: 'mag', 'grad', or 'eeg'
         lobe : str
             The lobe area of the channel: 'left frontal', 'right frontal', 'left temporal', 'right temporal', 'left parietal', 'right parietal', 'left occipital', 'right occipital', 'central', 'subcortical', 'unknown'.
         lobe_color : str
@@ -235,6 +235,10 @@ class MEG_channel:
                 #Attention: here time_vector, corr_coeff, p_val and everything get assigned to ecg or eog, 
                 # but artif_ch doesnt have this separation to ecg/eog. 
                 # Need to just make sure that the function is called in the right place.
+
+
+# Backward-compatibility alias — existing code that imports MEG_channel keeps working.
+MEG_channel = QC_channel
 
 
 class QC_derivative:

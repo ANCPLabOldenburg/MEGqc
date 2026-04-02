@@ -326,7 +326,7 @@ def make_joined_report_mne(raw_info_path: str, sections:dict, report_strings: di
     return report
 
 
-def simple_metric_basic(metric_global_name: str, metric_global_description: str, metric_global_content_mag: dict, metric_global_content_grad: dict, metric_local_name: str =None, metric_local_description: str =None, metric_local_content_mag: dict =None, metric_local_content_grad: dict =None, display_only_global: bool =False, psd: bool=False, measurement_units: bool = True):
+def simple_metric_basic(metric_global_name: str, metric_global_description: str, metric_global_content_mag: dict, metric_global_content_grad: dict, metric_local_name: str =None, metric_local_description: str =None, metric_local_content_mag: dict =None, metric_local_content_grad: dict =None, display_only_global: bool =False, psd: bool=False, measurement_units: bool = True, metric_global_content_eeg: dict = None, metric_local_content_eeg: dict = None):
     
     """
     Basic structure of simple metric for all measurements.
@@ -362,6 +362,10 @@ def simple_metric_basic(metric_global_name: str, metric_global_description: str,
         If True, the metric is done for PSD and the units are changed accordingly, by default False
     measurement_units : bool, optional
         If True, the measurement units are added to the metric, by default True
+    metric_global_content_eeg : dict, optional
+        Content of the global metric for EEG channels.
+    metric_local_content_eeg : dict, optional
+        Content of the local metric for EEG channels.
 
     Returns
     -------
@@ -372,12 +376,14 @@ def simple_metric_basic(metric_global_name: str, metric_global_description: str,
     
     _, unit_mag = get_tit_and_unit('mag', psd=psd)
     _, unit_grad = get_tit_and_unit('grad', psd=psd)
+    _, unit_eeg = get_tit_and_unit('eeg', psd=psd)
 
     if display_only_global is False:
        m_local = {metric_local_name: {
             "description": metric_local_description,
             "mag": metric_local_content_mag,
-            "grad": metric_local_content_grad}}
+            "grad": metric_local_content_grad,
+            "eeg": metric_local_content_eeg}}
     else:
         m_local = {}
 
@@ -387,17 +393,20 @@ def simple_metric_basic(metric_global_name: str, metric_global_description: str,
         simple_metric={
             'measurement_unit_mag': unit_mag,
             'measurement_unit_grad': unit_grad,
+            'measurement_unit_eeg': unit_eeg,
             metric_global_name: {
                 'description': metric_global_description,
                 "mag": metric_global_content_mag,
-                "grad": metric_global_content_grad}
+                "grad": metric_global_content_grad,
+                "eeg": metric_global_content_eeg}
             }
     else:
         simple_metric={
             metric_global_name: {
                 'description': metric_global_description,
                 "mag": metric_global_content_mag,
-                "grad": metric_global_content_grad}
+                "grad": metric_global_content_grad,
+                "eeg": metric_global_content_eeg}
             }
 
     #merge local and global metrics:
@@ -476,7 +485,13 @@ def make_summary_qc_report(report_strings_path: str, simple_metrics_path: str) -
         return str(text).replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
 
     def build_text_block(title, body):
-        if '<p>' in body or '<br>' in body:
+        import re as _re
+        # Detect if body already contains HTML tags — if so, render as-is
+        _html_tag_pattern = _re.compile(
+            r'<(p|br|table|th|td|tr|ul|ol|li|h[1-6]|code|strong|em|div|span|b|i)\b',
+            _re.IGNORECASE,
+        )
+        if _html_tag_pattern.search(body):
             body_html = (
                 f'<div style="text-align:center; font-family:sans-serif; font-size:16px;">{body}</div>'
             )
@@ -608,7 +623,12 @@ def make_summary_qc_report(report_strings_path: str, simple_metrics_path: str) -
     )
     for metric, content in reportstrings.items():
         if content and str(content).strip():
-            report_blocks.append(build_text_block(metric, str(content).replace("\n", "<br>")))
+            content_str = str(content)
+            # Only convert newlines to <br> if content is NOT already HTML
+            import re as _re
+            if not _re.search(r'<(p|br|table|th|td|tr|div|code)\b', content_str, _re.IGNORECASE):
+                content_str = content_str.replace("\n", "<br>")
+            report_blocks.append(build_text_block(metric, content_str))
 
     # Add tables for simple metrics (including PSD/ECG/EOG even when no
     # "description" field is present).
@@ -632,7 +652,10 @@ def make_summary_qc_report(report_strings_path: str, simple_metrics_path: str) -
 
         description = metric_data.get("description")
         if description and str(description).strip():
-            report_blocks.append(build_text_block(metric, str(description).replace("\n", "<br>")))
+            desc_str = str(description)
+            if not _re.search(r'<(p|br|table|th|td|tr|div|code)\b', desc_str, _re.IGNORECASE):
+                desc_str = desc_str.replace("\n", "<br>")
+            report_blocks.append(build_text_block(metric, desc_str))
 
         table_html = build_generic_table(metric_data, parent_metric=metric)
         full_html = (

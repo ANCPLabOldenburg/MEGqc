@@ -93,7 +93,7 @@ def annotate_muscle_zscore(
     .. footbibliography::
     """
     # Load raw muscle stage signal
-    raw_copy, shielding_str, meg_system = load_data(raw_muscle_path)
+    raw_copy, shielding_str, meg_system, _modality = load_data(raw_muscle_path)
     raw_copy.load_data()
 
     if ch_type is None:
@@ -114,8 +114,9 @@ def annotate_muscle_zscore(
     if ch_type in ("mag", "grad"):
         raw_copy.pick(ch_type)
     else:
-        ch_type = {"meg": False, ch_type: True}
-        raw_copy.pick(**ch_type)
+        # For EEG and other non-MEG types, pick directly by type string.
+        # Modern MNE's pick() does not accept 'meg' as a keyword argument.
+        raw_copy.pick(ch_type)
 
     raw_copy.filter(
         filter_freq[0],
@@ -167,9 +168,9 @@ def annotate_muscle_zscore(
             art_mask[l_idx] = True
 
     # Load orig muscle filtered
-    raw, shielding_str, meg_system = load_data(raw_muscle_path)
+    raw, shielding_str, meg_system, _modality = load_data(raw_muscle_path)
     # Load annotated muscle filtered
-    raw_copy, shielding_str2, meg_system2 = load_data(raw_annotated_muscle_path)
+    raw_copy, shielding_str2, meg_system2, _modality2 = load_data(raw_annotated_muscle_path)
 
 
     annot = _annotations_from_mask(

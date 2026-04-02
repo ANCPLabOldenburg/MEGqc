@@ -945,7 +945,8 @@ def find_mean_rwave_blink(ch_data: Union[List, np.ndarray], event_indexes: np.nd
     """
 
     # Initialize an empty array to store the extracted epochs
-    epochs = np.zeros((len(event_indexes), int((tmax-tmin)*sfreq)+1))
+    expected_len = int((tmax-tmin)*sfreq)+1
+    epochs = np.zeros((len(event_indexes), expected_len))
 
     # Loop through each ECG event and extract the corresponding epoch
     for i, event in enumerate(event_indexes):
@@ -958,7 +959,15 @@ def find_mean_rwave_blink(ch_data: Union[List, np.ndarray], event_indexes: np.nd
         if end > len(ch_data):
             continue
 
-        epochs[i, :] = ch_data[start:end]
+        segment = ch_data[start:end]
+        seg_len = len(segment)
+        if seg_len == expected_len:
+            epochs[i, :] = segment
+        elif seg_len < expected_len:
+            epochs[i, :seg_len] = segment
+        else:
+            # segment is 1 sample longer than expected — truncate
+            epochs[i, :] = segment[:expected_len]
 
     #average all epochs:
     mean_rwave=np.mean(epochs, axis=0)
@@ -1084,7 +1093,14 @@ def find_affected_by_correlation(mean_rwave: np.ndarray, artif_per_ch: List):
     if len(mean_rwave) != len(artif_per_ch[0].artif_data):
         print('___MEGqc___: ', 'mean_rwave and artif_per_ch.artif_data have different length! Both are defined by tmin and tmax in config.py and are use to cut the data. Keep in mind if changing anything with tmin and tmax')
         print('len(mean_rwave): ', len(mean_rwave), 'len(artif_per_ch[0].artif_data): ', len(artif_per_ch[0].artif_data))
-        return
+
+        # Try to align by trimming or padding to the shorter length
+        min_len = min(len(mean_rwave), len(artif_per_ch[0].artif_data))
+        mean_rwave_trimmed = mean_rwave[:min_len]
+        for ch in artif_per_ch:
+            smoothed = ch.artif_data_smoothed[:min_len] if ch.artif_data_smoothed is not None else np.zeros(min_len)
+            ch.corr_coef, ch.p_value = pearsonr(smoothed, mean_rwave_trimmed)
+        return artif_per_ch
 
     for ch in artif_per_ch:
         ch.corr_coef, ch.p_value = pearsonr(ch.artif_data_smoothed, mean_rwave)
@@ -1449,7 +1465,7 @@ def make_simple_metric_ECG_EOG(channels_ranked: dict, m_or_g_chosen: List, ecg_o
     """
 
     metric_global_name = 'all_channels_ranked_by_'+ecg_or_eog+'_contamination_level'
-    metric_global_content = {'mag': None, 'grad': None}
+    metric_global_content = {'mag': None, 'grad': None, 'eeg': None}
 
     if use_method == 'mean_threshold':
         metric_global_description = 'Here presented the channels with average (over '+ecg_or_eog+' epochs of this channel) ' +ecg_or_eog+ ' artifact above the threshold. Channels are listed here in order from the highest to lowest artifact amplitude. Non affected channels are not listed. Threshld is defined as average '+ecg_or_eog+' artifact peak magnitude over al channels * norm_lvl. norm_lvl is defined in the config file. Channels are presented in the form: ch.name: ch.main_peak_magnitude.'
@@ -1467,7 +1483,7 @@ def make_simple_metric_ECG_EOG(channels_ranked: dict, m_or_g_chosen: List, ecg_o
     else:
         measurement_units = False
 
-    simple_metric = simple_metric_basic(metric_global_name, metric_global_description, metric_global_content['mag'], metric_global_content['grad'], display_only_global=True, measurement_units = measurement_units)
+    simple_metric = simple_metric_basic(metric_global_name, metric_global_description, metric_global_content['mag'], metric_global_content['grad'], display_only_global=True, measurement_units = measurement_units, metric_global_content_eeg=metric_global_content.get('eeg'))
 
     return simple_metric
 
@@ -1545,12 +1561,72 @@ def get_ECG_data_choose_method(raw: mne.io.Raw, ecg_params: dict):
 
     else: #no ecg channel present
 
-        ecg_str = 'No ECG channel found. The signal is reconstructed based on magnetometers data. \n'
-        use_method = 'correlation_reconstructed'
+        # Check if magnetometer channels exist for ECG reconstruction
+        has_meg = len(mne.pick_types(raw.info, meg=True, eeg=False, exclude=[])) > 0
+        if has_meg:
+            ecg_str = 'No ECG channel found. The signal is reconstructed based on magnetometers data. \n'
+            use_method = 'correlation_reconstructed'
+        else:
+            # EEG-only data: try common ECG channel names before giving up
+            _common_ecg_names = ['ECG', 'EKG', 'ecg', 'ekg', 'ECG1', 'ECG2',
+                                 'EKG1', 'EKG2', 'ECGL', 'ECGR']
+            found_ecg_by_name = [ch for ch in _common_ecg_names if ch in raw.ch_names]
+            if found_ecg_by_name:
+                ecg_ch_name = found_ecg_by_name[0]
+                # Re-type it so MNE recognises it as ECG.
+                # If the channel is part of an SSP projector (e.g. 'Average
+                # EEG reference'), we need to remove those projectors first,
+                # otherwise set_channel_types will raise RuntimeError.
+                try:
+                    raw.set_channel_types({ecg_ch_name: 'ecg'})
+                except RuntimeError:
+                    # Remove projectors that contain this channel and retry
+                    projs_to_keep = []
+                    for proj in raw.info['projs']:
+                        col_names = proj['data'].get('col_names', [])
+                        if ecg_ch_name not in col_names:
+                            projs_to_keep.append(proj)
+                        else:
+                            print(f'___MEGqc___: Removing projector "{proj["desc"]}" '
+                                  f'that contains ECG channel {ecg_ch_name}.')
+                    raw.info['projs'] = projs_to_keep
+                    try:
+                        raw.set_channel_types({ecg_ch_name: 'ecg'})
+                    except Exception as exc2:
+                        print(f'___MEGqc___: Still cannot retype {ecg_ch_name}: {exc2}')
+                        ecg_str = (f'ECG channel {ecg_ch_name} found but cannot be '
+                                   f'retyped due to projector conflict: {exc2}. '
+                                   'ECG metric skipped.\n')
+                        use_method = 'no_ecg'
+                print(f'___MEGqc___: Found ECG channel by name: {ecg_ch_name}')
+                if use_method != 'no_ecg':
+                    bad_ecg_eog, ecg_data, event_indexes, ecg_eval_str = detect_noisy_ecg(
+                        raw, ecg_ch_name, ecg_or_eog='ECG',
+                        n_breaks_bursts_allowed_per_10min=ecg_params['n_breaks_bursts_allowed_per_10min'],
+                        allowed_range_of_peaks_stds=ecg_params['allowed_range_of_peaks_stds'],
+                        height_multiplier=ecg_params['height_multiplier'])
+                    if bad_ecg_eog[ecg_ch_name] == 'good':
+                        ecg_str = ecg_ch_name + ' is used to identify heartbeats (detected by common name). \n'
+                        use_method = 'correlation_recorded'
+                    else:
+                        ecg_str = (f'ECG channel {ecg_ch_name} was found by name but is too noisy. '
+                                   'ECG metric cannot be computed for EEG-only data without a good ECG channel. \n')
+                        use_method = 'no_ecg'
+            else:
+                # No ECG channel at all in EEG-only data — skip gracefully
+                ecg_str = ('No ECG channel found and no MEG channels available for '
+                           'ECG reconstruction. ECG metric is skipped for '
+                           'EEG-only data without a dedicated ECG channel. \n')
+                print('___MEGqc___: ', ecg_str)
+                use_method = 'no_ecg'
 
         # _, _, _, ecg_data = mne.preprocessing.find_ecg_events(raw, return_ecg=True)
         # # here the RECONSTRUCTED ecg data will be outputted (based on magnetometers), and only if u set return_ecg=True and no real ec channel present).
         # ecg_data = ecg_data[0]
+
+    if use_method == 'no_ecg':
+        ecg_str_total = ecg_str.replace('\n', '<br>')
+        return use_method, ecg_str_total, '', np.array([]), np.array([])
 
     if use_method == 'correlation_reconstructed':
         ecg_ch_name, bad_ecg_eog, ecg_data, event_indexes, ecg_eval_str = reconstruct_ecg_and_check(raw, ecg_params['n_breaks_bursts_allowed_per_10min'], ecg_params['allowed_range_of_peaks_stds'], ecg_params['height_multiplier'])
@@ -1607,7 +1683,23 @@ def get_EOG_data(raw: mne.io.Raw, eog_params: dict):
         if missing:
             print('___MEGqc___: EOG fixed channels not found in data:', missing)
         if eog_channel_names:
-            raw.set_channel_types({name: 'eog' for name in eog_channel_names})
+            try:
+                raw.set_channel_types({name: 'eog' for name in eog_channel_names})
+            except RuntimeError:
+                # Remove projectors containing EOG channels, then retry
+                projs_to_keep = []
+                for proj in raw.info['projs']:
+                    col_names = proj['data'].get('col_names', [])
+                    if not any(name in col_names for name in eog_channel_names):
+                        projs_to_keep.append(proj)
+                    else:
+                        print(f'___MEGqc___: Removing projector "{proj["desc"]}" '
+                              f'that contains EOG channel(s).')
+                raw.info['projs'] = projs_to_keep
+                try:
+                    raw.set_channel_types({name: 'eog' for name in eog_channel_names})
+                except Exception as exc:
+                    print(f'___MEGqc___: Could not retype EOG channels: {exc}')
     else:
         # Select the EOG channels
         eog_channels = mne.pick_types(raw.info, meg=False, eeg=False, stim=False, eog=True)
@@ -2069,7 +2161,7 @@ def ECG_meg_qc(ecg_params: dict, ecg_params_internal: dict, data_path:str, chann
     """
 
     # Load data
-    raw, shielding_str, meg_system = load_data(data_path)
+    raw, shielding_str, meg_system, _modality = load_data(data_path)
 
     chs_by_lobe = copy.deepcopy(chs_by_lobe_orig) 
     #in case we will change this variable in any way. If not copied it might introduce errors in parallel processing. 
@@ -2089,8 +2181,13 @@ def ECG_meg_qc(ecg_params: dict, ecg_params_internal: dict, data_path:str, chann
     ecg_derivs = []
     use_method, ecg_str, ecg_ch_name, ecg_data, event_indexes = get_ECG_data_choose_method(raw, ecg_params)
 
+    if use_method == 'no_ecg':
+        simple_metric_ECG = {'description': ecg_str}
+        print('___MEGqc___: ECG metric skipped — no ECG channel available.')
+        return ecg_derivs, simple_metric_ECG, ecg_str, []
+
     n_events = len(event_indexes)
-    minutes_in_data = len(ecg_data) / sfreq / 60
+    minutes_in_data = len(ecg_data) / sfreq / 60 if len(ecg_data) > 0 else 0.001
     events_rate_per_min = round(n_events / minutes_in_data, 1)
     print('___MEGqc___: ', 'ECG events detected: ', n_events)
     n_events_str = '<br><br>ECG events detected: ' + str(n_events)
@@ -2126,8 +2223,28 @@ def ECG_meg_qc(ecg_params: dict, ecg_params_internal: dict, data_path:str, chann
     ecg_str += ecg_str_checked + n_events_str
 
     if mean_good is False: 
-        #mean ECG wave calculsted but bad - dont continue
-        simple_metric_ECG = {'description': ecg_str}
+        #mean ECG wave calculated but bad - dont continue
+        if n_events > 0:
+            ecg_str += (
+                '<br><br><b>Note:</b> ' + str(n_events) + ' ECG events were detected, but the averaged '
+                'R-wave did not pass the expected shape check. This may indicate '
+                'noisy ECG data, atypical heartbeat morphology, or an incorrect '
+                'ECG channel. The raw ECG signal and detected peak locations are '
+                'displayed for inspection.'
+            )
+        else:
+            ecg_str += (
+                '<br><br><b>Note:</b> No heartbeat events were detected on the ECG channel. '
+                'This may indicate that the signal does not contain clear R-wave peaks, '
+                'the detection threshold is too strict, or the ECG channel is unreliable. '
+                'The raw ECG signal is displayed for inspection.'
+            )
+        simple_metric_ECG = {
+            'description': ecg_str,
+            'n_events': n_events,
+            'events_rate_per_min': events_rate_per_min,
+            'mean_waveform_ok': False,
+        }
 
         #Still Create df to be exported to tsv, except mean_rwave_shifted:
 
@@ -2187,6 +2304,9 @@ def ECG_meg_qc(ecg_params: dict, ecg_params_internal: dict, data_path:str, chann
             for mean_shifted in mean_rwave_shifted_variations:
                 affected_channels[m_or_g] = find_affected_by_correlation(mean_shifted, artif_per_ch)
 
+                if affected_channels[m_or_g] is None:
+                    print(f'___MEGqc___: ECG correlation alignment failed for {m_or_g} — skipping this variation.')
+                    continue
 
                 #collect all correlation values for all channels:
                 all_corr_values = [abs(ch.corr_coef) for ch in affected_channels[m_or_g]]
@@ -2208,9 +2328,12 @@ def ECG_meg_qc(ecg_params: dict, ecg_params_internal: dict, data_path:str, chann
             # Now that we found best correlation values, next step is to calculate magnitude ratios of every channel
             # Then, calculate similarity value comprised of correlation and magnitude ratio:
 
-            best_affected_channels[m_or_g] = find_affected_by_amplitude_ratio(best_affected_channels[m_or_g])
-
-            best_affected_channels[m_or_g] = find_affected_by_similarity_score(best_affected_channels[m_or_g])
+            if m_or_g in best_affected_channels and best_affected_channels[m_or_g] is not None:
+                best_affected_channels[m_or_g] = find_affected_by_amplitude_ratio(best_affected_channels[m_or_g])
+                best_affected_channels[m_or_g] = find_affected_by_similarity_score(best_affected_channels[m_or_g])
+            else:
+                print(f'___MEGqc___: ECG correlation analysis produced no results for {m_or_g} — using raw artifact data.')
+                best_affected_channels[m_or_g] = artif_per_ch
 
 
             bad_avg_str[m_or_g] = ''
@@ -2291,7 +2414,7 @@ def EOG_meg_qc(eog_params: dict, eog_params_internal: dict, data_path: str, chan
     
     """
     # Load data
-    raw, shielding_str, meg_system = load_data(data_path)
+    raw, shielding_str, meg_system, _modality = load_data(data_path)
 
     chs_by_lobe = copy.deepcopy(chs_by_lobe_orig) 
     #in case we will change this variable in any way. If not copied it might introduce errors in parallel processing. 
@@ -2352,7 +2475,27 @@ def EOG_meg_qc(eog_params: dict, eog_params_internal: dict, data_path: str, chan
     
 
     if mean_good is False:
-        simple_metric_EOG = {'description': eog_str}
+        if n_events > 0:
+            eog_str += (
+                '<br><br><b>Note:</b> ' + str(n_events) + ' EOG events were detected on the EOG channel, '
+                'but the averaged blink waveform did not pass the expected shape '
+                'check. This may indicate noisy EOG data, atypical blink morphology, '
+                'or an incorrect EOG channel. The raw EOG signal and detected peak '
+                'locations are displayed for inspection.'
+            )
+        else:
+            eog_str += (
+                '<br><br><b>Note:</b> No blink events were detected on the EOG channel. '
+                'This may indicate that the signal does not contain clear blink peaks, '
+                'the detection threshold is too strict, or the EOG channel is unreliable. '
+                'The raw EOG signal is displayed for inspection.'
+            )
+        simple_metric_EOG = {
+            'description': eog_str,
+            'n_events': n_events,
+            'events_rate_per_min': events_rate_per_min,
+            'mean_waveform_ok': False,
+        }
         return eog_derivs, simple_metric_EOG, eog_str, []
 
 
@@ -2385,16 +2528,18 @@ def EOG_meg_qc(eog_params: dict, eog_params_internal: dict, data_path: str, chan
             bad_avg_str[m_or_g] = ''
             avg_overall_obj = None
 
-            #ADDED:
+            if affected_channels[m_or_g] is None:
+                print(f'___MEGqc___: EOG correlation analysis failed for {m_or_g} — skipping amplitude/similarity.')
+                best_affected_channels[m_or_g] = artif_per_ch
+            else:
+                best_affected_channels[m_or_g] = copy.deepcopy(affected_channels[m_or_g])
 
-            best_affected_channels[m_or_g] = copy.deepcopy(affected_channels[m_or_g])
+                # Now that we found best correlation values, next step is to calculate magnitude ratios of every channel
+                # Then, calculate similarity value comprised of correlation and magnitude ratio:
 
-            # Now that we found best correlation values, next step is to calculate magnitude ratios of every channel
-            # Then, calculate similarity value comprised of correlation and magnitude ratio:
+                best_affected_channels[m_or_g] = find_affected_by_amplitude_ratio(best_affected_channels[m_or_g])
 
-            best_affected_channels[m_or_g] = find_affected_by_amplitude_ratio(best_affected_channels[m_or_g])
-
-            best_affected_channels[m_or_g] = find_affected_by_similarity_score(best_affected_channels[m_or_g])
+                best_affected_channels[m_or_g] = find_affected_by_similarity_score(best_affected_channels[m_or_g])
 
 
 

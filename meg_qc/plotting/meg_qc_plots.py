@@ -195,7 +195,7 @@ def _ensure_megqc_output_layout(
 # During plotting step - read the csvs (find using ancpbids), plot them, save them as htmls in the right folders.
 
 
-def create_categories_for_selector(entities: dict):
+def create_categories_for_selector(entities: dict, calculation_dir: str = None):
 
     """
     Create categories based on what metrics have already been calculated and detected as ancp bids as entities in MEGqc derivatives folder.
@@ -204,6 +204,9 @@ def create_categories_for_selector(entities: dict):
     ----------
     entities : dict
         A dictionary of entities and their subcategories.
+    calculation_dir : str, optional
+        Path to the calculation directory. If provided, channel types
+        are detected dynamically from derivative TSV files.
 
     Returns
     -------
@@ -232,10 +235,65 @@ def create_categories_for_selector(entities: dict):
     for category, subcategories in categories.items():
         categories[category] = ['_ALL_'+category+'s_'] + subcategories
 
-    # Add 'm_or_g' category
-    categories['m_or_g'] = ['_ALL_sensors', 'mag', 'grad']
+    # Add 'm_or_g' category — dynamically detect available channel types
+    detected_types = _detect_available_channel_types(calculation_dir)
+    if detected_types:
+        categories['m_or_g'] = ['_ALL_sensors'] + detected_types
+    else:
+        # Fallback to full list if detection fails
+        categories['m_or_g'] = ['_ALL_sensors', 'mag', 'grad', 'eeg']
 
     return categories
+
+
+def _detect_available_channel_types(calculation_dir: str = None) -> list:
+    """Detect which channel types (mag, grad, eeg) are present in derivative TSVs.
+
+    Scans for files with ``_mag_``, ``_grad_``, or ``_eeg_`` in the filename
+    under the calculation directory. Falls back to reading the ``Type`` column
+    from a Sensors or STDs TSV if filename-based detection finds nothing.
+    """
+    if calculation_dir is None:
+        return []
+    from pathlib import Path
+    import re as _re
+
+    calc_path = Path(calculation_dir)
+    if not calc_path.is_dir():
+        return []
+
+    found_types = set()
+
+    # Strategy 1: Check filename patterns like _mag_meg.tsv, _grad_meg.tsv, _eeg_eeg.tsv
+    for tsv in calc_path.rglob("*.tsv"):
+        name = tsv.name.lower()
+        if "_mag_" in name or name.endswith("_mag.tsv"):
+            found_types.add("mag")
+        if "_grad_" in name or name.endswith("_grad.tsv"):
+            found_types.add("grad")
+        if "_eeg_" in name or name.endswith("_eeg.tsv"):
+            found_types.add("eeg")
+
+    # Strategy 2: If filenames didn't help, read Type column from a Sensors/STDs TSV
+    if not found_types:
+        for tsv in calc_path.rglob("*desc-STDs*.tsv"):
+            try:
+                import pandas as _pd
+                df = _pd.read_csv(tsv, sep="\t", nrows=500, usecols=lambda c: c == "Type")
+                if "Type" in df.columns:
+                    types = df["Type"].dropna().unique()
+                    for t in types:
+                        t_lower = str(t).strip().lower()
+                        if t_lower in ("mag", "grad", "eeg"):
+                            found_types.add(t_lower)
+                if found_types:
+                    break
+            except Exception:
+                continue
+
+    # Return in canonical order
+    ordered = [t for t in ("mag", "grad", "eeg") if t in found_types]
+    return ordered
 
 
 def selector(entities: dict):
@@ -459,7 +517,7 @@ def _metric_to_report_section(metric: str) -> Optional[str]:
         return "MUSCLE"
     if "HEAD" in metric_upper:
         return "HEAD"
-    if "STIM" in metric_upper:
+    if "STIM" in metric_upper or "EVENTSUMMARY" in metric_upper:
         return "STIMULUS"
     return None
 
@@ -541,14 +599,24 @@ def _build_run_tab_labels(raw_entity_names: Sequence[str]) -> Dict[str, str]:
 
 
 def _format_metric_note_html(metric_note: str) -> str:
-    """Render metric notes with readable line breaks."""
+    """Render metric notes with readable line breaks.
+
+    If the note already contains HTML tags (e.g. ``<b>``, ``<table>``,
+    ``<code>``), it is passed through as-is to preserve formatting.
+    Plain-text notes are escaped and newlines converted to ``<br>``.
+    """
     text = str(metric_note or "").strip()
     if not text:
         return ""
+    # Detect existing HTML tags – if found, render as-is
+    _html_tag_re = re.compile(
+        r'<(b|i|em|strong|code|table|th|td|tr|ul|ol|li|h[1-6]|div|span|p|br|a)\b',
+        re.IGNORECASE,
+    )
+    if _html_tag_re.search(text):
+        return text
+    # Plain text: escape and convert newlines
     safe = html.escape(text)
-    safe = re.sub(r"&lt;br\s*/?&gt;", "<br>", safe, flags=re.IGNORECASE)
-    safe = re.sub(r"&lt;p&gt;", "<br>", safe, flags=re.IGNORECASE)
-    safe = re.sub(r"&lt;/p&gt;", "", safe, flags=re.IGNORECASE)
     safe = safe.replace("\n", "<br>")
     return safe
 
@@ -1026,8 +1094,8 @@ def _plot_block_from_derivative(deriv: QC_derivative, *, display_title: Optional
 def _infer_derivative_channel_type(deriv: QC_derivative) -> str:
     """Infer channel type bucket from derivative metadata.
 
-    Returns one of ``MAG``, ``GRAD``, or ``ALL``. The fallback ``ALL`` keeps
-    figures that are not channel-type specific (for example overview traces).
+    Returns one of ``MAG``, ``GRAD``, ``EEG``, or ``ALL``. The fallback ``ALL``
+    keeps figures that are not channel-type specific (for example overview traces).
     """
     name = str(getattr(deriv, "name", "") or "")
     desc = str(getattr(deriv, "description_for_user", "") or "")
@@ -1035,11 +1103,14 @@ def _infer_derivative_channel_type(deriv: QC_derivative) -> str:
 
     has_mag = ("magnetometer" in blob) or re.search(r"(^|[^a-z])mag([^a-z]|$)", blob) is not None
     has_grad = ("gradiometer" in blob) or re.search(r"(^|[^a-z])grad([^a-z]|$)", blob) is not None
+    has_eeg = ("electrode" in blob) or re.search(r"(^|[^a-z])eeg([^a-z]|$)", blob) is not None
 
-    if has_mag and not has_grad:
+    if has_mag and not has_grad and not has_eeg:
         return "MAG"
-    if has_grad and not has_mag:
+    if has_grad and not has_mag and not has_eeg:
         return "GRAD"
+    if has_eeg and not has_mag and not has_grad:
+        return "EEG"
     return "ALL"
 
 
@@ -1099,7 +1170,27 @@ def _build_metric_run_panel(
     """Build one run-specific panel inside a metric tab."""
     blocks = []
     if metric_note:
-        blocks.append(f"<p><strong>Metric notes:</strong> {_format_metric_note_html(metric_note)}</p>")
+        note_html = _format_metric_note_html(metric_note)
+        # Detect warning/failure keywords to render as a prominent alert banner
+        note_lower = metric_note.lower()
+        is_warning = any(kw in note_lower for kw in [
+            'did not pass', 'shape check', 'could not', 'not detected',
+            'can not be detected', 'no ecg', 'no eog', 'no expected wave',
+            'waveform_ok', 'mean_waveform', 'skipped', 'not calculated',
+            'not computed', 'too noisy', 'unreliable', 'dropped from',
+            'for inspection', 'no heartbeat', 'no blink',
+            'head positions could not',
+        ])
+        if is_warning:
+            blocks.append(
+                "<div style='background:#fff3cd; border:2px solid #ffc107; "
+                "border-radius:8px; padding:14px 18px; margin:10px 0 16px 0;'>"
+                "<h3 style='margin:0 0 8px 0; color:#856404;'>Metric Status</h3>"
+                f"<div style='color:#856404;'>{note_html}</div>"
+                "</div>"
+            )
+        else:
+            blocks.append(f"<p><strong>Metric notes:</strong> {note_html}</p>")
     if source_paths:
         src_items = "".join(
             f"<li><code>{html.escape(str(p))}</code></li>"
@@ -1115,9 +1206,10 @@ def _build_metric_run_panel(
         # Channel-type organization:
         # - MAG tab when magnetometer-specific figures exist
         # - GRAD tab when gradiometer-specific figures exist
+        # - EEG tab when EEG-specific figures exist
         # - General tab for non-specific figures
         ch_tabs: List[Tuple[str, str]] = []
-        order = [("MAG", "MAG"), ("GRAD", "GRAD"), ("ALL", "General")]
+        order = [("MAG", "MAG"), ("GRAD", "GRAD"), ("EEG", "EEG"), ("ALL", "General")]
         for key, label in order:
             items = ch_groups.get(key, [])
             if not items:
@@ -1161,8 +1253,16 @@ def _build_subject_overview_section(
     metrics_payload: Dict[str, List[Dict[str, Any]]],
     overview_payload: List[Dict[str, Any]],
     summary_payload: List[Dict[str, Any]],
+    embedded_eeg_note: bool = False,
 ) -> str:
-    """Create overview tab with compact run/metric availability."""
+    """Create overview tab with compact run/metric availability.
+
+    Parameters
+    ----------
+    embedded_eeg_note : bool
+        When True, an informational banner is added explaining that EEG channels
+        were detected within the MEG recordings and are included in this report.
+    """
     metric_keys = [m for m in METRIC_ORDER if metrics_payload.get(m)]
     run_labels = sorted(
         {
@@ -1185,7 +1285,7 @@ def _build_subject_overview_section(
     empty_row_html = "<tr><td colspan='99'>No runs found.</td></tr>"
     table_html = (
         "<table>"
-        "<thead><tr><th>Run / task</th>"
+        "<thead><tr><th>Recording</th>"
         f"{header_cols}</tr></thead>"
         f"<tbody>{''.join(rows) if rows else empty_row_html}</tbody>"
         "</table>"
@@ -1199,16 +1299,33 @@ def _build_subject_overview_section(
         "<h3>Subject summary</h3>"
         f"<p><strong>Dataset:</strong> {html.escape(dataset_name)}</p>"
         f"<p><strong>Subject:</strong> sub-{html.escape(subject)}</p>"
-        f"<p><strong>N runs:</strong> {n_runs}</p>"
+        f"<p><strong>N recordings:</strong> {n_runs}</p>"
         f"<p><strong>N metrics with figures:</strong> {n_metrics}</p>"
         "</div>"
         "<div class='overview-card'>"
-        "<h3>Run x metric availability</h3>"
+        "<h3>Recording x metric availability</h3>"
         f"{table_html}"
         "</div>"
         "</div>"
     )
 
+    # Embedded EEG note for Scenario 2 (MEG recordings with EEG channels inside)
+    if embedded_eeg_note:
+        overview_html += (
+            "<div style='background:#e3f2fd; border:2px solid #64b5f6; "
+            "border-radius:8px; padding:14px 18px; margin:12px 0 16px 0;'>"
+            "<h3 style='margin:0 0 8px 0; color:#1565c0;'>EEG channels detected in MEG recording</h3>"
+            "<p style='margin:0; color:#1565c0;'>"
+            "This MEG recording also contains EEG electrode channels. "
+            "The EEG data is included in this report as a dedicated EEG tab "
+            "within each metric section (alongside the MAG and GRAD tabs). "
+            "These are not independent EEG recordings but EEG channels "
+            "embedded within the MEG data files."
+            "</p></div>"
+        )
+
+    # Build sensor position panels — when embedded EEG is present, separate
+    # MEG and EEG sensors into dedicated subtabs to avoid visual overlap.
     sensor_tabs: List[Tuple[str, str]] = []
     for item in overview_payload:
         derivs = item.get("sensor_derivatives", []) or []
@@ -1223,8 +1340,26 @@ def _build_subject_overview_section(
                 for p in sorted(set(str(p) for p in source_paths))
             )
             src_html = f"<details><summary>Sources</summary><ul>{src_items}</ul></details>"
-        sensor_blocks = "".join(_plot_block_from_derivative(d) for d in derivs)
-        sensor_tabs.append((run_label, src_html + sensor_blocks))
+
+        if embedded_eeg_note and len(derivs) > 1:
+            # Separate sensor plots into MEG and EEG subtabs
+            meg_sensor_derivs = [d for d in derivs if _infer_derivative_channel_type(d) in ("MAG", "GRAD", "ALL")]
+            eeg_sensor_derivs = [d for d in derivs if _infer_derivative_channel_type(d) == "EEG"]
+            ch_type_tabs: List[Tuple[str, str]] = []
+            if meg_sensor_derivs:
+                ch_type_tabs.append(("MEG sensors", "".join(_plot_block_from_derivative(d) for d in meg_sensor_derivs)))
+            if eeg_sensor_derivs:
+                ch_type_tabs.append(("EEG sensors", "".join(_plot_block_from_derivative(d) for d in eeg_sensor_derivs)))
+            if not ch_type_tabs:
+                ch_type_tabs.append(("All sensors", "".join(_plot_block_from_derivative(d) for d in derivs)))
+            sensor_content = src_html + _build_subtabs_html(
+                f"overview-sensors-chtype-{_sanitize_token(run_label)}", ch_type_tabs, level=3
+            )
+        else:
+            sensor_blocks = "".join(_plot_block_from_derivative(d) for d in derivs)
+            sensor_content = src_html + sensor_blocks
+
+        sensor_tabs.append((run_label, sensor_content))
 
     if sensor_tabs:
         overview_html += (
@@ -1390,11 +1525,30 @@ def _collect_subject_gqi_task_rows(
         if not group_metrics_dir.exists():
             continue
 
-        for tsv_path in sorted(group_metrics_dir.glob("Global_Quality_Index_attempt_*.tsv")):
-            match = re.search(r"attempt_(\d+)\.tsv$", tsv_path.name)
+        # Collect GQI TSVs from per-modality subdirs first, then legacy root
+        _gqi_tsv_paths: list = []
+        for subdir in ("meg", "eeg"):
+            d = group_metrics_dir / subdir
+            if d.is_dir():
+                _gqi_tsv_paths.extend(d.glob("Global_Quality_Index_attempt_*.tsv"))
+        # Fallback: legacy combined files in root group_metrics/
+        if not _gqi_tsv_paths:
+            _gqi_tsv_paths = list(group_metrics_dir.glob("Global_Quality_Index_attempt_*.tsv"))
+
+        for tsv_path in sorted(_gqi_tsv_paths):
+            match = re.search(r"attempt_(\d+)", tsv_path.name)
             if not match:
                 continue
             attempt = int(match.group(1))
+            # Determine modality from filename or parent directory
+            _tsv_name = tsv_path.name.lower()
+            _tsv_parent = tsv_path.parent.name.lower()
+            if "_eeg" in _tsv_name or _tsv_parent == "eeg":
+                _tsv_modality = "eeg"
+            elif "_meg" in _tsv_name or _tsv_parent == "meg":
+                _tsv_modality = "meg"
+            else:
+                _tsv_modality = "unknown"
 
             try:
                 with tsv_path.open("r", encoding="utf-8") as f:
@@ -1406,16 +1560,21 @@ def _collect_subject_gqi_task_rows(
                         rows.append(
                             {
                                 "attempt": attempt,
+                                "modality": record.get("modality", _tsv_modality),
                                 "task": str(record.get("task", "")).strip(),
                                 "GQI": str(record.get("GQI", "")).strip(),
                                 "ECG_mag_high_corr_num": str(record.get("ECG_mag_high_corr_num", "")).strip(),
                                 "ECG_mag_high_corr_percentage": str(record.get("ECG_mag_high_corr_percentage", "")).strip(),
                                 "ECG_grad_high_corr_num": str(record.get("ECG_grad_high_corr_num", "")).strip(),
                                 "ECG_grad_high_corr_percentage": str(record.get("ECG_grad_high_corr_percentage", "")).strip(),
+                                "ECG_eeg_high_corr_num": str(record.get("ECG_eeg_high_corr_num", "")).strip(),
+                                "ECG_eeg_high_corr_percentage": str(record.get("ECG_eeg_high_corr_percentage", "")).strip(),
                                 "EOG_mag_high_corr_num": str(record.get("EOG_mag_high_corr_num", "")).strip(),
                                 "EOG_mag_high_corr_percentage": str(record.get("EOG_mag_high_corr_percentage", "")).strip(),
                                 "EOG_grad_high_corr_num": str(record.get("EOG_grad_high_corr_num", "")).strip(),
                                 "EOG_grad_high_corr_percentage": str(record.get("EOG_grad_high_corr_percentage", "")).strip(),
+                                "EOG_eeg_high_corr_num": str(record.get("EOG_eeg_high_corr_num", "")).strip(),
+                                "EOG_eeg_high_corr_percentage": str(record.get("EOG_eeg_high_corr_percentage", "")).strip(),
                                 "tsv_path": str(tsv_path),
                             }
                         )
@@ -1443,9 +1602,11 @@ def _build_subject_gqi_metric_panel(rows: List[Dict[str, Any]]) -> str:
         source_name = os.path.basename(source_path) if source_path else "-"
         if source_path:
             source_paths.append(source_path)
+        modality_label = row.get('modality', '') or '-'
         body_rows.append(
             "<tr>"
             f"<td>{row['attempt']}</td>"
+            f"<td>{html.escape(modality_label)}</td>"
             f"<td>{html.escape(row.get('task', '') or '-')}</td>"
             f"<td>{row.get('GQI', '') or '-'}</td>"
             f"<td><code>{html.escape(source_name)}</code></td>"
@@ -1455,7 +1616,7 @@ def _build_subject_gqi_metric_panel(rows: List[Dict[str, Any]]) -> str:
     table_html = (
         "<table>"
         "<thead><tr>"
-        "<th>Attempt</th><th>Task</th><th>GQI</th><th>Source TSV</th>"
+        "<th>Attempt</th><th>Modality</th><th>Task</th><th>GQI</th><th>Source TSV</th>"
         "</tr></thead>"
         f"<tbody>{''.join(body_rows)}</tbody>"
         "</table>"
@@ -1474,7 +1635,7 @@ def _build_subject_gqi_metric_panel(rows: List[Dict[str, Any]]) -> str:
         "<div class='overview-card'>"
         "<h3>Global Quality Index (GQI)</h3>"
         "<p>Task-level rows discovered from "
-        "<code>summary_reports/group_metrics/Global_Quality_Index_attempt_&lt;n&gt;.tsv</code>. "
+        "<code>summary_reports/group_metrics/{meg,eeg}/Global_Quality_Index_attempt_&lt;n&gt;_{meg,eeg}.tsv</code>. "
         "Values shown are filtered for this subject.</p>"
         f"{table_html}"
         f"{sources_details}"
@@ -1524,7 +1685,8 @@ def _build_psd_summary_from_simple_metrics(metric_data: Any) -> str:
     rows: List[List[str]] = []
     rows.append(["Unit (MAG)", html.escape(str(metric_data.get("measurement_unit_mag", "-")))])
     rows.append(["Unit (GRAD)", html.escape(str(metric_data.get("measurement_unit_grad", "-")))])
-    for ch_type in ("mag", "grad"):
+    rows.append(["Unit (EEG)", html.escape(str(metric_data.get("measurement_unit_eeg", "-")))])
+    for ch_type in ("mag", "grad", "eeg"):
         global_block = ((metric_data.get("PSD_global") or {}).get(ch_type) or {})
         local_block = ((metric_data.get("PSD_local") or {}).get(ch_type) or {})
 
@@ -1580,6 +1742,8 @@ def _build_ecg_eog_affected_summary(
                                               f" ({row.get(f'{prefix}_mag_high_corr_percentage', '-')}%)")],
         ["GRAD affected channels", html.escape(f"{row.get(f'{prefix}_grad_high_corr_num', '-')}"
                                                f" ({row.get(f'{prefix}_grad_high_corr_percentage', '-')}%)")],
+        ["EEG affected channels", html.escape(f"{row.get(f'{prefix}_eeg_high_corr_num', '-')}"
+                                              f" ({row.get(f'{prefix}_eeg_high_corr_percentage', '-')}%)")],
     ]
     return (
         f"<h4>{metric.upper()} affected-channel summary (from GQI task row)</h4>"
@@ -1597,9 +1761,10 @@ def _extract_channel_names_for_table(channel_dict: Any) -> str:
 
 
 def _render_mag_grad_rows(sensor_kind: str, payload: Dict[str, Any]) -> List[str]:
-    """Render metric-specific mag/grad subsection rows (STD/PtP style)."""
+    """Render metric-specific mag/grad/eeg subsection rows (STD/PtP style)."""
     rows: List[str] = []
-    sensor_label = "MAGNETOMETERS" if sensor_kind == "mag" else "GRADIOMETERS"
+    sensor_labels = {"mag": "MAGNETOMETERS", "grad": "GRADIOMETERS", "eeg": "EEG ELECTRODES"}
+    sensor_label = sensor_labels.get(sensor_kind, sensor_kind.upper())
     rows.append(
         f"<tr><td colspan='2' style='border:1px solid #ccc; text-align:center; padding:6px;'><strong>{sensor_label}</strong></td></tr>"
     )
@@ -1678,7 +1843,7 @@ def _render_detailed_metric_rows(data: Any, *, parent_metric: str) -> List[str]:
             rows.append(
                 f"<tr><td colspan='2' style='border:1px solid #ccc; padding:8px; background:#e0f7fa;'><strong>{key_txt}</strong></td></tr>"
             )
-            if key in {"mag", "grad"}:
+            if key in {"mag", "grad", "eeg"}:
                 rows.extend(_render_mag_grad_rows(key, value))
                 continue
             if key == "details" and parent_metric in {"STD", "PTP_MANUAL", "PTP_AUTO"}:
@@ -1780,11 +1945,19 @@ def _build_subject_report_html(
     metrics_payload: Dict[str, List[Dict[str, Any]]],
     overview_payload: List[Dict[str, Any]],
     summary_payload: List[Dict[str, Any]],
+    embedded_eeg_note: bool = False,
 ) -> str:
     """Compose one self-contained subject report.
 
     This report is intentionally standalone: it embeds all JS/CSS and lazy plot
     payloads in one HTML file to avoid external dependencies or sidecar files.
+
+    Parameters
+    ----------
+    embedded_eeg_note : bool
+        When True, a note is added to the overview informing the user that
+        EEG channels were detected within the MEG recording and are included
+        as an EEG tab inside this MEG report.
     """
     _reset_lazy_figure_store()
 
@@ -1798,6 +1971,7 @@ def _build_subject_report_html(
                 metrics_payload=metrics_payload,
                 overview_payload=overview_payload,
                 summary_payload=summary_payload,
+                embedded_eeg_note=embedded_eeg_note,
             ),
         )
     ]
@@ -2548,6 +2722,11 @@ class Deriv_to_plot:
         match = re.search(r'sub-([A-Za-z0-9]+)_', name)
         self.subject = match.group(1) if match else None
 
+        # Determine BIDS modality from the derivative folder structure.
+        # Files under ``calculation/meg/`` → 'meg', under ``calculation/eeg/`` → 'eeg'.
+        # This reflects the true BIDS datatype origin, not derived channel types.
+        self.bids_modality = self._infer_bids_modality_from_path(str(path))
+
     def __repr__(self):
 
         return (
@@ -2555,10 +2734,35 @@ class Deriv_to_plot:
             f"    subject={self.subject},\n"
             f"    path={self.path},\n"
             f"    metric={self.metric},\n"
+            f"    bids_modality={self.bids_modality},\n"
             f"    deriv_entity_obj={self.deriv_entity_obj},\n"
             f"    raw_entity_name={self.raw_entity_name}\n"
             f")"
         )
+
+    @staticmethod
+    def _infer_bids_modality_from_path(path_str: str) -> str:
+        """Determine the BIDS modality from the derivative folder structure.
+
+        Files stored under ``calculation/meg/sub-X/`` → ``'meg'``
+        Files stored under ``calculation/eeg/sub-X/`` → ``'eeg'``
+
+        Falls back to the BIDS suffix in the filename (``_meg.tsv`` vs ``_eeg.tsv``)
+        and ultimately returns ``'unknown'``.
+        """
+        norm = path_str.replace('\\', '/')
+        # Check folder structure first (most reliable)
+        if '/calculation/meg/' in norm or '/calculation/meg\\' in norm:
+            return 'meg'
+        if '/calculation/eeg/' in norm or '/calculation/eeg\\' in norm:
+            return 'eeg'
+        # Fallback: check BIDS suffix in filename
+        basename = os.path.basename(norm)
+        if basename.endswith('_eeg.tsv') or basename.endswith('_eeg.json') or basename.endswith('_eeg.fif'):
+            return 'eeg'
+        if basename.endswith('_meg.tsv') or basename.endswith('_meg.json') or basename.endswith('_meg.fif'):
+            return 'meg'
+        return 'unknown'
 
     def print_detailed_entities(self):
 
@@ -2582,6 +2786,84 @@ class Deriv_to_plot:
 
 
 from joblib import Parallel, delayed
+
+
+def _write_subject_metric_log(
+    *,
+    log_folders: List[Path],
+    subject: str,
+    metric_log: List[Dict[str, Any]],
+    has_meg: bool,
+    has_eeg: bool,
+) -> None:
+    """Write a per-subject metric status log as JSON and human-readable text.
+
+    The log files are written into every folder in *log_folders* (typically the
+    same directories that contain the HTML reports: ``meg/sub-X/``,
+    ``eeg/sub-X/``, etc.).
+    """
+    generated = dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    log_payload = {
+        "subject": subject,
+        "generated": generated,
+        "modalities_detected": {
+            "meg": has_meg,
+            "eeg": has_eeg,
+        },
+        "metrics": metric_log,
+    }
+
+    # Count summary
+    n_ok = sum(1 for m in metric_log if m.get("status") == "OK")
+    n_warn = sum(1 for m in metric_log if m.get("status") == "WARNING")
+    n_err = sum(1 for m in metric_log if m.get("status") == "ERROR")
+    n_skip = sum(1 for m in metric_log if m.get("status") == "SKIPPED")
+    log_payload["summary"] = {
+        "ok": n_ok,
+        "warnings": n_warn,
+        "errors": n_err,
+        "skipped": n_skip,
+        "total": len(metric_log),
+    }
+
+    txt_lines = [
+        f"MEGqc Metric Log -- sub-{subject}",
+        f"Generated: {generated}",
+        f"Modalities: MEG={'yes' if has_meg else 'no'}, EEG={'yes' if has_eeg else 'no'}",
+        f"Summary: {n_ok} OK, {n_warn} warnings, {n_err} errors, {n_skip} skipped ({len(metric_log)} total)",
+        "",
+        f"{'Run':<40} {'Metric':<16} {'Status':<10} {'Figs':<5} Message",
+        "-" * 120,
+    ]
+    for entry in metric_log:
+        run = entry.get("run", "")[:38]
+        metric = entry.get("metric", "")[:14]
+        status = entry.get("status", "")
+        n_figs = str(entry.get("n_figures", ""))
+        msg = entry.get("message", "")[:80]
+        txt_lines.append(f"{run:<40} {metric:<16} {status:<10} {n_figs:<5} {msg}")
+    txt_lines.append("")
+    txt_content = "\n".join(txt_lines)
+
+    for log_folder in log_folders:
+        log_folder.mkdir(parents=True, exist_ok=True)
+        json_path = log_folder / f"sub-{subject}_desc-MetricLog_meg.json"
+        try:
+            with open(json_path, "w", encoding="utf-8") as f:
+                json.dump(log_payload, f, indent=2, ensure_ascii=False)
+        except Exception as exc:
+            print(f"___MEGqc___: Could not write metric log JSON: {exc}")
+
+        txt_path = log_folder / f"sub-{subject}_desc-MetricLog_meg.txt"
+        try:
+            txt_path.write_text(txt_content, encoding="utf-8")
+        except Exception as exc:
+            print(f"___MEGqc___: Could not write metric log TXT: {exc}")
+
+    # Print summary to console
+    folders_str = ", ".join(str(f) for f in log_folders)
+    print(f"___MEGqc___: sub-{subject} metric log: {n_ok} OK, {n_warn} warnings, "
+          f"{n_err} errors, {n_skip} skipped -> {folders_str}")
 
 
 def process_subject(
@@ -2623,6 +2905,9 @@ def process_subject(
     # ``summary_payload`` stores run-level metadata and JSON references used
     # by the "QC summary" tab.
     summary_payload: List[Dict[str, Any]] = []
+
+    # ``metric_log`` collects per-run, per-metric status for the subject log file.
+    metric_log: List[Dict[str, Any]] = []
 
     for raw_entity_name in existing_raws_per_sub:
         derivs_for_this_raw = [
@@ -2687,6 +2972,12 @@ def process_subject(
                     f"___MEGqc___: Failed to build derivatives for "
                     f"sub-{sub} / {run_label} / {metric}: {exc}"
                 )
+                metric_log.append({
+                    "run": run_label,
+                    "metric": metric,
+                    "status": "ERROR",
+                    "message": str(exc),
+                })
                 continue
 
             section_key = _metric_to_report_section(metric)
@@ -2695,30 +2986,213 @@ def process_subject(
             derivatives = qc_derivs.get(section_key, [])
             metric_note = str(report_strings.get(section_key, "") or "")
             if (not derivatives) and (not metric_note):
+                metric_log.append({
+                    "run": run_label,
+                    "metric": metric,
+                    "status": "SKIPPED",
+                    "message": "No derivatives or metric notes produced.",
+                })
                 continue
 
-            metrics_payload[metric].append(
-                {
-                    "run_label": run_label,
-                    "derivatives": derivatives,
-                    "metric_note": metric_note,
-                    "source_paths": tsv_paths,
-                }
-            )
+            # Determine status from the metric note content
+            note_lower = metric_note.lower()
+            if any(kw in note_lower for kw in [
+                'did not pass', 'shape check', 'could not', 'not detected',
+                'can not be detected', 'no ecg', 'no eog', 'no expected wave',
+                'too noisy', 'unreliable', 'skipped',
+            ]):
+                log_status = "WARNING"
+            else:
+                log_status = "OK"
+            log_msg = metric_note[:200].replace('\n', ' ').replace('<br>', ' ').strip() if metric_note else ""
+            # Strip HTML tags for log readability
+            log_msg = re.sub(r'<[^>]+>', '', log_msg).strip()
+            metric_log.append({
+                "run": run_label,
+                "metric": metric,
+                "status": log_status,
+                "n_figures": len(derivatives),
+                "message": log_msg,
+            })
 
-    # Emit one subject-level HTML report.
-    report_html = _build_subject_report_html(
+            # EventSummary derivatives map to STIMULUS section — merge them
+            # into the 'stimulus' payload bucket so everything appears on the
+            # same Stimulus tab rather than creating a separate hidden tab.
+            payload_key = 'stimulus' if metric == 'EventSummary' else metric
+
+            # Check if an entry for this run already exists in the payload
+            existing_entry = None
+            for entry in metrics_payload.get(payload_key, []):
+                if entry["run_label"] == run_label:
+                    existing_entry = entry
+                    break
+
+            if existing_entry is not None:
+                # Merge: prepend new derivatives (summary tables should come
+                # first) and combine metric notes
+                existing_entry["derivatives"] = derivatives + existing_entry["derivatives"]
+                if metric_note and metric_note not in existing_entry.get("metric_note", ""):
+                    existing_entry["metric_note"] = metric_note + existing_entry.get("metric_note", "")
+                existing_entry["source_paths"] = existing_entry.get("source_paths", []) + tsv_paths
+            else:
+                metrics_payload[payload_key].append(
+                    {
+                        "run_label": run_label,
+                        "derivatives": derivatives,
+                        "metric_note": metric_note,
+                        "source_paths": tsv_paths,
+                    }
+                )
+
+    # ── Determine which BIDS modalities are present ─────────────────────
+    # Use the folder-based BIDS modality from derivatives (calculation/meg/
+    # vs calculation/eeg/) rather than channel-type inference from figure names.
+    # This correctly distinguishes:
+    #   Scenario 1: MEG-only datasets → only 'meg' folder exists
+    #   Scenario 2: MEG recordings with embedded EEG channels → only 'meg' folder,
+    #               but EEG-channel derivatives (e.g. _eeg_meg.tsv) are present
+    #   Scenario 3: True multimodal datasets → both 'meg' and 'eeg' folders exist
+
+    # Collect the set of BIDS modalities across all raw entity names for this sub.
+    # Map using run_labels (which payload entries use), not raw_entity_names.
+    bids_modalities_per_run_label: Dict[str, str] = {}
+    for raw_entity_name in existing_raws_per_sub:
+        raw_derivs = [d for d in derivs_to_plot if d.subject == sub and d.raw_entity_name == raw_entity_name]
+        # All derivs for a given raw entity come from the same BIDS modality folder
+        modalities_found = {d.bids_modality for d in raw_derivs if d.bids_modality != 'unknown'}
+        if len(modalities_found) == 1:
+            bids_mod = modalities_found.pop()
+        elif 'meg' in modalities_found:
+            bids_mod = 'meg'
+        elif 'eeg' in modalities_found:
+            bids_mod = 'eeg'
+        else:
+            bids_mod = 'unknown'
+        rl = run_tab_labels.get(raw_entity_name, _human_run_label(raw_entity_name))
+        bids_modalities_per_run_label[rl] = bids_mod
+
+    bids_has_meg = 'meg' in bids_modalities_per_run_label.values()
+    bids_has_eeg = 'eeg' in bids_modalities_per_run_label.values()
+
+    # Detect if MEG recordings contain embedded EEG channel derivatives
+    # (i.e. BIDS modality is 'meg' but some derivatives have EEG channel type)
+    def _has_channel_type_in_payload(payload, ch_type_keys):
+        """Check if any derivative in the payload has the given channel types."""
+        for entries in payload.values():
+            for entry in entries:
+                for deriv in entry.get("derivatives", []):
+                    if _infer_derivative_channel_type(deriv) in ch_type_keys:
+                        return True
+        return False
+
+    def _filter_payload_by_channel_type(payload, keep_keys):
+        """Return a copy of metrics_payload keeping only derivatives of given ch types."""
+        from copy import deepcopy
+        filtered = defaultdict(list)
+        for metric_key, entries in payload.items():
+            for entry in entries:
+                kept_derivs = [
+                    d for d in entry.get("derivatives", [])
+                    if _infer_derivative_channel_type(d) in keep_keys
+                ]
+                if kept_derivs or entry.get("metric_note"):
+                    new_entry = deepcopy(entry)
+                    new_entry["derivatives"] = kept_derivs
+                    filtered[metric_key].append(new_entry)
+        return filtered
+
+    def _filter_payload_by_runs(payload, run_labels_set):
+        """Return a copy of metrics_payload keeping only entries matching run labels."""
+        from copy import deepcopy
+        filtered = defaultdict(list)
+        for metric_key, entries in payload.items():
+            for entry in entries:
+                if entry["run_label"] in run_labels_set:
+                    filtered[metric_key].append(deepcopy(entry))
+        return filtered
+
+    # Always emit per-modality HTMLs when that modality has data
+    report_output_folders: List[Path] = []
+
+    if bids_has_meg:
+        # Collect run_labels belonging to MEG BIDS modality
+        meg_bids_run_labels = {
+            rl for rl, mod in bids_modalities_per_run_label.items() if mod == 'meg'
+        }
+        meg_payload = _filter_payload_by_runs(metrics_payload, meg_bids_run_labels)
+
+        # Check if this MEG payload has embedded EEG channel derivatives
+        meg_has_embedded_eeg = _has_channel_type_in_payload(meg_payload, {"EEG"})
+
+        # For Scenario 2 (MEG with embedded EEG): include ALL channel types
+        # in the MEG report. The EEG data will appear as an "EEG" tab within
+        # the metric subtabs (alongside MAG and GRAD tabs).
+        # We keep the full payload — no channel-type filtering needed, because
+        # _build_metric_run_panel already organizes derivs into MAG/GRAD/EEG tabs.
+
+        meg_overview = [item for item in overview_payload if item["run_label"] in meg_bids_run_labels]
+        meg_summary = [item for item in summary_payload if item["run_label"] in meg_bids_run_labels]
+
+        meg_html = _build_subject_report_html(
+            subject=sub,
+            dataset_name=dataset_name,
+            metrics_payload=meg_payload,
+            overview_payload=meg_overview,
+            summary_payload=meg_summary,
+            embedded_eeg_note=meg_has_embedded_eeg,
+        )
+        meg_folder = reports_root / "meg" / f"sub-{sub}"
+        meg_folder.mkdir(parents=True, exist_ok=True)
+        meg_path = meg_folder / f"sub-{sub}_desc-subject_qa_report_meg.html"
+        meg_path.write_text(meg_html, encoding="utf-8")
+        report_output_folders.append(meg_folder)
+
+    if bids_has_eeg:
+        # Only include runs that truly belong to the EEG BIDS modality folder
+        eeg_bids_run_labels = {
+            rl for rl, mod in bids_modalities_per_run_label.items() if mod == 'eeg'
+        }
+        eeg_payload = _filter_payload_by_runs(metrics_payload, eeg_bids_run_labels)
+
+        eeg_overview = [item for item in overview_payload if item["run_label"] in eeg_bids_run_labels]
+        eeg_summary = [item for item in summary_payload if item["run_label"] in eeg_bids_run_labels]
+        eeg_html = _build_subject_report_html(
+            subject=sub,
+            dataset_name=dataset_name,
+            metrics_payload=eeg_payload,
+            overview_payload=eeg_overview,
+            summary_payload=eeg_summary,
+        )
+        eeg_folder = reports_root / "eeg" / f"sub-{sub}"
+        eeg_folder.mkdir(parents=True, exist_ok=True)
+        eeg_path = eeg_folder / f"sub-{sub}_desc-subject_qa_report_eeg.html"
+        eeg_path.write_text(eeg_html, encoding="utf-8")
+        report_output_folders.append(eeg_folder)
+
+    # If neither BIDS modality was detected (e.g. only ALL-type derivs or unknown),
+    # fall back to a single combined report
+    if not bids_has_meg and not bids_has_eeg:
+        report_html = _build_subject_report_html(
+            subject=sub,
+            dataset_name=dataset_name,
+            metrics_payload=metrics_payload,
+            overview_payload=overview_payload,
+            summary_payload=summary_payload,
+        )
+        subject_folder = reports_root / f"sub-{sub}"
+        subject_folder.mkdir(parents=True, exist_ok=True)
+        report_path = subject_folder / f"sub-{sub}_desc-subject_qa_report_meg.html"
+        report_path.write_text(report_html, encoding="utf-8")
+        report_output_folders.append(subject_folder)
+
+    # ── Write per-subject metric log file ────────────────────────────────
+    _write_subject_metric_log(
+        log_folders=report_output_folders,
         subject=sub,
-        dataset_name=dataset_name,
-        metrics_payload=metrics_payload,
-        overview_payload=overview_payload,
-        summary_payload=summary_payload,
+        metric_log=metric_log,
+        has_meg=bids_has_meg,
+        has_eeg=bids_has_eeg,
     )
-
-    subject_folder = reports_root / f"sub-{sub}"
-    subject_folder.mkdir(parents=True, exist_ok=True)
-    report_path = subject_folder / f"sub-{sub}_desc-subject_qa_report_meg.html"
-    report_path.write_text(report_html, encoding="utf-8")
     return
 
 
@@ -2822,7 +3296,8 @@ def make_plots_meg_qc(
     # general PSD report (``PSDs``) can gather all derivatives at once.  This
     # prevents the loss of the ``PSDs`` report when only the noise/waves
     # derivatives are present in the dataset.
-    psd_related = {'PSDnoiseMag', 'PSDnoiseGrad', 'PSDwavesMag', 'PSDwavesGrad'}
+    psd_related = {'PSDnoiseMag', 'PSDnoiseGrad', 'PSDnoiseEeg',
+                    'PSDwavesMag', 'PSDwavesGrad', 'PSDwavesEeg'}
     if psd_related.intersection(all_metrics):
         all_metrics = [m for m in all_metrics if m not in psd_related]
         if 'PSDs' not in all_metrics:
@@ -2838,7 +3313,9 @@ def make_plots_meg_qc(
         'PtPsManual': 'PtPsManual',
         'PtPsAuto': 'PtPsAuto',
         'ECGs': 'ECGs',
+        'ECGchannel': 'ECGs',
         'EOGs': 'EOGs',
+        'EOGchannel': 'EOGs',
         'Head': 'Head',
         'Muscle': 'Muscle',
         'RawInfo': 'RawInfo',
@@ -2846,8 +3323,9 @@ def make_plots_meg_qc(
         'SimpleMetrics': 'SimpleMetrics',
     }
     all_metrics = [valid_metrics[m] for m in all_metrics if m in valid_metrics]
-    # Preserve order while removing duplicates
-    #all_metrics = list(dict.fromkeys(all_metrics))
+    # Preserve order while removing duplicates (e.g. ECGchannel and ECGs both
+    # map to ECGs — without dedup the metric would be processed twice).
+    all_metrics = list(dict.fromkeys(all_metrics))
 
     # Now store it in chosen_entities as a list
     chosen_entities = {
@@ -2860,13 +3338,14 @@ def make_plots_meg_qc(
 
     # And now you can append or pop, etc.
     chosen_entities['METRIC'].append('stimulus')
+    chosen_entities['METRIC'].append('EventSummary')
     chosen_entities['METRIC'].append('RawInfo')
     chosen_entities['METRIC'].append('ReportStrings')
     # Ensure SimpleMetrics is always present so that summary reports can be built
     chosen_entities['METRIC'].append('SimpleMetrics')
 
     # 5) Define a simple plot_settings. Example: always 'mag' and 'grad'
-    plot_settings = {'m_or_g': ['mag', 'grad']}
+    plot_settings = {'m_or_g': ['mag', 'grad', 'eeg']}
 
     print('___MEGqc___: CHOSEN entities to plot:', chosen_entities)
     print('___MEGqc___: CHOSEN settings:', plot_settings)
@@ -2881,7 +3360,7 @@ def make_plots_meg_qc(
             query_args = {
                 'subj': chosen_entities['subject'],
                 'task': chosen_entities['task'],
-                'suffix': 'meg',
+                'suffix': ['meg', 'eeg'],
                 'extension': ['tsv', 'json', 'fif'],
                 'return_type': 'filename',
                 'desc': '',
@@ -2891,8 +3370,9 @@ def make_plots_meg_qc(
             # If the user (now "all") had multiple possible descs for PSDs, ECGs, etc.
             if metric == 'PSDs':
                 # Include all PSD derivatives (noise and waves) so the PSD report is
-                # generated correctly.
-                query_args['desc'] = ['PSDs', 'PSDnoiseMag', 'PSDnoiseGrad', 'PSDwavesMag', 'PSDwavesGrad']
+                # generated correctly — cover MAG, GRAD, and EEG variants.
+                query_args['desc'] = ['PSDs', 'PSDnoiseMag', 'PSDnoiseGrad', 'PSDnoiseEeg',
+                                      'PSDwavesMag', 'PSDwavesGrad', 'PSDwavesEeg']
             elif metric == 'ECGs':
                 query_args['desc'] = ['ECGchannel', 'ECGs']
             elif metric == 'EOGs':
@@ -2906,7 +3386,13 @@ def make_plots_meg_qc(
 
             with temporary_dataset_base(query_dataset, query_base):
                 tsv_paths = list(query_dataset.query(**query_args))
-            tsvs_to_plot_by_metric[metric] = sorted(tsv_paths)
+            # Sort by basename so the order matches entity-object sorting
+            # (which sorts by k['name'], also a basename). Using full-path
+            # sort can cause mismatches in multimodal datasets where
+            # directory structure (ses-eeg/ vs ses-meg/) differs from
+            # filename ordering.
+            tsvs_to_plot_by_metric[metric] = sorted(
+                tsv_paths, key=lambda p: os.path.basename(str(p)))
 
             # Now query object form for ancpbids entities
             query_args['return_type'] = 'object'
@@ -2926,8 +3412,8 @@ def make_plots_meg_qc(
                 raise ValueError(f'Different number of tsvs and entities for metric: {tsv_metric}')
 
             for tsv_path, deriv_entities in zip(tsv_paths, entity_vals):
-                file_name_in_path = os.path.basename(tsv_path).split('_meg.')[0]
-                file_name_in_obj = deriv_entities['name'].split('_meg.')[0]
+                file_name_in_path = re.split(r'_(?:meg|eeg)\.', os.path.basename(tsv_path))[0]
+                file_name_in_obj = re.split(r'_(?:meg|eeg)\.', deriv_entities['name'])[0]
 
                 if file_name_in_obj not in file_name_in_path:
                     raise ValueError('Different names in tsvs_to_plot_by_metric and entities_per_file')

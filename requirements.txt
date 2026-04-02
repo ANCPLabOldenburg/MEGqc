@@ -6,6 +6,8 @@ plotly==5.24.1
 joblib==1.4.2
 pyqt6
 pyqt6-plugins==6.4.2.2.3; platform_system != "Darwin"
+pyqtgraph>=0.13.3
+PyQt6-WebEngine>=6.6.0
 numba==0.58.1
 psutil==5.9.8
 matplotlib==3.8.4

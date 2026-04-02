@@ -41,7 +41,7 @@ from meg_qc.calculation.meg_qc_pipeline import resolve_analysis_root
 
 
 MODULES = ("STD", "PTP", "PSD", "ECG", "EOG", "Muscle")
-CH_TYPES = ("mag", "grad")
+CH_TYPES = ("mag", "grad", "eeg")
 MAX_POINTS_ECDF = 2500
 MAX_POINTS_PROFILE = 2000
 MAX_POINTS_VIOLIN = 3000
@@ -68,6 +68,7 @@ class RunMeta:
     acquisition: str = "n/a"
     recording: str = "n/a"
     processing: str = "n/a"
+    bids_suffix: str = "n/a"  # BIDS modality suffix: "meg" or "eeg" — from derivative filename
 
 
 @dataclass
@@ -241,13 +242,21 @@ def _parse_entities_from_run_key(run_key: str) -> RunMeta:
     )
 
 
-def _extract_run_and_desc(file_name: str) -> Tuple[Optional[str], Optional[str]]:
-    match = re.search(r"_desc-([^_]+)_meg\.tsv$", file_name, flags=re.IGNORECASE)
+def _extract_run_and_desc(file_name: str) -> Tuple[Optional[str], Optional[str], Optional[str]]:
+    """Return (run_key, desc, bids_suffix) from a derivative TSV filename.
+
+    The BIDS suffix ('meg' or 'eeg') is the authoritative modality indicator
+    and must be used to route channel-type data into the correct accumulator.
+    EEG channels embedded inside a MEG recording (_meg.tsv) must NOT be
+    treated as EEG-modality data.
+    """
+    match = re.search(r"_desc-([^_]+)_(meg|eeg)\.tsv$", file_name, flags=re.IGNORECASE)
     if not match:
-        return None, None
+        return None, None, None
     desc = match.group(1)
+    bids_suffix = match.group(2).lower()  # "meg" or "eeg"
     run_key = file_name.split("_desc-")[0]
-    return run_key, desc
+    return run_key, desc, bids_suffix
 
 
 def _discover_run_records(calculation_dir: Path) -> Dict[str, RunRecord]:
@@ -261,21 +270,27 @@ def _discover_run_records(calculation_dir: Path) -> Dict[str, RunRecord]:
     run_meta: Dict[str, RunMeta] = {}
 
     for tsv_path in calculation_dir.rglob("*.tsv"):
-        run_key, desc = _extract_run_and_desc(tsv_path.name)
+        run_key, desc, bids_suffix = _extract_run_and_desc(tsv_path.name)
         if run_key is None or desc is None:
             continue
-        tmp_files[run_key][desc].append(tsv_path)
-        if run_key not in run_meta:
-            run_meta[run_key] = _parse_entities_from_run_key(run_key)
+        # Use a composite key so that a MEG recording and an EEG recording
+        # with the same BIDS entities (sub/ses/task/run) are kept as separate
+        # RunRecords and routed to the correct modality accumulator.
+        full_key = f"{run_key}_{bids_suffix}"
+        tmp_files[full_key][desc].append(tsv_path)
+        if full_key not in run_meta:
+            meta = _parse_entities_from_run_key(run_key)
+            meta.bids_suffix = bids_suffix
+            run_meta[full_key] = meta
 
     run_records: Dict[str, RunRecord] = {}
-    for run_key, desc_map in tmp_files.items():
-        record = RunRecord(meta=run_meta[run_key], files={})
+    for full_key, desc_map in tmp_files.items():
+        record = RunRecord(meta=run_meta[full_key], files={})
         for desc, paths in desc_map.items():
             # Keep only the newest file for a given run + desc.
             chosen = sorted(paths, key=lambda p: p.stat().st_mtime)[-1]
             record.files[desc] = chosen
-        run_records[run_key] = record
+        run_records[full_key] = record
 
     return run_records
 
@@ -290,7 +305,10 @@ def _read_tsv(path: Path) -> Optional[pd.DataFrame]:
     try:
         with warnings.catch_warnings():
             warnings.simplefilter("ignore", DtypeWarning)
-            return pd.read_csv(path, sep="\t", low_memory=False, dtype=str)
+            df = pd.read_csv(path, sep="\t", low_memory=False, dtype=str)
+        # Drop stale index column from old derivatives saved with index=True
+        df = df.drop(columns=[c for c in df.columns if c.startswith("Unnamed:")], errors="ignore")
+        return df
     except Exception:
         return None
 
@@ -579,6 +597,8 @@ def _parse_muscle_ch_type(value: str) -> Optional[str]:
     value = str(value).lower()
     if "grad" in value:
         return "grad"
+    if "eeg" in value or "ecog" in value or "seeg" in value or "ieeg" in value:
+        return "eeg"
     if "mag" in value:
         return "mag"
     return None
@@ -600,7 +620,12 @@ def _load_muscle_scores(path: Path) -> Dict[str, np.ndarray]:
         if not ch_non_na.empty:
             ch_type = _parse_muscle_ch_type(str(ch_non_na.iloc[0]))
     if ch_type is None:
-        ch_type = "mag"
+        # Infer from file path: check if file is under an eeg/ subfolder
+        path_str = str(path).replace("\\", "/").lower()
+        if "/eeg/" in path_str or "_eeg." in path_str or "_eeg_" in path_str:
+            ch_type = "eeg"
+        else:
+            ch_type = "mag"  # Default to mag for MEG data
 
     return {ch_type: scores}
 
@@ -608,9 +633,7 @@ def _load_muscle_scores(path: Path) -> Dict[str, np.ndarray]:
 def _condition_label(meta: RunMeta) -> str:
     parts = []
     if meta.task != "n/a":
-        parts.append(f"task={meta.task}")
-    if meta.condition != "n/a":
-        parts.append(f"condition={meta.condition}")
+        parts.append(meta.task)
     if not parts:
         return "all recordings"
     return ", ".join(parts)
@@ -959,13 +982,13 @@ def _epoch_consistency_notes(
             continue
         if len(counts) == 1:
             notes[cond] = (
-                f"Epoch counts are aligned across recordings in this task/condition "
+                f"Epoch counts are aligned across recordings in this task "
                 f"(n_epochs={counts[0]})."
             )
         else:
             span = ", ".join(str(c) for c in counts)
             notes[cond] = (
-                f"Epoch counts vary across recordings in this task/condition ({span}). "
+                f"Epoch counts vary across recordings in this task ({span}). "
                 "Matrices are padded during aggregation; padded cells are excluded "
                 "from matrix statistics."
             )
@@ -1015,8 +1038,8 @@ def _make_ecdf_figure(values_by_condition: Dict[str, List[float]], title: str, x
         xaxis_title=x_title,
         yaxis_title="ECDF",
         template="plotly_white",
-        legend={"orientation": "h", "yanchor": "bottom", "y": 1.02, "xanchor": "left", "x": 0},
-        margin={"l": 55, "r": 20, "t": 65, "b": 50},
+        legend={"orientation": "h", "yanchor": "bottom", "y": 1.02, "xanchor": "left", "x": 0, "font": {"size": 11}},
+        margin={"l": 55, "r": 30, "t": 50, "b": 50},
     )
     return fig
 
@@ -1049,11 +1072,12 @@ def plot_violin_channel_distribution(
         return None
     fig.update_layout(
         title={"text": title, "x": 0.5},
-        xaxis_title="Task / condition",
+        xaxis_title="Task",
         yaxis_title=y_title,
         template="plotly_white",
         violinmode="group",
-        margin={"l": 55, "r": 20, "t": 65, "b": 50},
+        legend={"orientation": "h", "yanchor": "bottom", "y": 1.02, "xanchor": "left", "x": 0, "font": {"size": 11}},
+        margin={"l": 55, "r": 30, "t": 50, "b": 50},
     )
     return fig
 
@@ -1285,12 +1309,13 @@ def plot_heatmap_sorted_channels_windows(
         else:
             base_summary = np.nanmedian(base, axis=1)
     order = np.argsort(np.nan_to_num(base_summary, nan=-np.inf))[::-1]
+    natural_order = np.arange(n_rows, dtype=int)
 
     row_keep = _downsample_indices(n_rows, MAX_HEATMAP_CHANNELS)
     col_keep = _downsample_indices(n_cols, MAX_HEATMAP_WINDOWS)
 
-    def _payload_for(arr: np.ndarray) -> Dict[str, np.ndarray]:
-        arr_sorted = arr[order, :]
+    def _payload_for(arr: np.ndarray, ch_order: np.ndarray) -> Dict[str, np.ndarray]:
+        arr_sorted = arr[ch_order, :]
         z = arr_sorted[row_keep][:, col_keep]
         x = np.arange(n_cols, dtype=int)[col_keep]
         y = np.arange(n_rows, dtype=int)[row_keep]
@@ -1311,7 +1336,7 @@ def plot_heatmap_sorted_channels_windows(
             right_q95 = np.nanquantile(arr_sorted[row_keep, :], 0.95, axis=1)
             right_mean = np.nanmean(arr_sorted[row_keep, :], axis=1)
 
-        sorted_names = base_channel_names[order]
+        sorted_names = base_channel_names[ch_order]
         row_names = sorted_names[row_keep]
         heat_custom = np.tile(np.asarray(row_names, dtype=object)[:, None], (1, x.size))
 
@@ -1335,7 +1360,9 @@ def plot_heatmap_sorted_channels_windows(
             "right_mean": right_mean,
         }
 
-    payload_by_label = {label: _payload_for(padded[label]) for label in ordered_labels}
+    payload_by_label = {label: _payload_for(padded[label], order) for label in ordered_labels}
+    # Natural-order payloads for the channel order toggle.
+    nat_payload_by_label = {label: _payload_for(padded[label], natural_order) for label in ordered_labels}
     z_all = np.concatenate(
         [vals["z"][np.isfinite(vals["z"])] for vals in payload_by_label.values() if np.any(np.isfinite(vals["z"]))],
         axis=0,
@@ -1574,6 +1601,48 @@ def plot_heatmap_sorted_channels_windows(
         )
     )
 
+    # ── Channel order toggle (sorted vs natural) ─────────────────────────
+    # The active (default) variant is whichever label is currently rendered.
+    active_label = ordered_labels[0]
+    sorted_full = _variant_restyle_args(payload_by_label[active_label])
+    natural_full = _variant_restyle_args(nat_payload_by_label[active_label])
+    menus.append(
+        dict(
+            type="buttons",
+            direction="right",
+            x=0.00,
+            y=-0.74,
+            xanchor="left",
+            yanchor="top",
+            showactive=True,
+            bgcolor="#FFF8E1",
+            bordercolor="#D4A017",
+            borderwidth=1.8,
+            font=dict(size=14, color="#7B6B1A"),
+            pad=dict(r=16, t=10, l=14, b=10),
+            buttons=[
+                dict(
+                    label="   Channels: Sorted (high→low)   ",
+                    method="update",
+                    args=[
+                        sorted_full,
+                        {"yaxis3.title.text": "Sorted channel index"},
+                        trace_indices,
+                    ],
+                ),
+                dict(
+                    label="   Channels: Natural order   ",
+                    method="update",
+                    args=[
+                        natural_full,
+                        {"yaxis3.title.text": "Channel index (original)"},
+                        trace_indices,
+                    ],
+                ),
+            ],
+        )
+    )
+
     fig.update_xaxes(showticklabels=False, row=1, col=1)
     fig.update_yaxes(title_text=side_title, row=1, col=1, automargin=True, title_standoff=10)
     fig.update_xaxes(title_text="Epoch index", row=2, col=1)
@@ -1586,9 +1655,9 @@ def plot_heatmap_sorted_channels_windows(
     fig.update_layout(
         title={"text": title, "x": 0.5, "y": 0.97, "xanchor": "center", "yanchor": "top"},
         template="plotly_white",
-        margin={"l": 70, "r": 55, "t": 165, "b": 340},
-        height=980,
-        legend={"orientation": "h", "yanchor": "bottom", "y": 1.06, "xanchor": "left", "x": 0},
+        margin={"l": 70, "r": 55, "t": 165, "b": 400},
+        height=1020,
+        legend={"orientation": "h", "yanchor": "bottom", "y": 1.06, "xanchor": "left", "x": 0, "font": {"size": 11}},
         coloraxis={
             "colorscale": "Viridis",
             "cmin": float(zmin),
@@ -1961,31 +2030,22 @@ def _figure_to_div(
         return "<p>No distribution is available for this section.</p>"
     fig_out = go.Figure(fig)
 
-    # Global title-spacing guard (legend coordinates are preserved as authored).
-    has_title = bool(getattr(getattr(fig_out.layout, "title", None), "text", None))
-    legend_obj = getattr(fig_out.layout, "legend", None)
-    has_legend = legend_obj is not None
-    legend_orientation = str(getattr(legend_obj, "orientation", "") or "").lower() if has_legend else ""
-    has_horizontal_legend = legend_orientation == "h"
+    # ── Zone 1: extract title into an independent HTML block ─────────
+    import html as _html_mod
+    title_html = ""
+    fig_title = fig_out.layout.title
+    if fig_title:
+        title_text = ""
+        if isinstance(fig_title, str):
+            title_text = fig_title
+        else:
+            title_text = str(getattr(fig_title, "text", "") or "")
+        if title_text:
+            title_html = f"<div class='fig-title'>{_html_mod.escape(title_text)}</div>"
+            fig_out.update_layout(title=None)
 
-    if has_title:
-        title_json = fig_out.layout.title.to_plotly_json() if fig_out.layout.title is not None else {}
-        title_pad = dict(title_json.get("pad", {}))
-        title_pad["b"] = max(int(title_pad.get("b", 0) or 0), 34)
-        title_pad["t"] = max(int(title_pad.get("t", 0) or 0), 10)
-        title_json["pad"] = title_pad
-        title_json.setdefault("yanchor", "top")
-        title_json.setdefault("y", 0.98)
-        fig_out.update_layout(title=title_json)
-
-    margin_json = fig_out.layout.margin.to_plotly_json() if fig_out.layout.margin is not None else {}
-    top_margin = int(margin_json.get("t", 65) or 65)
-    if has_title:
-        top_margin = max(top_margin, 102)
-    if has_horizontal_legend:
-        top_margin = max(top_margin, 120)
-    margin_json["t"] = top_margin
-    fig_out.update_layout(margin=margin_json)
+    # ── Zone 2 (legend) stays inside the Plotly figure at y>1 ────────
+    # ── Zone 3 (plot) occupies the remaining Plotly area ─────────────
 
     # Universal controls: axis-label sizing for all axis-bearing plots.
     if include_axis_size_control:
@@ -1996,7 +2056,7 @@ def _figure_to_div(
     if height is None or not np.isfinite(height):
         height = 640
     height_px = f"{int(max(420, float(height)))}px"
-    return _register_lazy_figure(fig_out, height_px=height_px, controls=controls)
+    return title_html + _register_lazy_figure(fig_out, height_px=height_px, controls=controls)
 
 
 def _trace_numeric(values) -> Optional[np.ndarray]:
@@ -2222,7 +2282,7 @@ def _figure_block(
         f"<div id='{toggle_id}-raw' class='fig-view active'>{raw_div}</div>"
         f"<div id='{toggle_id}-norm' class='fig-view'>{norm_div}</div>"
         f"<p class='fig-note'><strong>How to interpret:</strong> {detailed_note} "
-        "The normalized view applies a robust scaling (median/IQR) to improve comparability of shape across conditions without changing rank structure.</p>"
+        "The normalized view applies a robust scaling (median/IQR) to improve comparability of shape across tasks without changing rank structure.</p>"
     )
 
 
@@ -2387,7 +2447,7 @@ def _summary_table_html(acc: ChTypeAccumulator) -> str:
         condition_rows.append(f"<tr><td>{cond}</td><td>{count}</td></tr>")
     condition_table = (
         "<table>"
-        "<thead><tr><th>Task / condition</th><th>Runs</th></tr></thead>"
+        "<thead><tr><th>Task</th><th>Recordings</th></tr></thead>"
         f"<tbody>{''.join(condition_rows)}</tbody>"
         "</table>"
     )
@@ -2397,10 +2457,10 @@ def _summary_table_html(acc: ChTypeAccumulator) -> str:
         "<div class='tile'>"
         f"<h3>Dataset summary</h3>"
         f"<p><strong>N subjects:</strong> {len(acc.subjects)}</p>"
-        f"<p><strong>N runs:</strong> {acc.run_count}</p>"
+        f"<p><strong>N recordings:</strong> {acc.run_count}</p>"
         "</div>"
         "<div class='tile'>"
-        "<h3>Runs per task / condition</h3>"
+        "<h3>Recordings per task</h3>"
         f"{condition_table}"
         "</div>"
         "<div class='tile'>"
@@ -2621,9 +2681,7 @@ def _run_rows_dataframe(rows: List[RunMetricRow]) -> pd.DataFrame:
     def _cond_display(row: pd.Series) -> str:
         parts = []
         if row["task"] != "n/a":
-            parts.append(f"task={row['task']}")
-        if row["condition"] != "n/a":
-            parts.append(f"condition={row['condition']}")
+            parts.append(row["task"])
         return ", ".join(parts) if parts else "all recordings"
 
     df["condition_label"] = df.apply(_cond_display, axis=1)
@@ -2723,7 +2781,7 @@ def plot_subject_condition_violin(
         return None
     fig.update_layout(
         title={"text": title, "x": 0.5},
-        xaxis_title="Task / condition",
+        xaxis_title="Task",
         yaxis_title=y_label,
         template="plotly_white",
         violinmode="group",
@@ -2756,15 +2814,15 @@ def plot_run_fingerprint_scatter(
         dcond = data.loc[data["condition_label"] == cond].copy()
         if dcond.empty:
             continue
-        # One trace per condition enables native legend filtering (click to hide
-        # all points for that task/condition).
+        # One trace per task label enables native legend filtering (click to hide
+        # all points for that task).
         fig.add_trace(
             go.Scattergl(
                 x=dcond[x_col],
                 y=dcond[y_col],
                 mode="markers",
                 name=cond,
-                legendgroup=f"condition-{cond}",
+                legendgroup=f"task-{cond}",
                 marker={
                     "size": 8,
                     "symbol": symbol_map[cond],
@@ -2774,7 +2832,7 @@ def plot_run_fingerprint_scatter(
                     "showscale": False,
                 },
                 customdata=np.stack([dcond["hover_entities"]], axis=-1),
-                hovertemplate="%{customdata[0]}<br>condition="
+                hovertemplate="%{customdata[0]}<br>task="
                 + cond
                 + "<br>x=%{x:.3g}<br>y=%{y:.3g}<extra></extra>",
                 showlegend=True,
@@ -2788,8 +2846,8 @@ def plot_run_fingerprint_scatter(
         xaxis_title=x_label,
         yaxis_title=y_label,
         template="plotly_white",
-        margin={"l": 55, "r": 20, "t": 65, "b": 50},
-        legend={"orientation": "h", "yanchor": "bottom", "y": 1.02, "xanchor": "left", "x": 0},
+        margin={"l": 55, "r": 30, "t": 50, "b": 50},
+        legend={"orientation": "h", "yanchor": "bottom", "y": 1.02, "xanchor": "left", "x": 0, "font": {"size": 11}},
     )
     return fig
 
@@ -2932,7 +2990,7 @@ def plot_subject_condition_effect(
                 line={"width": 1.2, "color": color_map[subject]},
                 marker={"size": 6},
                 showlegend=False,
-                hovertemplate=f"sub={subject}<br>condition=%{{x}}<br>value=%{{y:.3g}}<extra></extra>",
+                hovertemplate=f"sub={subject}<br>task=%{{x}}<br>value=%{{y:.3g}}<extra></extra>",
             )
         )
 
@@ -2940,7 +2998,7 @@ def plot_subject_condition_effect(
         return None
     fig.update_layout(
         title={"text": title, "x": 0.5},
-        xaxis_title="Task / condition",
+        xaxis_title="Task",
         yaxis_title=y_label,
         template="plotly_white",
         margin={"l": 55, "r": 20, "t": 65, "b": 50},
@@ -3463,6 +3521,49 @@ def _encapsulate_updatemenus_panel(fig: go.Figure) -> None:
     )
 
 
+# ---------------------------------------------------------------------------
+# Legend layout helper — guarantees title is never covered
+# ---------------------------------------------------------------------------
+
+# Entries ≤ this: legend to the right of the plot (vertical, outside).
+# Entries >  this: legend below the plot with extra bottom margin.
+# In both cases the top margin is fixed so the title has its own space.
+
+
+def _safe_legend_layout(n_entries: int, *, extra_groupclick: Optional[str] = None) -> dict:
+    """Return Plotly ``legend`` + ``margin`` + ``height`` kwargs for
+    non-overlapping title / legend / plot zones.
+
+    The legend is **always horizontal**, placed above the plot area with
+    ``y > 1`` so it lives in the top-margin band.  The top margin grows
+    dynamically to accommodate multi-row wrapping.  The title is rendered
+    as independent HTML above the figure (see ``_figure_to_div``).
+    """
+    entries_per_row = 3  # conservative for typical label widths
+    n_rows = max(1, -(-n_entries // entries_per_row))
+    legend_height_px = n_rows * 26 + 20
+    margin_t = max(50, legend_height_px)
+
+    d: dict = {
+        "orientation": "h",
+        "yanchor": "bottom",
+        "y": 1.02,
+        "xanchor": "left",
+        "x": 0.0,
+        "font": {"size": 11},
+        "itemsizing": "constant",
+        "tracegroupgap": 4,
+    }
+    if extra_groupclick:
+        d["groupclick"] = extra_groupclick
+
+    return {
+        "legend": d,
+        "margin": {"l": 55, "r": 30, "t": margin_t, "b": 60},
+        "height": max(620, margin_t + 60 + 400),
+    }
+
+
 def plot_histogram_distribution(
     values_by_group: Dict[str, List[float]],
     title: str,
@@ -3517,14 +3618,15 @@ def plot_histogram_distribution(
         )
     if not fig.data:
         return None
+    n_legend_entries = len([t for t in fig.data if getattr(t, "showlegend", False)])
+    layout_kw = _safe_legend_layout(max(n_legend_entries, len(sorted(values_by_group))))
     fig.update_layout(
         title={"text": title, "x": 0.5},
         xaxis_title=x_title,
         yaxis_title="Density",
         barmode="overlay",
         template="plotly_white",
-        margin={"l": 55, "r": 20, "t": 65, "b": 50},
-        legend={"orientation": "h", "yanchor": "bottom", "y": 1.02, "xanchor": "left", "x": 0},
+        **layout_kw,
     )
     _attach_distribution_style_controls(fig, default_line_width=2.6, default_marker_size=8.0)
     return fig
@@ -3549,13 +3651,13 @@ def plot_density_distribution(
         fig.add_trace(go.Scatter(x=x, y=y, mode="lines", name=f"{label} (n={vals.size})", line={"width": 2.6}))
     if not fig.data:
         return None
+    layout_kw = _safe_legend_layout(len(sorted(values_by_group)))
     fig.update_layout(
         title={"text": title, "x": 0.5},
         xaxis_title=x_title,
         yaxis_title="Density",
         template="plotly_white",
-        margin={"l": 55, "r": 20, "t": 65, "b": 50},
-        legend={"orientation": "h", "yanchor": "bottom", "y": 1.02, "xanchor": "left", "x": 0},
+        **layout_kw,
     )
     _attach_distribution_style_controls(fig, default_line_width=2.6, default_marker_size=8.0)
     return fig
@@ -3649,7 +3751,7 @@ def plot_violin_with_subject_jitter(
             tasks = sorted({t for t in group["task"].tolist() if t != "n/a"})
             hover = (
                 f"sub={subject}"
-                f"<br>condition={label}"
+                f"<br>task={label}"
                 f"<br>n_recordings={len(group)}"
                 + (f"<br>tasks={', '.join(tasks)}" if tasks else "")
                 + f"<br>value={value:.3g}"
@@ -3666,7 +3768,7 @@ def plot_violin_with_subject_jitter(
             tasks = sorted({t for t in group["task"].tolist() if t != "n/a"})
             hover = (
                 f"sub={subject}"
-                "<br>condition=all tasks"
+                "<br>task=all tasks"
                 f"<br>n_recordings={len(group)}"
                 + (f"<br>tasks={', '.join(tasks)}" if tasks else "")
                 + f"<br>value={value:.3g}"
@@ -3742,20 +3844,13 @@ def plot_violin_with_subject_jitter(
             for level in range(1, 9):
                 side_x_by_level[level].append(x_side_levels[level])
 
+    layout_kw = _safe_legend_layout(len(labels), extra_groupclick="togglegroup")
     fig.update_layout(
         title={"text": title, "x": 0.5},
-        xaxis_title="Task / condition",
+        xaxis_title="Task",
         yaxis_title=y_title,
         template="plotly_white",
-        margin={"l": 55, "r": 20, "t": 65, "b": 50},
-        legend={
-            "orientation": "h",
-            "yanchor": "bottom",
-            "y": 1.02,
-            "xanchor": "left",
-            "x": 0,
-            "groupclick": "togglegroup",
-        },
+        **layout_kw,
     )
     fig.update_xaxes(
         tickmode="array",
@@ -3849,7 +3944,7 @@ def plot_box_with_subject_jitter(
             tasks = sorted({t for t in group["task"].tolist() if t != "n/a"})
             hover = (
                 f"sub={subject}"
-                f"<br>condition={label}"
+                f"<br>task={label}"
                 f"<br>n_recordings={len(group)}"
                 + (f"<br>tasks={', '.join(tasks)}" if tasks else "")
                 + f"<br>value={value:.3g}"
@@ -3866,7 +3961,7 @@ def plot_box_with_subject_jitter(
             tasks = sorted({t for t in group["task"].tolist() if t != "n/a"})
             hover = (
                 f"sub={subject}"
-                "<br>condition=all tasks"
+                "<br>task=all tasks"
                 f"<br>n_recordings={len(group)}"
                 + (f"<br>tasks={', '.join(tasks)}" if tasks else "")
                 + f"<br>value={value:.3g}"
@@ -3942,20 +4037,13 @@ def plot_box_with_subject_jitter(
             for level in range(1, 9):
                 side_x_by_level[level].append(x_side_levels[level])
 
+    layout_kw = _safe_legend_layout(len(labels), extra_groupclick="togglegroup")
     fig.update_layout(
         title={"text": title, "x": 0.5},
-        xaxis_title="Task / condition",
+        xaxis_title="Task",
         yaxis_title=y_title,
         template="plotly_white",
-        margin={"l": 55, "r": 20, "t": 65, "b": 50},
-        legend={
-            "orientation": "h",
-            "yanchor": "bottom",
-            "y": 1.02,
-            "xanchor": "left",
-            "x": 0,
-            "groupclick": "togglegroup",
-        },
+        **layout_kw,
     )
     fig.update_xaxes(
         tickmode="array",
@@ -4132,7 +4220,7 @@ def plot_condition_effect_grid(
                     name=f"sub-{subject}",
                     legendgroup=f"sub-{subject}",
                     showlegend=(show_subject_legend and idx == 0),
-                    hovertemplate=f"sub={subject}<br>condition=%{{x}}<br>value=%{{y:.3g}}<extra></extra>",
+                    hovertemplate=f"sub={subject}<br>task=%{{x}}<br>value=%{{y:.3g}}<extra></extra>",
                 ),
                 row=row_i,
                 col=col_i,
@@ -4149,13 +4237,13 @@ def plot_condition_effect_grid(
                 name="Median subject profile",
                 legendgroup="median-profile",
                 showlegend=(idx == 0),
-                hovertemplate="condition=%{x}<br>median=%{y:.3g}<extra></extra>",
+                hovertemplate="task=%{x}<br>median=%{y:.3g}<extra></extra>",
             ),
             row=row_i,
             col=col_i,
         )
         if row_i == rows:
-            fig.update_xaxes(title_text="Task / condition", row=row_i, col=col_i)
+            fig.update_xaxes(title_text="Task", row=row_i, col=col_i)
         else:
             fig.update_xaxes(title_text="", row=row_i, col=col_i)
 
@@ -4235,7 +4323,7 @@ def plot_condition_effect_single(
                 name=f"sub-{s}",
                 legendgroup=f"sub-{s}",
                 showlegend=show_subject_legend,
-                hovertemplate=f"sub={s}<br>condition=%{{x}}<br>value=%{{y:.3g}}<extra></extra>",
+                hovertemplate=f"sub={s}<br>task=%{{x}}<br>value=%{{y:.3g}}<extra></extra>",
             )
         )
 
@@ -4250,13 +4338,13 @@ def plot_condition_effect_single(
             name="Median subject profile",
             legendgroup="median-profile",
             showlegend=True,
-            hovertemplate="condition=%{x}<br>median=%{y:.3g}<extra></extra>",
+            hovertemplate="task=%{x}<br>median=%{y:.3g}<extra></extra>",
         )
     )
 
     fig.update_layout(
         title={"text": title, "x": 0.5},
-        xaxis_title="Task / condition",
+        xaxis_title="Task",
         yaxis_title=y_label,
         template="plotly_white",
         margin={"l": 62, "r": 22, "t": 78, "b": 80},
@@ -4401,15 +4489,20 @@ def _combine_accumulators(acc_by_type: Dict[str, ChTypeAccumulator]) -> ChTypeAc
     This is intentionally cumulative (channel concatenation), not unit
     harmonization. Matrix-like payloads are row-stacked with epoch padding so
     combined tabs can preserve all available channels from each type.
+
+    Only MEG channel types (mag, grad) are merged here. EEG is excluded
+    because it has different physical units and should not be mixed into the
+    MEG combined view.
     """
+    MEG_ONLY_TYPES = ("mag", "grad")
     combined = ChTypeAccumulator()
     std_runs_by_cond_by_type: Dict[str, Dict[str, List[np.ndarray]]] = {
-        ch: defaultdict(list) for ch in CH_TYPES
+        ch: defaultdict(list) for ch in MEG_ONLY_TYPES
     }
     ptp_runs_by_cond_by_type: Dict[str, Dict[str, List[np.ndarray]]] = {
-        ch: defaultdict(list) for ch in CH_TYPES
+        ch: defaultdict(list) for ch in MEG_ONLY_TYPES
     }
-    for ch_type in CH_TYPES:
+    for ch_type in MEG_ONLY_TYPES:
         if ch_type not in acc_by_type:
             continue
         acc = acc_by_type[ch_type]
@@ -4582,7 +4675,7 @@ def _combine_accumulators(acc_by_type: Dict[str, ChTypeAccumulator]) -> ChTypeAc
         combined.ptp_epoch_counts_by_condition[cond].extend([int(np.asarray(m).shape[1]) for m in mats if np.asarray(m).ndim == 2])
 
     rows = []
-    for ch_type in CH_TYPES:
+    for ch_type in ("mag", "grad"):
         rows.extend(acc_by_type[ch_type].run_rows)
     df = _run_rows_dataframe(rows)
     if not df.empty:
@@ -4603,7 +4696,7 @@ def _build_global_qa_section(acc: ChTypeAccumulator, tab_name: str, amplitude_un
 
     std_violin = plot_violin_channel_distribution(
         acc.std_dist_by_condition,
-        f"STD channel distribution by condition{suffix}",
+        f"STD channel distribution by task{suffix}",
         f"STD summary ({amplitude_unit})",
     )
     std_profile = plot_quantile_band_timecourse(
@@ -4640,7 +4733,7 @@ def _build_global_qa_section(acc: ChTypeAccumulator, tab_name: str, amplitude_un
         color_title=f"STD ({amplitude_unit})",
         interpretation=(
             f"Axes: spatial coordinates from stored channel geometry; color in {amplitude_unit}. "
-            "Each marker is one channel summary aggregated across recordings in this condition (Global QA). "
+            "Each marker is one channel summary aggregated across recordings in this task (Global QA). "
             "Typical appearance: smooth spatial gradients. Suspicious appearance: localized hotspots. "
             "Limitation: Global QA does not identify subjects."
         ),
@@ -4648,7 +4741,7 @@ def _build_global_qa_section(acc: ChTypeAccumulator, tab_name: str, amplitude_un
 
     ptp_violin = plot_violin_channel_distribution(
         acc.ptp_dist_by_condition,
-        f"PtP channel distribution by condition{suffix}",
+        f"PtP channel distribution by task{suffix}",
         f"PtP summary ({amplitude_unit})",
     )
     ptp_profile = plot_quantile_band_timecourse(
@@ -4685,7 +4778,7 @@ def _build_global_qa_section(acc: ChTypeAccumulator, tab_name: str, amplitude_un
         color_title=f"PtP ({amplitude_unit})",
         interpretation=(
             f"Axes: spatial coordinates from stored channel geometry; color in {amplitude_unit}. "
-            "Marker color shows per-channel upper-tail PtP amplitude aggregated across recordings in this condition (Global QA). "
+            "Marker color shows per-channel upper-tail PtP amplitude aggregated across recordings in this task (Global QA). "
             "Typical appearance: moderate spatial spread. Suspicious appearance: persistent hotspots. "
             "Limitation: Global QA does not identify subjects."
         ),
@@ -4697,7 +4790,7 @@ def _build_global_qa_section(acc: ChTypeAccumulator, tab_name: str, amplitude_un
     )
     psd_violin = plot_violin_channel_distribution(
         acc.psd_ratio_by_condition,
-        "Mains relative power distribution by condition",
+        "Mains relative power distribution by task",
         "Mains relative power (unitless)",
     )
     psd_topomaps = _topomap_blocks(
@@ -4706,7 +4799,7 @@ def _build_global_qa_section(acc: ChTypeAccumulator, tab_name: str, amplitude_un
         color_title="Mains ratio",
         interpretation=(
             "Axes: spatial coordinates from stored channel geometry; color is unitless relative power. "
-            "Each marker is one channel aggregated across recordings in this condition (Global QA). "
+            "Each marker is one channel aggregated across recordings in this task (Global QA). "
             "Typical appearance: mild spatial variation. Suspicious appearance: strong localized hotspots. "
             "Limitation: Global QA does not identify subjects."
         ),
@@ -4714,12 +4807,12 @@ def _build_global_qa_section(acc: ChTypeAccumulator, tab_name: str, amplitude_un
 
     ecg_violin = plot_violin_channel_distribution(
         acc.ecg_corr_by_condition,
-        "ECG correlation magnitude distribution by condition",
+        "ECG correlation magnitude distribution by task",
         "|r| (unitless)",
     )
     eog_violin = plot_violin_channel_distribution(
         acc.eog_corr_by_condition,
-        "EOG correlation magnitude distribution by condition",
+        "EOG correlation magnitude distribution by task",
         "|r| (unitless)",
     )
     muscle_profile = plot_quantile_band_timecourse(
@@ -4730,7 +4823,7 @@ def _build_global_qa_section(acc: ChTypeAccumulator, tab_name: str, amplitude_un
     )
     muscle_violin = plot_violin_channel_distribution(
         acc.muscle_scalar_by_condition,
-        "Muscle upper-tail distribution by condition",
+        "Muscle upper-tail distribution by task",
         "Muscle score (z-score, unitless)",
     )
 
@@ -4772,7 +4865,7 @@ def _build_global_qa_section(acc: ChTypeAccumulator, tab_name: str, amplitude_un
         + _figure_block(
             std_violin,
             (
-                f"Y-axis is STD in {amplitude_unit}; x-axis is task/condition. "
+                f"Y-axis is STD in {amplitude_unit}; x-axis is task. "
                 "Each observation represents one channel summarized across epochs for one recording. "
                 "Typical appearance: compact distribution with moderate upper tail. "
                 "Suspicious appearance: heavy upper tail where few channels dominate. Global QA does not identify subjects."
@@ -4795,9 +4888,9 @@ def _build_global_qa_section(acc: ChTypeAccumulator, tab_name: str, amplitude_un
         + _figure_block(
             ptp_violin,
             (
-                f"Y-axis is PtP amplitude in {amplitude_unit}; x-axis is task/condition. "
+                f"Y-axis is PtP amplitude in {amplitude_unit}; x-axis is task. "
                 "Each observation represents one channel summarized across epochs for one recording. "
-                "Typical appearance: moderate spread. Suspicious appearance: heavy upper tail and condition-dependent broadening."
+                "Typical appearance: moderate spread. Suspicious appearance: heavy upper tail and task-dependent broadening."
             ),
         )
         + _figure_block(
@@ -4897,27 +4990,27 @@ def _build_subject_qa_section(acc: ChTypeAccumulator, tab_name: str, amplitude_u
 
     std_violin = plot_subject_condition_violin(
         df, "std_median",
-        "STD by condition with subject-aware points",
+        "STD by task with subject-aware points",
         f"STD ({amplitude_unit})",
     )
     ptp_violin = plot_subject_condition_violin(
         df, "ptp_upper_tail",
-        "PtP by condition with subject-aware points",
+        "PtP by task with subject-aware points",
         f"PtP ({amplitude_unit})",
     )
     ecg_violin = plot_subject_condition_violin(
         df, "ecg_mean_abs_corr",
-        "ECG correlation magnitude by condition with subject-aware points",
+        "ECG correlation magnitude by task with subject-aware points",
         "|r| (unitless)",
     )
     eog_violin = plot_subject_condition_violin(
         df, "eog_mean_abs_corr",
-        "EOG correlation magnitude by condition with subject-aware points",
+        "EOG correlation magnitude by task with subject-aware points",
         "|r| (unitless)",
     )
     mains_violin = plot_subject_condition_violin(
         df, "mains_ratio",
-        "Mains relative power by condition with subject-aware points",
+        "Mains relative power by task with subject-aware points",
         "Mains ratio (unitless)",
     )
 
@@ -4925,7 +5018,7 @@ def _build_subject_qa_section(acc: ChTypeAccumulator, tab_name: str, amplitude_u
         df,
         "std_median",
         "std_upper_tail",
-        "Run fingerprint scatter (STD)",
+        "Recording fingerprint scatter (STD)",
         f"Median channel STD per recording ({amplitude_unit})",
         f"Upper-tail channel STD per recording ({amplitude_unit})",
     )
@@ -4933,7 +5026,7 @@ def _build_subject_qa_section(acc: ChTypeAccumulator, tab_name: str, amplitude_u
         df,
         "ptp_median",
         "ptp_upper_tail",
-        "Run fingerprint scatter (PtP)",
+        "Recording fingerprint scatter (PtP)",
         f"Median channel PtP per recording ({amplitude_unit})",
         f"Upper-tail channel PtP per recording ({amplitude_unit})",
     )
@@ -4941,7 +5034,7 @@ def _build_subject_qa_section(acc: ChTypeAccumulator, tab_name: str, amplitude_u
         df,
         "mains_ratio",
         "mains_harmonics_ratio",
-        "Run fingerprint scatter (PSD mains)",
+        "Recording fingerprint scatter (PSD mains)",
         "Mains relative power (unitless)",
         "Harmonics relative power (unitless)",
     )
@@ -4949,7 +5042,7 @@ def _build_subject_qa_section(acc: ChTypeAccumulator, tab_name: str, amplitude_u
         df,
         "ecg_mean_abs_corr",
         "ecg_p95_abs_corr",
-        "Run fingerprint scatter (ECG)",
+        "Recording fingerprint scatter (ECG)",
         "Mean |ECG correlation| per recording",
         "p95 |ECG correlation| per recording",
     )
@@ -4957,7 +5050,7 @@ def _build_subject_qa_section(acc: ChTypeAccumulator, tab_name: str, amplitude_u
         df,
         "eog_mean_abs_corr",
         "eog_p95_abs_corr",
-        "Run fingerprint scatter (EOG)",
+        "Recording fingerprint scatter (EOG)",
         "Mean |EOG correlation| per recording",
         "p95 |EOG correlation| per recording",
     )
@@ -4965,7 +5058,7 @@ def _build_subject_qa_section(acc: ChTypeAccumulator, tab_name: str, amplitude_u
         df,
         "muscle_median",
         "muscle_p95",
-        "Run fingerprint scatter (Muscle)",
+        "Recording fingerprint scatter (Muscle)",
         "Median muscle score per recording",
         "p95 muscle score per recording",
     )
@@ -4975,7 +5068,7 @@ def _build_subject_qa_section(acc: ChTypeAccumulator, tab_name: str, amplitude_u
     condition_effect = plot_subject_condition_effect(
         df,
         metric_col="std_median",
-        title="Condition effect per subject (STD median)",
+        title="Task effect per subject (STD median)",
         y_label=f"STD ({amplitude_unit})",
     )
 
@@ -5003,29 +5096,29 @@ def _build_subject_qa_section(acc: ChTypeAccumulator, tab_name: str, amplitude_u
         + _figure_block(
             std_violin,
             (
-                f"Y-axis is STD in {amplitude_unit}; x-axis is task/condition. "
+                f"Y-axis is STD in {amplitude_unit}; x-axis is task. "
                 "Each point represents one recording summary and hover includes BIDS entities. "
-                "Typical appearance: moderate spread per condition. Suspicious appearance: heavy upper tails or subject clusters away from peers."
+                "Typical appearance: moderate spread per task. Suspicious appearance: heavy upper tails or subject clusters away from peers."
             ),
         )
         + _figure_block(
             ptp_violin,
             (
-                f"Y-axis is PtP in {amplitude_unit}; x-axis is task/condition. "
+                f"Y-axis is PtP in {amplitude_unit}; x-axis is task. "
                 "Each point represents one recording summary and is colored by subject. "
                 "Typical appearance: compact subject overlap. Suspicious appearance: repeated subject-specific upper tails."
             ),
         )
         + _figure_block(ecg_violin, "Y-axis is |r| (unitless); each point is one recording summary. Look for consistent subject-level shifts.")
-        + _figure_block(eog_violin, "Y-axis is |r| (unitless); each point is one recording summary. Look for condition-specific and subject-specific shifts.")
+        + _figure_block(eog_violin, "Y-axis is |r| (unitless); each point is one recording summary. Look for task-specific and subject-specific shifts.")
         + _figure_block(mains_violin, "Y-axis is mains ratio (unitless); each point is one recording summary. Heavy upper tails indicate stronger mains burden.")
         + "</div>"
         "<div class='metric-block'>"
-        "<h3>Run fingerprint scatter</h3>"
+        "<h3>Recording fingerprint scatter</h3>"
         + _figure_block(
             std_scatter,
             (
-                "Each point = one recording (sub x task x run), colored by subject and symbolized by condition. "
+                "Each point = one recording (sub x task x run), colored by subject and symbolized by task. "
                 "Axes represent central and upper-tail STD summaries. "
                 "Typical appearance: compact cloud with moderate spread. Suspicious appearance: isolated points with strong upper-tail displacement."
             ),
@@ -5369,10 +5462,10 @@ def _build_cohort_overview_section(acc: ChTypeAccumulator, amplitude_unit: str, 
 def _build_condition_effect_section(acc: ChTypeAccumulator, amplitude_unit: str, is_combined: bool) -> str:
     df = _run_rows_dataframe(acc.run_rows)
     if df.empty:
-        return "<section><h2>QA metrics across tasks</h2><p>No condition comparison is available.</p></section>"
+        return "<section><h2>QA metrics across tasks</h2><p>No task comparison is available.</p></section>"
 
     if "condition_label" not in df.columns or df["condition_label"].nunique() < 2:
-        return "<section><h2>QA metrics across tasks</h2><p>Condition comparison requires at least two task/condition labels.</p></section>"
+        return "<section><h2>QA metrics across tasks</h2><p>Task comparison requires at least two task labels.</p></section>"
 
     suffix = " (all channels)" if is_combined else ""
     token = "combined" if is_combined else ("grad" if "/m" in amplitude_unit else "mag")
@@ -5453,7 +5546,7 @@ def _build_condition_effect_section(acc: ChTypeAccumulator, amplitude_unit: str,
                 y_label=y_label,
             )
             interpretation = (
-                f"Each thin line is one subject profile across task/condition labels for the {variant_label.lower()} summary. "
+                f"Each thin line is one subject profile across task labels for the {variant_label.lower()} summary. "
                 "The dark line is the cohort median profile across subjects. "
                 "Consistent separation between task labels indicates a task-linked shift in this QA summary."
             )
@@ -5472,7 +5565,7 @@ def _build_condition_effect_section(acc: ChTypeAccumulator, amplitude_unit: str,
     return (
         "<section>"
         "<h2>QA metrics across tasks</h2>"
-        "<p>One tab per metric. Inside each metric, switch between median, mean, and upper-tail summaries to inspect how subject trajectories change across task/condition labels.</p>"
+        "<p>One tab per metric. Inside each metric, switch between median, mean, and upper-tail summaries to inspect how subject trajectories change across task labels.</p>"
         + _build_subtabs_html(f"task-effects-main-{token}", metric_tabs, level=2)
         + "</section>"
     )
@@ -5505,7 +5598,7 @@ def _build_metric_details_section(acc: ChTypeAccumulator, amplitude_unit: str, i
         n_epochs = _count_map_values(epoch_values)
         n_recording_values = _count_map_values(rec_values)
         return (
-            f"<strong>Counts:</strong> N subjects={n_subjects}, N runs={n_runs}, "
+            f"<strong>Counts:</strong> N subjects={n_subjects}, N recordings={n_runs}, "
             f"N recording values={n_recording_values}, N channels={n_channels}, N epochs={n_epochs}."
         )
 
@@ -5750,7 +5843,7 @@ def _build_metric_details_section(acc: ChTypeAccumulator, amplitude_unit: str, i
                 df,
                 x_col=x_col,
                 y_col=y_col,
-                title=f"Run fingerprint ({metric_name}){suffix}",
+                title=f"Recording fingerprint ({metric_name}){suffix}",
                 x_label=x_label,
                 y_label=y_label,
             )
@@ -5907,7 +6000,7 @@ def _build_metric_details_section(acc: ChTypeAccumulator, amplitude_unit: str, i
             cond: plot_psd_median_band(_aggregate_psd_profiles(profiles), title=f"PSD profile ({cond})")
             for cond, profiles in sorted(acc.psd_profiles_by_condition.items())
         },
-        "Line and quantile bands summarize channel PSD profiles by condition (frequency in Hz).",
+        "Line and quantile bands summarize channel PSD profiles by task (frequency in Hz).",
         normalized_variant=True,
         norm_mode="y",
     )
@@ -6033,7 +6126,7 @@ def _build_metric_details_section(acc: ChTypeAccumulator, amplitude_unit: str, i
             )
             for cond, profiles in sorted(acc.muscle_profiles_by_condition.items())
         },
-        "Muscle epoch envelope by condition (median and quantile bands).",
+        "Muscle epoch envelope by task (median and quantile bands).",
         normalized_variant=True,
         norm_mode="y",
     )
@@ -6054,7 +6147,7 @@ def _build_metric_details_section(acc: ChTypeAccumulator, amplitude_unit: str, i
     return (
         "<section>"
         "<h2>QA metrics details</h2>"
-        "<p>Each metric has three distribution panels (A/B/C), summary variants (default metric summary first, then the two alternatives), and run fingerprint scatter for recording-level spread. STD and PtP also include channel-epoch heatmap variants.</p>"
+        "<p>Each metric has three distribution panels (A/B/C), summary variants (default metric summary first, then the two alternatives), and recording fingerprint scatter for recording-level spread. STD and PtP also include channel-epoch heatmap variants.</p>"
         + metric_tabs
         + "</section>"
     )
@@ -6069,7 +6162,7 @@ def _build_subject_drilldown_section(acc: ChTypeAccumulator, amplitude_unit: str
         df,
         "std_median",
         "std_upper_tail",
-        "Run fingerprint (STD)",
+        "Recording fingerprint (STD)",
         f"Median channel STD per recording ({amplitude_unit})",
         f"Upper-tail channel STD per recording ({amplitude_unit})",
     )
@@ -6077,7 +6170,7 @@ def _build_subject_drilldown_section(acc: ChTypeAccumulator, amplitude_unit: str
         df,
         "ptp_median",
         "ptp_upper_tail",
-        "Run fingerprint (PtP)",
+        "Recording fingerprint (PtP)",
         f"Median channel PtP per recording ({amplitude_unit})",
         f"Upper-tail channel PtP per recording ({amplitude_unit})",
     )
@@ -6085,7 +6178,7 @@ def _build_subject_drilldown_section(acc: ChTypeAccumulator, amplitude_unit: str
         df,
         "mains_ratio",
         "mains_harmonics_ratio",
-        "Run fingerprint (PSD mains/harmonics)",
+        "Recording fingerprint (PSD mains/harmonics)",
         "Mains relative power",
         "Harmonics relative power",
     )
@@ -6093,7 +6186,7 @@ def _build_subject_drilldown_section(acc: ChTypeAccumulator, amplitude_unit: str
         df,
         "ecg_mean_abs_corr",
         "ecg_p95_abs_corr",
-        "Run fingerprint (ECG)",
+        "Recording fingerprint (ECG)",
         "Mean |ECG correlation| per recording",
         "p95 |ECG correlation| per recording",
     )
@@ -6101,7 +6194,7 @@ def _build_subject_drilldown_section(acc: ChTypeAccumulator, amplitude_unit: str
         df,
         "eog_mean_abs_corr",
         "eog_p95_abs_corr",
-        "Run fingerprint (EOG)",
+        "Recording fingerprint (EOG)",
         "Mean |EOG correlation| per recording",
         "p95 |EOG correlation| per recording",
     )
@@ -6109,7 +6202,7 @@ def _build_subject_drilldown_section(acc: ChTypeAccumulator, amplitude_unit: str
         df,
         "muscle_median",
         "muscle_p95",
-        "Run fingerprint (Muscle)",
+        "Recording fingerprint (Muscle)",
         "Median muscle score per recording",
         "p95 muscle score per recording",
     )
@@ -6202,6 +6295,8 @@ def _build_tab_content(tab_name: str, acc: ChTypeAccumulator, is_combined: bool)
         amplitude_unit = "mixed pT-based MEG units (all channels)"
     elif tab_name.upper() == "MAG":
         amplitude_unit = "picoTesla (pT)"
+    elif tab_name.upper() == "EEG":
+        amplitude_unit = "microVolts (µV)"
     else:
         amplitude_unit = "picoTesla/m (pT/m)"
 
@@ -6248,7 +6343,7 @@ def _build_report_html(
     _reset_lazy_figure_store()
     generated = dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     version = getattr(meg_qc, "__version__", "unknown")
-    tab_order = ["Combined (mag+grad)", "MAG", "GRAD"]
+    tab_order = ["Combined (mag+grad)", "MAG", "GRAD", "EEG"]
     available_tabs = [tab for tab in tab_order if tab in tab_accumulators and tab_accumulators[tab].run_count > 0]
     if not available_tabs:
         available_tabs = [tab for tab in tab_order if tab in tab_accumulators]
@@ -6390,6 +6485,14 @@ def _build_report_html(
       margin-top: 10px;
       padding-top: 10px;
       overflow: visible;
+    }}
+    .fig-title {{
+      font-size: 16px;
+      font-weight: 700;
+      color: #1a3a5c;
+      text-align: center;
+      padding: 10px 8px 2px;
+      line-height: 1.3;
     }}
     .fig .js-plotly-plot {{
       width: 100% !important;
@@ -7211,6 +7314,18 @@ def _update_accumulator_for_loaded_run(
         if ch_type not in CH_TYPES:
             continue
 
+        # ── BIDS modality guard ───────────────────────────────────────────────
+        # The BIDS suffix of the derivative file (stored in record.meta.bids_suffix)
+        # is the authoritative signal for which modality this recording belongs to.
+        # A MEG recording (_meg.tsv) may contain embedded EEG channels, but those
+        # must NOT be counted as EEG-modality data.  Conversely, an EEG recording
+        # (_eeg.tsv) should never produce mag/grad channel rows.
+        _bids_sfx = record.meta.bids_suffix
+        if _bids_sfx == "meg" and ch_type == "eeg":
+            continue  # EEG channels inside a MEG recording → skip
+        if _bids_sfx == "eeg" and ch_type in ("mag", "grad"):
+            continue  # MEG channel types inside an EEG recording → skip
+
         acc = acc_by_type[ch_type]
         acc.run_count += 1
         if record.meta.subject != "n/a":
@@ -7938,24 +8053,57 @@ def make_group_plots_meg_qc(
     settings_snapshot = _load_settings_snapshot(source_megqc_root)
     combined_acc = _combine_accumulators(acc_by_type)
 
-    tab_accumulators: Dict[str, ChTypeAccumulator] = {
-        "Combined (mag+grad)": combined_acc,
-        "MAG": acc_by_type["mag"],
-        "GRAD": acc_by_type["grad"],
-    }
+    # Build tab accumulators, filtering out types with no data.
+    tab_accumulators: Dict[str, ChTypeAccumulator] = {}
+    # Only add Combined tab if at least one of mag or grad has data
+    if acc_by_type["mag"].run_count > 0 or acc_by_type["grad"].run_count > 0:
+        tab_accumulators["Combined (mag+grad)"] = combined_acc
+    if acc_by_type["mag"].run_count > 0:
+        tab_accumulators["MAG"] = acc_by_type["mag"]
+    if acc_by_type["grad"].run_count > 0:
+        tab_accumulators["GRAD"] = acc_by_type["grad"]
+    if acc_by_type["eeg"].run_count > 0:
+        tab_accumulators["EEG"] = acc_by_type["eeg"]
     if all(acc.run_count == 0 for acc in tab_accumulators.values()):
         print("___MEGqc___: Group QA: no reports were generated.")
         return {}
 
-    report_html = _build_report_html(
-        dataset_name=dataset_name,
-        tab_accumulators=tab_accumulators,
-        settings_snapshot=settings_snapshot,
-    )
-    out_name = f"QA_group_report_{dataset_name}.html"
-    out_path = reports_dir / out_name
-    out_path.write_text(report_html, encoding="utf-8")
+    # ── Per-modality separate HTML reports (no combined agnostic report) ──
+    # MEG report: Combined + MAG + GRAD tabs (only if any MEG data exists)
+    meg_accs = {k: v for k, v in tab_accumulators.items()
+                if k in ("Combined (mag+grad)", "MAG", "GRAD")}
+    if any(acc.run_count > 0 for acc in meg_accs.values()):
+        meg_html = _build_report_html(
+            dataset_name=dataset_name,
+            tab_accumulators=meg_accs,
+            settings_snapshot=settings_snapshot,
+        )
+        meg_report_dir = reports_dir / "meg"
+        meg_report_dir.mkdir(parents=True, exist_ok=True)
+        meg_path = meg_report_dir / f"QA_group_report_{dataset_name}_meg.html"
+        meg_path.write_text(meg_html, encoding="utf-8")
+        print(f"___MEGqc___:   MEG report: {meg_path}")
 
-    print("___MEGqc___: Group QA report created:")
-    print(f"___MEGqc___:   report: {out_path}")
-    return {"report": out_path}
+    # EEG report: EEG tab only (only if EEG data exists)
+    eeg_acc = tab_accumulators.get("EEG")
+    if eeg_acc is not None and eeg_acc.run_count > 0:
+        eeg_html = _build_report_html(
+            dataset_name=dataset_name,
+            tab_accumulators={"EEG": eeg_acc},
+            settings_snapshot=settings_snapshot,
+        )
+        eeg_report_dir = reports_dir / "eeg"
+        eeg_report_dir.mkdir(parents=True, exist_ok=True)
+        eeg_path = eeg_report_dir / f"QA_group_report_{dataset_name}_eeg.html"
+        eeg_path.write_text(eeg_html, encoding="utf-8")
+        print(f"___MEGqc___:   EEG report: {eeg_path}")
+
+    # Determine primary report path for return value
+    meg_accs_check = {k: v for k, v in tab_accumulators.items()
+                      if k in ("Combined (mag+grad)", "MAG", "GRAD")}
+    if any(acc.run_count > 0 for acc in meg_accs_check.values()):
+        primary_path = reports_dir / "meg" / f"QA_group_report_{dataset_name}_meg.html"
+    else:
+        primary_path = reports_dir / "eeg" / f"QA_group_report_{dataset_name}_eeg.html"
+
+    return {"report": primary_path}

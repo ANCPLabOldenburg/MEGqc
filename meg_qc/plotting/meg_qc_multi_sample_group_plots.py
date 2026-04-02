@@ -64,6 +64,35 @@ from meg_qc.plotting.meg_qc_group_plots import (
 MAX_POINTS_SCATTER = 4000
 
 
+def _adaptive_legend_layout(n_entries: int) -> dict:
+    """Return legend + margin + height kwargs for non-overlapping zones.
+
+    Title is rendered as independent HTML above the figure (see
+    ``_figure_to_div``).  The legend is **always horizontal**, placed above
+    the plot area with ``y > 1`` so it lives in the top-margin band.  The
+    top margin grows dynamically to accommodate multi-row wrapping, so
+    legend and plot content never overlap.
+    """
+    entries_per_row = 3  # conservative for typical label widths
+    n_rows = max(1, -(-n_entries // entries_per_row))
+    legend_height_px = n_rows * 26 + 20
+    margin_t = max(50, legend_height_px)
+    return {
+        "legend": {
+            "orientation": "h",
+            "yanchor": "bottom",
+            "y": 1.02,
+            "xanchor": "left",
+            "x": 0.0,
+            "font": {"size": 11},
+            "itemsizing": "constant",
+            "tracegroupgap": 4,
+        },
+        "margin": {"l": 55, "r": 30, "t": margin_t, "b": 60},
+        "height": max(620, margin_t + 60 + 400),
+    }
+
+
 @dataclass
 class SampleBundle:
     """Container with all information needed for one dataset sample."""
@@ -148,11 +177,16 @@ def _collect_sample_bundle(
     acc_by_type = _build_accumulators_for_runs(run_records, n_jobs=n_jobs)
 
     combined_acc = _combine_accumulators(acc_by_type)
-    tab_accumulators: Dict[str, ChTypeAccumulator] = {
-        "Combined (mag+grad)": combined_acc,
-        "MAG": acc_by_type["mag"],
-        "GRAD": acc_by_type["grad"],
-    }
+    # Build tab accumulators, filtering out types with no data.
+    tab_accumulators: Dict[str, ChTypeAccumulator] = {}
+    if acc_by_type["mag"].run_count > 0 or acc_by_type["grad"].run_count > 0:
+        tab_accumulators["Combined (mag+grad)"] = combined_acc
+    if acc_by_type["mag"].run_count > 0:
+        tab_accumulators["MAG"] = acc_by_type["mag"]
+    if acc_by_type["grad"].run_count > 0:
+        tab_accumulators["GRAD"] = acc_by_type["grad"]
+    if acc_by_type["eeg"].run_count > 0:
+        tab_accumulators["EEG"] = acc_by_type["eeg"]
     if all(acc.run_count == 0 for acc in tab_accumulators.values()):
         print(f"___MEGqc___: Multi-sample QA: skipping {sample_id}, no usable run summaries.")
         return None
@@ -237,7 +271,7 @@ def plot_run_fingerprint_scatter_by_sample(
     x_label: str,
     y_label: str,
 ) -> Optional[go.Figure]:
-    """Run fingerprint with sample colors and task/condition legend filtering."""
+    """Run fingerprint with sample colors and task legend filtering."""
     if df.empty or x_col not in df.columns or y_col not in df.columns:
         return None
     data = df.loc[np.isfinite(df[x_col]) & np.isfinite(df[y_col])].copy()
@@ -273,20 +307,20 @@ def plot_run_fingerprint_scatter_by_sample(
                     "showscale": False,
                 },
                 customdata=np.stack([dcond["hover_entities"]], axis=-1),
-                hovertemplate="%{customdata[0]}<br>condition=" + cond + "<br>x=%{x:.3g}<br>y=%{y:.3g}<extra></extra>",
+                hovertemplate="%{customdata[0]}<br>task=" + cond + "<br>x=%{x:.3g}<br>y=%{y:.3g}<extra></extra>",
                 showlegend=True,
             )
         )
 
     if not fig.data:
         return None
+    legend_kw = _adaptive_legend_layout(len(fig.data))
     fig.update_layout(
         title={"text": title, "x": 0.5},
         xaxis_title=x_label,
         yaxis_title=y_label,
         template="plotly_white",
-        margin={"l": 55, "r": 20, "t": 70, "b": 55},
-        legend={"orientation": "h", "yanchor": "bottom", "y": 1.02, "xanchor": "left", "x": 0},
+        **legend_kw,
     )
     return fig
 
@@ -304,7 +338,7 @@ def _run_values_by_condition(df: pd.DataFrame, value_col: str) -> Dict[str, List
 
 
 def _run_values_labeled(df: pd.DataFrame, value_col: str) -> Dict[str, List[float]]:
-    """Build value groups as: '<sample> | <condition>' plus '<sample> | all tasks'."""
+    """Build value groups as: '<sample> | <task>' plus '<sample> | all tasks'."""
     out: Dict[str, List[float]] = defaultdict(list)
     if df.empty or value_col not in df.columns or "sample_id" not in df.columns:
         return {}
@@ -355,7 +389,7 @@ def _collect_labeled_values_from_bundles(
 
 
 def _subject_points_labeled(df: pd.DataFrame, value_col: str) -> pd.DataFrame:
-    """One subject point per sample-condition and per sample-all_tasks."""
+    """One subject point per sample-task and per sample-all_tasks."""
     if df.empty or value_col not in df.columns or "sample_id" not in df.columns or "subject" not in df.columns:
         return pd.DataFrame()
 
@@ -382,7 +416,7 @@ def _subject_points_labeled(df: pd.DataFrame, value_col: str) -> pd.DataFrame:
                 "task": ",".join(tasks) if tasks else "n/a",
                 value_col: val,
                 "hover_entities": (
-                    f"sample={sample_id}<br>subject={subject}<br>condition={cond}<br>n_recordings={len(group)}"
+                    f"sample={sample_id}<br>subject={subject}<br>task={cond}<br>n_recordings={len(group)}"
                     + (f"<br>tasks={', '.join(tasks)}" if tasks else "")
                     + f"<br>value={val:.3g}"
                 ),
@@ -404,7 +438,7 @@ def _subject_points_labeled(df: pd.DataFrame, value_col: str) -> pd.DataFrame:
                 "task": ",".join(tasks) if tasks else "n/a",
                 value_col: val,
                 "hover_entities": (
-                    f"sample={sample_id}<br>subject={subject}<br>condition=all tasks<br>n_recordings={len(group)}"
+                    f"sample={sample_id}<br>subject={subject}<br>task=all tasks<br>n_recordings={len(group)}"
                     + (f"<br>tasks={', '.join(tasks)}" if tasks else "")
                     + f"<br>value={val:.3g}"
                 ),
@@ -464,7 +498,7 @@ def _distribution_views(
                     box_raw,
                     (
                         "Each box is one dataset-task group summarizing median, quartiles, and whiskers. "
-                        "Labels include '<dataset> | <task/condition>' and '<dataset> | all tasks'. "
+                        "Labels include '<dataset> | <task>' and '<dataset> | all tasks'. "
                         "Jittered dots are one robust subject summary for the selected variant."
                     ),
                     normalized_variant=True,
@@ -672,7 +706,7 @@ def _build_metric_panel(
             _figure_block(
                 fp_fig,
                 (
-                    "Each point is one recording. Color encodes dataset and legend toggles task/condition groups. "
+                    "Each point is one recording. Color encodes dataset and legend toggles task groups. "
                     "Use this view to compare recording-level spread across datasets in the same metric space."
                 ),
             )
@@ -1058,7 +1092,7 @@ def _build_multi_cumulative_section(
     return (
         "<section>"
         "<h2>Cummulative distributions</h2>"
-        "<p>Each curve corresponds to one '<dataset> | <task/condition>' group plus '<dataset> | all tasks'.</p>"
+        "<p>Each curve corresponds to one '<dataset> | <task>' group plus '<dataset> | all tasks'.</p>"
         + _figure_block(std_ecdf, "Cumulative distribution of channel-level STD summaries across all datasets/tasks.")
         + _figure_block(ptp_ecdf, "Cumulative distribution of channel-level PtP summaries across all datasets/tasks.")
         + _figure_block(psd_ecdf, "Cumulative distribution of mains relative power across all datasets/tasks.")
@@ -1331,6 +1365,9 @@ def _build_tab_content(
     elif tab_name == "MAG":
         amplitude_unit = "picoTesla (pT)"
         tab_token = "mag"
+    elif tab_name == "EEG":
+        amplitude_unit = "microVolts (µV)"
+        tab_token = "eeg"
     else:
         amplitude_unit = "picoTesla/m (pT/m)"
         tab_token = "grad"
@@ -1350,7 +1387,7 @@ def _build_tab_content(
         bundles,
         tab_name,
         section_title="QA metrics across tasks",
-        section_intro="Same task/condition profiles as the single-dataset report, shown per dataset.",
+        section_intro="Same task profiles as the single-dataset report, shown per dataset.",
         section_builder=lambda acc, unit, combined: _build_condition_effect_section(acc, amplitude_unit=unit, is_combined=combined),
         amplitude_unit=amplitude_unit,
         is_combined=is_combined,
@@ -1534,6 +1571,14 @@ def _build_multi_sample_report_html(
       margin-top: 10px;
       padding-top: 10px;
       overflow: visible;
+    }}
+    .fig-title {{
+      font-size: 16px;
+      font-weight: 700;
+      color: #1a3a5c;
+      text-align: center;
+      padding: 10px 8px 2px;
+      line-height: 1.3;
     }}
     .fig .js-plotly-plot {{
       width: 100% !important;
@@ -2385,23 +2430,75 @@ def make_multi_sample_group_plots_meg_qc(
         print("___MEGqc___: Multi-sample QA: fewer than two datasets had usable derivatives.")
         return {}
 
-    tab_order = ["Combined (mag+grad)", "MAG", "GRAD"]
-    html = _build_multi_sample_report_html(bundles, tab_order)
+    # ── Classify bundles by modality ──────────────────────────────────
+    meg_tabs_all = ["Combined (mag+grad)", "MAG", "GRAD"]
+    eeg_tabs_all = ["EEG"]
 
-    if output_report_path is not None:
-        out_path = Path(output_report_path).expanduser().resolve()
-    else:
-        primary_reports_dir = bundles[0].reports_dir
-        ids = [_sanitize_token(b.sample_id) for b in bundles]
-        suffix = "_vs_".join(ids[:4])
-        if len(ids) > 4:
-            suffix = f"{suffix}_and_{len(ids) - 4}_more"
-        out_name = f"QA_multi_sample_report_{suffix}.html"
-        out_path = primary_reports_dir / out_name
+    def _bundle_has_modality(b, tab_name):
+        acc = b.tab_accumulators.get(tab_name)
+        return acc is not None and acc.run_count > 0
 
-    out_path.parent.mkdir(parents=True, exist_ok=True)
-    out_path.write_text(html, encoding="utf-8")
+    meg_bundles = [b for b in bundles if any(_bundle_has_modality(b, t) for t in meg_tabs_all)]
+    eeg_bundles = [b for b in bundles if _bundle_has_modality(b, "EEG")]
 
-    print("___MEGqc___: Multi-sample QA report created:")
-    print(f"___MEGqc___:   report: {out_path}")
-    return {"report": out_path}
+    # Determine primary reports dir and naming
+    primary_reports_dir = bundles[0].reports_dir
+    ids = [_sanitize_token(b.sample_id) for b in bundles]
+    name_suffix = "_vs_".join(ids[:4])
+    if len(ids) > 4:
+        name_suffix = f"{name_suffix}_and_{len(ids) - 4}_more"
+
+    result = {}
+
+    # ── MEG multi-sample report ───────────────────────────────────────
+    if len(meg_bundles) >= 2:
+        # Include MEG tabs that any bundle provides — tabs with missing data in
+        # some bundles will show a "no data" placeholder rather than disappearing.
+        meg_shared = [t for t in meg_tabs_all
+                      if any(_bundle_has_modality(b, t) for b in meg_bundles)]
+        if meg_shared:
+            meg_html = _build_multi_sample_report_html(meg_bundles, meg_shared)
+            meg_dir = primary_reports_dir / "meg"
+            meg_dir.mkdir(parents=True, exist_ok=True)
+            if output_report_path is not None:
+                meg_path = Path(output_report_path).parent / "meg" / (Path(output_report_path).stem + "_meg.html")
+            else:
+                meg_path = meg_dir / f"QA_multi_sample_report_{name_suffix}_meg.html"
+            meg_path.parent.mkdir(parents=True, exist_ok=True)
+            meg_path.write_text(meg_html, encoding="utf-8")
+            result["meg_report"] = meg_path
+            print(f"___MEGqc___: Multi-sample MEG QA report created: {meg_path}")
+            meg_ids = [b.sample_id for b in meg_bundles]
+            excluded = [b.sample_id for b in bundles if b not in meg_bundles]
+            if excluded:
+                print(f"___MEGqc___:   MEG comparison includes [{', '.join(meg_ids)}], excludes [{', '.join(excluded)}] (no MEG data)")
+        else:
+            print("___MEGqc___: Multi-sample QA: MEG datasets found but no shared MEG tabs across them.")
+    elif len(meg_bundles) == 1:
+        print(f"___MEGqc___: Multi-sample QA: only one MEG dataset ({meg_bundles[0].sample_id}), skipping MEG comparison.")
+
+    # ── EEG multi-sample report ───────────────────────────────────────
+    if len(eeg_bundles) >= 2:
+        eeg_html = _build_multi_sample_report_html(eeg_bundles, eeg_tabs_all)
+        eeg_dir = primary_reports_dir / "eeg"
+        eeg_dir.mkdir(parents=True, exist_ok=True)
+        if output_report_path is not None:
+            eeg_path = Path(output_report_path).parent / "eeg" / (Path(output_report_path).stem + "_eeg.html")
+        else:
+            eeg_path = eeg_dir / f"QA_multi_sample_report_{name_suffix}_eeg.html"
+        eeg_path.parent.mkdir(parents=True, exist_ok=True)
+        eeg_path.write_text(eeg_html, encoding="utf-8")
+        result["eeg_report"] = eeg_path
+        print(f"___MEGqc___: Multi-sample EEG QA report created: {eeg_path}")
+        eeg_ids = [b.sample_id for b in eeg_bundles]
+        excluded = [b.sample_id for b in bundles if b not in eeg_bundles]
+        if excluded:
+            print(f"___MEGqc___:   EEG comparison includes [{', '.join(eeg_ids)}], excludes [{', '.join(excluded)}] (no EEG data)")
+    elif len(eeg_bundles) == 1:
+        print(f"___MEGqc___: Multi-sample QA: only one EEG dataset ({eeg_bundles[0].sample_id}), skipping EEG comparison.")
+
+    # ── No combined agnostic report — only per-modality reports ──────
+    if not result:
+        print("___MEGqc___: Multi-sample QA: could not produce any comparison reports.")
+
+    return result

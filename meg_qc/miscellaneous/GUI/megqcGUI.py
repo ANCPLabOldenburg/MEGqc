@@ -37,7 +37,7 @@ from PyQt6.QtWidgets import (
     QGroupBox, QSpinBox, QTabWidget, QScrollArea, QMessageBox,
     QListWidget, QCheckBox, QTableWidget, QTableWidgetItem, QHeaderView,
     QDialog, QComboBox, QDoubleSpinBox, QDialogButtonBox, QGridLayout,
-    QInputDialog,
+    QInputDialog, QTreeView, QListView, QAbstractItemView,
 )
 from PyQt6.QtCore import (
     QObject,
@@ -61,7 +61,12 @@ from meg_qc.test import (
 )
 from meg_qc.calculation.meg_qc_pipeline import list_analysis_profiles
 from meg_qc import __version__ as MEGQC_VERSION
-
+try:
+    from PyQt6.QtWebEngineWidgets import QWebEngineView
+    from PyQt6.QtWebEngineCore import QWebEngineSettings
+    HAS_WEBENGINE = True
+except ImportError:
+    HAS_WEBENGINE = False
 # Use Qt5 widget integration and not the OS integrations (This will prevent incompatibilities)
 QCoreApplication.setAttribute(Qt.ApplicationAttribute.AA_DontUseNativeDialogs)
 
@@ -298,12 +303,24 @@ class SettingsEditorDialog(QDialog):
     _ENUM_OPTIONS: Dict[Tuple[str, str], List[str]] = {
         ("Filtering", "method"): ["iir", "fir"],
         ("Epoching", "event_repeated"): ["merge", "drop", "error"],
+        ("EEG", "reference_method"): ["average", "REST", "none"],
+        ("EEG", "montage"): [
+            "auto", "standard_1020", "standard_1010", "standard_1005",
+            "biosemi64", "biosemi128", "biosemi256",
+            "GSN-HydroCel-129", "GSN-HydroCel-256",
+            "mgh60", "mgh70",
+        ],
     }
     # These fields intentionally allow blank values in settings.ini.
     # Using text widgets here avoids forcing a numeric value during resets.
     _OPTIONAL_NUMERIC_KEYS = {
         ("GENERAL", "data_crop_tmin"),
         ("GENERAL", "data_crop_tmax"),
+    }
+
+    # Fields that accept either an integer value OR the literal "False" to disable the feature.
+    _INT_OR_FALSE_KEYS = {
+        ("Filtering", "downsample_to_hz"),
     }
 
     def __init__(self, source_path: Union[str, Path], defaults_path: Union[str, Path], title: str, parent=None):
@@ -373,6 +390,9 @@ class SettingsEditorDialog(QDialog):
         scroll.setWidget(container)
         root.addWidget(scroll)
 
+        # Wire apply_filtering toggle AFTER all widgets are built
+        self._wire_apply_filtering_toggle()
+
         btn_row = QHBoxLayout()
         self.btn_reset = QPushButton("Reset to defaults")
         self.btn_reset.clicked.connect(self._reset_to_defaults)
@@ -387,6 +407,29 @@ class SettingsEditorDialog(QDialog):
         buttons.accepted.connect(self.accept)
         buttons.rejected.connect(self.reject)
         root.addWidget(buttons)
+
+    def _wire_apply_filtering_toggle(self):
+        """
+        When 'apply_filtering' is unchecked, gray-out the filter frequency and
+        method fields so the user understands they have no effect.
+        Downsampling remains independently controllable.
+        """
+        if ("Filtering", "apply_filtering") not in self.widgets:
+            return
+        chk_widget, _ = self.widgets[("Filtering", "apply_filtering")]
+        # These keys only make sense when filtering is on
+        filter_dependent_keys = ["l_freq", "h_freq", "method"]
+
+        def _set_enabled(state):
+            enabled = bool(state)
+            for k in filter_dependent_keys:
+                if ("Filtering", k) in self.widgets:
+                    w, _ = self.widgets[("Filtering", k)]
+                    w.setEnabled(enabled)
+
+        chk_widget.stateChanged.connect(_set_enabled)
+        # Apply initial state on dialog open
+        _set_enabled(chk_widget.isChecked())
 
     def _ordered_sections(self) -> List[str]:
         sections = list(self.config.sections())
@@ -438,15 +481,19 @@ class SettingsEditorDialog(QDialog):
             lay.setSpacing(8)
             chk_mag = QCheckBox("mag")
             chk_grad = QCheckBox("grad")
+            chk_eeg = QCheckBox("eeg")
             chk_mag.setMinimumWidth(72)
             chk_grad.setMinimumWidth(72)
+            chk_eeg.setMinimumWidth(72)
             parts = [p.strip().lower() for p in val.split(",") if p.strip()]
             chk_mag.setChecked("mag" in parts)
             chk_grad.setChecked("grad" in parts)
+            chk_eeg.setChecked("eeg" in parts)
             lay.addWidget(chk_mag)
             lay.addWidget(chk_grad)
+            lay.addWidget(chk_eeg)
             lay.addStretch(1)
-            container.setProperty("ch_types_widgets", (chk_mag, chk_grad))
+            container.setProperty("ch_types_widgets", (chk_mag, chk_grad, chk_eeg))
             return container, "ch_types"
 
         if sec_key in self._ENUM_OPTIONS:
@@ -459,7 +506,7 @@ class SettingsEditorDialog(QDialog):
             combo.setMaximumWidth(205)
             return combo, "enum"
 
-        if val.lower() in {"true", "false"}:
+        if val.lower() in {"true", "false"} and sec_key not in self._INT_OR_FALSE_KEYS:
             chk = QCheckBox()
             chk.setChecked(val.lower() == "true")
             return chk, "bool"
@@ -470,6 +517,35 @@ class SettingsEditorDialog(QDialog):
             line.setMinimumWidth(145)
             line.setMaximumWidth(215)
             return line, "text"
+
+        if sec_key in self._INT_OR_FALSE_KEYS:
+            container = QWidget()
+            lay = QHBoxLayout(container)
+            lay.setContentsMargins(0, 0, 0, 0)
+            lay.setSpacing(6)
+            chk = QCheckBox("enable")
+            spin = QSpinBox()
+            spin.setRange(1, 1_000_000)
+            spin.setMinimumWidth(100)
+            spin.setMaximumWidth(170)
+            spin.setSuffix(" Hz")
+            is_disabled = val.strip().lower() in ("false", "0", "no", "none", "")
+            if is_disabled:
+                chk.setChecked(False)
+                spin.setValue(1000)
+                spin.setEnabled(False)
+            else:
+                try:
+                    spin.setValue(int(val.strip()))
+                except (ValueError, TypeError):
+                    spin.setValue(1000)
+                chk.setChecked(True)
+                spin.setEnabled(True)
+            chk.stateChanged.connect(lambda state, s=spin: s.setEnabled(bool(state)))
+            lay.addWidget(chk)
+            lay.addWidget(spin)
+            container.setProperty("int_or_false_widgets", (chk, spin))
+            return container, "int_or_false"
 
         if val == "":
             line = QLineEdit("")
@@ -509,17 +585,22 @@ class SettingsEditorDialog(QDialog):
 
     def _widget_to_value(self, widget: QWidget, widget_type: str) -> str:
         if widget_type == "ch_types":
-            chk_mag, chk_grad = widget.property("ch_types_widgets")
+            chk_mag, chk_grad, chk_eeg = widget.property("ch_types_widgets")
             chosen = []
             if chk_mag.isChecked():
                 chosen.append("mag")
             if chk_grad.isChecked():
                 chosen.append("grad")
+            if chk_eeg.isChecked():
+                chosen.append("eeg")
             return ", ".join(chosen)
         if widget_type == "enum":
             return str(widget.currentText())
         if widget_type == "bool":
             return "True" if widget.isChecked() else "False"
+        if widget_type == "int_or_false":
+            chk, spin = widget.property("int_or_false_widgets")
+            return str(spin.value()) if chk.isChecked() else "False"
         if widget_type == "int":
             return str(int(widget.value()))
         if widget_type == "float":
@@ -545,10 +626,11 @@ class SettingsEditorDialog(QDialog):
                 continue
             val = cfg[section][key]
             if widget_type == "ch_types":
-                chk_mag, chk_grad = widget.property("ch_types_widgets")
+                chk_mag, chk_grad, chk_eeg = widget.property("ch_types_widgets")
                 parts = [p.strip().lower() for p in val.split(",") if p.strip()]
                 chk_mag.setChecked("mag" in parts)
                 chk_grad.setChecked("grad" in parts)
+                chk_eeg.setChecked("eeg" in parts)
             elif widget_type == "enum":
                 widget.setCurrentText(val)
             elif widget_type == "bool":
@@ -558,6 +640,20 @@ class SettingsEditorDialog(QDialog):
                     widget.setValue(int(val))
                 except Exception:
                     pass
+            elif widget_type == "int_or_false":
+                chk, spin = widget.property("int_or_false_widgets")
+                is_disabled = val.strip().lower() in ("false", "0", "no", "none", "")
+                if is_disabled:
+                    chk.setChecked(False)
+                    spin.setValue(1000)
+                    spin.setEnabled(False)
+                else:
+                    try:
+                        spin.setValue(int(val.strip()))
+                    except Exception:
+                        spin.setValue(1000)
+                    chk.setChecked(True)
+                    spin.setEnabled(True)
             elif widget_type == "float":
                 try:
                     widget.setValue(float(val))
@@ -1124,6 +1220,13 @@ class MainWindow(QMainWindow):
         self._apply_section_highlight_style()
         if persist:
             self.settings_store.setValue("ui/theme", name)
+        # Propagate to the QC Viewer window if it is open
+        viewer = getattr(self, "_qc_viewer_window", None)
+        if viewer is not None:
+            try:
+                viewer.refresh_theme()
+            except Exception:
+                pass
 
     def _build_section_highlight_stylesheet(self) -> str:
         """
@@ -1631,7 +1734,7 @@ class MainWindow(QMainWindow):
         dataset_input_lay = QHBoxLayout(dataset_input_row)
         dataset_input_lay.setContentsMargins(0, 0, 0, 0)
         self.dataset_input = QLineEdit()
-        self.dataset_input.setPlaceholderText("Add one BIDS dataset path")
+        self.dataset_input.setPlaceholderText("Add BIDS dataset path(s) — Browse supports multiple selection")
         btn_dataset_browse = QPushButton("Browse")
         btn_dataset_browse.clicked.connect(self._browse_dataset_input)
         btn_dataset_add = QPushButton("Add")
@@ -1966,6 +2069,10 @@ class MainWindow(QMainWindow):
         bottom_lay.addWidget(self.lbl_version)
         bottom_lay.addWidget(self.btn_check_updates)
         bottom_lay.addStretch(1)
+        self.btn_qc_viewer = QPushButton("QC Viewer")
+        self.btn_qc_viewer.setToolTip("Open the integrated QC data & report viewer.")
+        self.btn_qc_viewer.clicked.connect(self._open_qc_viewer)
+        bottom_lay.addWidget(self.btn_qc_viewer)
         self.btn_gui_settings = QPushButton("GUI settings")
         self.btn_gui_settings.clicked.connect(self._open_gui_settings_dialog)
         bottom_lay.addWidget(self.btn_gui_settings)
@@ -1979,6 +2086,26 @@ class MainWindow(QMainWindow):
         self._apply_section_highlight_style()
         self._set_active_run_task(None)
         return w
+
+    # ──────────────────────────────── #
+    # QC Viewer launcher               #
+    # ──────────────────────────────── #
+    def _open_qc_viewer(self):
+        """Open the integrated QC Viewer window."""
+        try:
+            from .qc_viewer import QCViewerWindow
+            initial_dir = self.derivatives_dir.text() if self.derivatives_dir.text() else None
+            self._qc_viewer_window = QCViewerWindow(
+                parent=None,
+                initial_dir=initial_dir,
+            )
+            self._qc_viewer_window.show()
+        except Exception as e:
+            QMessageBox.warning(
+                self,
+                "QC Viewer",
+                f"Failed to open the QC Viewer:\n{e}",
+            )
 
     # ──────────────────────────────── #
     # helper: browse directory         #
@@ -2008,9 +2135,29 @@ class MainWindow(QMainWindow):
             edit.setText(path)
 
     def _browse_dataset_input(self):
-        self._browse(self.dataset_input)
-        if self.dataset_input.text().strip():
-            self._add_dataset_from_input()
+        """Open a folder dialog that allows selecting multiple directories at once."""
+        dlg = QFileDialog(self, "Select one or more BIDS dataset folders")
+        dlg.setFileMode(QFileDialog.FileMode.Directory)
+        dlg.setOption(QFileDialog.Option.DontUseNativeDialog, True)
+        dlg.setOption(QFileDialog.Option.ShowDirsOnly, True)
+
+        # Enable multi-selection on the internal views
+        for view in dlg.findChildren(QListView) + dlg.findChildren(QTreeView):
+            view.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
+
+        # Start in the current text or home
+        start_dir = self.dataset_input.text().strip()
+        if start_dir and os.path.isdir(start_dir):
+            dlg.setDirectory(start_dir)
+
+        if dlg.exec():
+            selected = dlg.selectedFiles()
+            # Filter to only actual directories
+            dirs = [p for p in selected if os.path.isdir(p)]
+            for d in dirs:
+                self._add_dataset_path(d)
+            # Clear the line edit since items went straight to the table
+            self.dataset_input.clear()
 
     def _browse_plot_input_tsv(self):
         path, _ = QFileDialog.getOpenFileName(

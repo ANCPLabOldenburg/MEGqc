@@ -87,9 +87,9 @@ def _get_sensor_param(section: dict, subsection: str, param: str, preferred: str
 
     Elekta datasets expose both magnetometer and gradiometer entries. CTF data
     only provides gradiometers, so we fall back to ``fallback`` when the
-    ``preferred`` sensor entry is missing. Returning ``"NA"`` ensures that the
-    summary table retains the same column layout for concatenation across
-    systems.
+    ``preferred`` sensor entry is missing. EEG-only datasets are also checked.
+    Returning ``"NA"`` ensures that the summary table retains the same column
+    layout for concatenation across systems.
     """
 
     container = _safe_dict(_safe_dict(section).get(subsection))
@@ -100,6 +100,11 @@ def _get_sensor_param(section: dict, subsection: str, param: str, preferred: str
     fallback_section = _safe_dict(container.get(fallback))
     if fallback_section and fallback_section.get(param) is not None:
         return fallback_section.get(param)
+
+    # Try EEG as additional fallback for EEG-only datasets
+    eeg_section = _safe_dict(container.get("eeg"))
+    if eeg_section and eeg_section.get(param) is not None:
+        return eeg_section.get(param)
 
     return "NA"
 
@@ -144,12 +149,14 @@ def create_summary_report(
     # Number of events used when computing the muscle metric
     total_events = muscle.get("total_number_of_events")
 
-    # Extract PSD noise information for magnetometers and gradiometers
+    # Extract PSD noise information for magnetometers, gradiometers, and EEG
     psd_details_mag = _safe_dict(_safe_dict(psd_global.get("mag")).get("details"))
     psd_details_grad = _safe_dict(_safe_dict(psd_global.get("grad")).get("details"))
+    psd_details_eeg = _safe_dict(_safe_dict(psd_global.get("eeg")).get("details"))
 
     has_mag_psd = bool(psd_details_mag)
     has_grad_psd = bool(psd_details_grad)
+    has_eeg_psd = bool(psd_details_eeg)
 
     # Percentage of power attributed to noise for each sensor type
     noisy_power_mag = (
@@ -168,16 +175,21 @@ def create_summary_report(
         if has_grad_psd
         else None
     )
+    noisy_power_eeg = (
+        sum(
+            d.get("percent_of_this_noise_ampl_relative_to_all_signal_global", 0)
+            for d in psd_details_eeg.values()
+        )
+        if has_eeg_psd
+        else None
+    )
 
     # Average noise level across available sensor types. For CTF data only the
     # gradiometer branch is available, but Elekta data (mag+grad) keeps the
-    # original averaging behaviour unchanged.
-    if has_mag_psd and has_grad_psd:
-        M_psd = mean([noisy_power_mag, noisy_power_grad])
-    elif has_mag_psd:
-        M_psd = noisy_power_mag
-    elif has_grad_psd:
-        M_psd = noisy_power_grad
+    # original averaging behaviour unchanged. EEG data adds another branch.
+    noise_values = [v for v in [noisy_power_mag, noisy_power_grad, noisy_power_eeg] if v is not None]
+    if noise_values:
+        M_psd = mean(noise_values)
     else:
         M_psd = None
 
@@ -217,7 +229,8 @@ def create_summary_report(
     def build_summary_table(source):
         """Return a table summarising noisy and flat channels."""
         rows = []
-        for sensor_type in ["mag", "grad"]:
+        sensor_map = {"mag": "MAGNETOMETERS", "grad": "GRADIOMETERS", "eeg": "EEG CHANNELS"}
+        for sensor_type in ["mag", "grad", "eeg"]:
             data_for_sensor = _safe_dict(_safe_dict(source).get(sensor_type))
             n_noisy = data_for_sensor.get("number_of_noisy_ch")
             p_noisy = data_for_sensor.get("percent_of_noisy_ch")
@@ -227,7 +240,7 @@ def create_summary_report(
             rows.append({"Metric": "Flat Channels", sensor_type: _format_count_percent(n_flat, p_flat)})
         df = pd.DataFrame(rows)
         df = df.groupby("Metric").first().reset_index()
-        df.rename(columns={"mag": "MAGNETOMETERS", "grad": "GRADIOMETERS"}, inplace=True)
+        df.rename(columns=sensor_map, inplace=True)
         return df
 
     def build_epoch_summary(source):
@@ -255,12 +268,13 @@ def create_summary_report(
             return total_noisy, total_noisy_pct, total_flat, total_flat_pct
 
         rows = []
-        for sensor_type in ["mag", "grad"]:
+        sensor_map = {"mag": "MAGNETOMETERS", "grad": "GRADIOMETERS", "eeg": "EEG CHANNELS"}
+        for sensor_type in ["mag", "grad", "eeg"]:
             data_for_sensor = _safe_dict(_safe_dict(source).get(sensor_type))
             total_noisy, total_noisy_pct, total_flat, total_flat_pct = _resolve_epoch_totals(data_for_sensor)
             rows.append(
                 {
-                    "Sensor Type": "MAGNETOMETERS" if sensor_type == "mag" else "GRADIOMETERS",
+                    "Sensor Type": sensor_map.get(sensor_type, sensor_type.upper()),
                     "Noisy Epochs": _format_count_percent(
                         total_noisy,
                         total_noisy_pct,
@@ -306,10 +320,10 @@ def create_summary_report(
         ptp_lvl = "NA"
         ptp_epoch_lvl = "NA"
 
-    def build_psd_summary(noise_mag, noise_grad):
+    def build_psd_summary(noise_mag, noise_grad, noise_eeg=None):
         """Return a table with global PSD noise percentages."""
         df = pd.DataFrame([
-            {"Metric": "Noise Power", "mag": noise_mag, "grad": noise_grad}
+            {"Metric": "Noise Power", "mag": noise_mag, "grad": noise_grad, "eeg": noise_eeg}
         ])
 
         def _fmt_noise(val):
@@ -317,10 +331,11 @@ def create_summary_report(
 
         df["mag"] = df["mag"].map(_fmt_noise)
         df["grad"] = df["grad"].map(_fmt_noise)
-        df.rename(columns={"mag": "MAGNETOMETERS", "grad": "GRADIOMETERS"}, inplace=True)
+        df["eeg"] = df["eeg"].map(_fmt_noise)
+        df.rename(columns={"mag": "MAGNETOMETERS", "grad": "GRADIOMETERS", "eeg": "EEG CHANNELS"}, inplace=True)
         return df
 
-    psd_df = build_psd_summary(noisy_power_mag, noisy_power_grad)
+    psd_df = build_psd_summary(noisy_power_mag, noisy_power_grad, noisy_power_eeg)
 
     # Default thresholds and weights for the GQI formula
     thresholds = {
@@ -348,7 +363,8 @@ def create_summary_report(
         """Return a table with channels having |corr| > 0.8 for ECG/EOG."""
         results = []
         percentages = []
-        for sensor_type in ["mag", "grad"]:
+        sensor_map = {"mag": "MAGNETOMETERS", "grad": "GRADIOMETERS", "eeg": "EEG CHANNELS"}
+        for sensor_type in ["mag", "grad", "eeg"]:
             entries = data.get(section)
             entries = _safe_dict(entries)
             entries = _safe_dict(entries.get(contamination_key))
@@ -364,7 +380,7 @@ def create_summary_report(
             percentages.append(percent)
             results.append(
                 {
-                    "Sensor Type": "MAGNETOMETERS" if sensor_type == "mag" else "GRADIOMETERS",
+                    "Sensor Type": sensor_map.get(sensor_type, sensor_type.upper()),
                     "# |High Correlations| > 0.8": f"{high_corr} ({percent:.1f}%)",
                     "Total Channels": total,
                 }
@@ -400,14 +416,11 @@ def create_summary_report(
     if std_present:
         std_global = _safe_dict(data["STD"].get("STD_all_time_series"))
         vals = []
-        mag = _safe_dict(std_global.get("mag"))
-        grad = _safe_dict(std_global.get("grad"))
-        if mag:
-            vals.append(mag.get("percent_of_noisy_ch"))
-            vals.append(mag.get("percent_of_flat_ch"))
-        if grad:
-            vals.append(grad.get("percent_of_noisy_ch"))
-            vals.append(grad.get("percent_of_flat_ch"))
+        for st in ["mag", "grad", "eeg"]:
+            st_data = _safe_dict(std_global.get(st))
+            if st_data:
+                vals.append(st_data.get("percent_of_noisy_ch"))
+                vals.append(st_data.get("percent_of_flat_ch"))
         vals = [v for v in vals if v is not None]
         std_pct = mean(vals) if vals else None
     else:
@@ -416,14 +429,11 @@ def create_summary_report(
     if ptp_present:
         ptp_global = _safe_dict(data["PTP_MANUAL"].get("ptp_manual_all"))
         vals = []
-        mag = _safe_dict(ptp_global.get("mag"))
-        grad = _safe_dict(ptp_global.get("grad"))
-        if mag:
-            vals.append(mag.get("percent_of_noisy_ch"))
-            vals.append(mag.get("percent_of_flat_ch"))
-        if grad:
-            vals.append(grad.get("percent_of_noisy_ch"))
-            vals.append(grad.get("percent_of_flat_ch"))
+        for st in ["mag", "grad", "eeg"]:
+            st_data = _safe_dict(ptp_global.get(st))
+            if st_data:
+                vals.append(st_data.get("percent_of_noisy_ch"))
+                vals.append(st_data.get("percent_of_flat_ch"))
         vals = [v for v in vals if v is not None]
         ptp_pct = mean(vals) if vals else None
     else:
@@ -653,24 +663,44 @@ def generate_gqi_summary(dataset_path: str, megqc_root: str, config_file: str) -
     attempt_dir = os.path.join(reports_root, f"global_quality_index_{attempt}")
     os.makedirs(attempt_dir, exist_ok=True)
 
-    pattern = os.path.join(calc_dir, "sub-*", "*SimpleMetrics_meg.json")
+    # Search for SimpleMetrics JSON files in both modality subfolders and
+    # legacy flat layout.  The glob patterns cover:
+    #   calculation/meg/sub-XXX/*SimpleMetrics_meg.json   (new layout)
+    #   calculation/eeg/sub-XXX/*SimpleMetrics_eeg.json   (new layout)
+    #   calculation/sub-XXX/*SimpleMetrics_meg.json        (legacy layout)
+    #   calculation/sub-XXX/*SimpleMetrics_eeg.json        (legacy layout)
+    _json_patterns = [
+        os.path.join(calc_dir, "meg", "sub-*", "*SimpleMetrics_meg.json"),
+        os.path.join(calc_dir, "eeg", "sub-*", "*SimpleMetrics_eeg.json"),
+        os.path.join(calc_dir, "sub-*", "*SimpleMetrics_meg.json"),
+        os.path.join(calc_dir, "sub-*", "*SimpleMetrics_eeg.json"),
+    ]
+    _seen_json = set()
     summary_paths = []
-    for json_path in glob.glob(pattern):
-        sub_dir = os.path.basename(os.path.dirname(json_path))
-        out_sub = os.path.join(attempt_dir, sub_dir)
-        os.makedirs(out_sub, exist_ok=True)
-        base = os.path.basename(json_path).replace("SimpleMetrics", f"GlobalSummaryReport_attempt{attempt}")
-        out_json = os.path.join(out_sub, base)
-        # Generate per-subject summary JSON (no HTML)
-        create_summary_report(json_path, None, out_json, gqi_params)
-        task_label = _extract_task_label(json_path)
-        summary_paths.append((out_json, task_label))
+    for pattern in _json_patterns:
+        for json_path in glob.glob(pattern):
+            real = os.path.realpath(json_path)
+            if real in _seen_json:
+                continue
+            _seen_json.add(real)
+            sub_dir = os.path.basename(os.path.dirname(json_path))
+            out_sub = os.path.join(attempt_dir, sub_dir)
+            os.makedirs(out_sub, exist_ok=True)
+            base = os.path.basename(json_path).replace("SimpleMetrics", f"GlobalSummaryReport_attempt{attempt}")
+            out_json = os.path.join(out_sub, base)
+            # Generate per-subject summary JSON (no HTML)
+            create_summary_report(json_path, None, out_json, gqi_params)
+            task_label = _extract_task_label(json_path)
+            summary_paths.append((out_json, task_label))
 
     # Collate per-subject summaries into a group table
     group_dir = os.path.join(reports_root, "group_metrics")
     os.makedirs(group_dir, exist_ok=True)
     from meg_qc.calculation.meg_qc_pipeline import flatten_summary_metrics
-    rows = []
+
+    # Separate summary paths by modality based on their BIDS suffix
+    meg_rows = []
+    eeg_rows = []
     for path, task in summary_paths:
         # Flatten each summary JSON into a one-row dictionary
         with open(path, "r", encoding="utf-8") as f:
@@ -678,15 +708,37 @@ def generate_gqi_summary(dataset_path: str, megqc_root: str, config_file: str) -
         subject = os.path.basename(os.path.dirname(path))
         row = {"task": task, "subject": subject}
         row.update(flatten_summary_metrics(js))
-        rows.append(row)
-    if rows:
+
+        # Determine modality from the source file path or suffix
+        basename = os.path.basename(path)
+        if '_eeg.' in basename or '/eeg/' in path:
+            row["modality"] = "eeg"
+            eeg_rows.append(row)
+        else:
+            row["modality"] = "meg"
+            meg_rows.append(row)
+
+    def _write_group_tsv(rows, filepath):
+        """Write a group metrics TSV from a list of row dicts."""
+        if not rows:
+            return
         df = pd.DataFrame(rows)
-        # Ensure the task column is the first column of the table
         cols = df.columns.tolist()
-        cols.insert(0, cols.pop(cols.index("task")))
-        df = df[cols]
-        tsv_file = os.path.join(group_dir, f"Global_Quality_Index_attempt_{attempt}.tsv")
-        df.to_csv(tsv_file, sep="\t", index=False)
+        if "task" in cols:
+            cols.insert(0, cols.pop(cols.index("task")))
+            df = df[cols]
+        df.to_csv(filepath, sep="\t", index=False)
+
+    # Write per-modality tables (primary outputs)
+    if meg_rows:
+        meg_group_dir = os.path.join(group_dir, "meg")
+        os.makedirs(meg_group_dir, exist_ok=True)
+        _write_group_tsv(meg_rows, os.path.join(meg_group_dir, f"Global_Quality_Index_attempt_{attempt}_meg.tsv"))
+
+    if eeg_rows:
+        eeg_group_dir = os.path.join(group_dir, "eeg")
+        os.makedirs(eeg_group_dir, exist_ok=True)
+        _write_group_tsv(eeg_rows, os.path.join(eeg_group_dir, f"Global_Quality_Index_attempt_{attempt}_eeg.tsv"))
 
     # Save configuration used for this attempt
     config_dir = os.path.join(reports_root, "config")

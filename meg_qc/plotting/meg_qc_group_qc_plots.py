@@ -1,8 +1,10 @@
 """Dataset-level QC plotting from Global Quality Index summary tables.
 
-This module builds an interactive HTML QC report from
-``summary_reports/group_metrics/Global_Quality_Index_attempt_*.tsv`` produced
-by the GQI calculation pipeline.
+This module builds an interactive HTML QC report from per-modality GQI TSVs:
+``summary_reports/group_metrics/meg/Global_Quality_Index_attempt_*_meg.tsv``
+``summary_reports/group_metrics/eeg/Global_Quality_Index_attempt_*_eeg.tsv``
+produced by the GQI calculation pipeline.  Legacy combined TSVs at the root
+``group_metrics/`` level are also supported for backward compatibility.
 
 Public entrypoint
 -----------------
@@ -32,7 +34,39 @@ from meg_qc.calculation.meg_qc_pipeline import resolve_analysis_root
 
 
 METRIC_ORDER = ("GQI", "STD", "PtP", "PSD", "ECG", "EOG", "Muscle")
-TOP_TABS = ("Combined (mag+grad)", "MAG", "GRAD")
+TOP_TABS = ("Combined (mag+grad)", "MAG", "GRAD", "EEG")
+
+def _adaptive_legend_layout(n_entries: int, groupclick: str = "") -> dict:
+    """Return legend + margin + height kwargs for non-overlapping zones.
+
+    Title is rendered as independent HTML above the figure (see
+    ``_figure_to_div``).  The legend is **always horizontal**, placed above
+    the plot area with ``y > 1`` so it lives in the top-margin band.  The
+    top margin grows dynamically to accommodate multi-row wrapping, so
+    legend and plot content never overlap.
+    """
+    entries_per_row = 3  # conservative for typical label widths
+    n_rows = max(1, -(-n_entries // entries_per_row))
+    legend_height_px = n_rows * 26 + 20
+    margin_t = max(50, legend_height_px)
+    d: dict = {
+        "orientation": "h",
+        "yanchor": "bottom",
+        "y": 1.02,
+        "xanchor": "left",
+        "x": 0.0,
+        "font": {"size": 11},
+        "itemsizing": "constant",
+        "tracegroupgap": 4,
+    }
+    if groupclick:
+        d["groupclick"] = groupclick
+    return {
+        "legend": d,
+        "margin": {"l": 55, "r": 30, "t": margin_t, "b": 60},
+        "height": max(620, margin_t + 60 + 400),
+    }
+
 
 _LAZY_PLOT_COUNTER = count(1)
 _LAZY_PAYLOAD_COUNTER = count(1)
@@ -48,6 +82,7 @@ class ComponentSpec:
     unit: str
     mag_col: Optional[str] = None
     grad_col: Optional[str] = None
+    eeg_col: Optional[str] = None
     global_col: Optional[str] = None
 
 
@@ -88,6 +123,7 @@ COMPONENTS: Dict[str, List[ComponentSpec]] = {
             "% channels",
             mag_col="STD_ts_noisy_channels_mag_percentage",
             grad_col="STD_ts_noisy_channels_grad_percentage",
+            eeg_col="STD_ts_noisy_channels_eeg_percentage",
         ),
         ComponentSpec(
             "std_ts_flat",
@@ -95,6 +131,7 @@ COMPONENTS: Dict[str, List[ComponentSpec]] = {
             "% channels",
             mag_col="STD_ts_flat_channels_mag_percentage",
             grad_col="STD_ts_flat_channels_grad_percentage",
+            eeg_col="STD_ts_flat_channels_eeg_percentage",
         ),
         ComponentSpec(
             "std_ep_noisy",
@@ -102,6 +139,7 @@ COMPONENTS: Dict[str, List[ComponentSpec]] = {
             "% epochs",
             mag_col="STD_ep_mag_noisy_percentage",
             grad_col="STD_ep_grad_noisy_percentage",
+            eeg_col="STD_ep_eeg_noisy_percentage",
         ),
         ComponentSpec(
             "std_ep_flat",
@@ -109,6 +147,7 @@ COMPONENTS: Dict[str, List[ComponentSpec]] = {
             "% epochs",
             mag_col="STD_ep_mag_flat_percentage",
             grad_col="STD_ep_grad_flat_percentage",
+            eeg_col="STD_ep_eeg_flat_percentage",
         ),
     ],
     "PtP": [
@@ -118,6 +157,7 @@ COMPONENTS: Dict[str, List[ComponentSpec]] = {
             "% channels",
             mag_col="PTP_ts_noisy_channels_mag_percentage",
             grad_col="PTP_ts_noisy_channels_grad_percentage",
+            eeg_col="PTP_ts_noisy_channels_eeg_percentage",
         ),
         ComponentSpec(
             "ptp_ts_flat",
@@ -125,6 +165,7 @@ COMPONENTS: Dict[str, List[ComponentSpec]] = {
             "% channels",
             mag_col="PTP_ts_flat_channels_mag_percentage",
             grad_col="PTP_ts_flat_channels_grad_percentage",
+            eeg_col="PTP_ts_flat_channels_eeg_percentage",
         ),
         ComponentSpec(
             "ptp_ep_noisy",
@@ -132,6 +173,7 @@ COMPONENTS: Dict[str, List[ComponentSpec]] = {
             "% epochs",
             mag_col="PTP_ep_mag_noisy_percentage",
             grad_col="PTP_ep_grad_noisy_percentage",
+            eeg_col="PTP_ep_eeg_noisy_percentage",
         ),
         ComponentSpec(
             "ptp_ep_flat",
@@ -139,6 +181,7 @@ COMPONENTS: Dict[str, List[ComponentSpec]] = {
             "% epochs",
             mag_col="PTP_ep_mag_flat_percentage",
             grad_col="PTP_ep_grad_flat_percentage",
+            eeg_col="PTP_ep_eeg_flat_percentage",
         ),
     ],
     "PSD": [
@@ -148,6 +191,7 @@ COMPONENTS: Dict[str, List[ComponentSpec]] = {
             "% relative power",
             mag_col="PSD_noise_mag_percentage",
             grad_col="PSD_noise_grad_percentage",
+            eeg_col="PSD_noise_eeg_percentage",
         ),
     ],
     "ECG": [
@@ -157,6 +201,7 @@ COMPONENTS: Dict[str, List[ComponentSpec]] = {
             "% channels",
             mag_col="ECG_mag_high_corr_percentage",
             grad_col="ECG_grad_high_corr_percentage",
+            eeg_col="ECG_eeg_high_corr_percentage",
         ),
     ],
     "EOG": [
@@ -166,6 +211,7 @@ COMPONENTS: Dict[str, List[ComponentSpec]] = {
             "% channels",
             mag_col="EOG_mag_high_corr_percentage",
             grad_col="EOG_grad_high_corr_percentage",
+            eeg_col="EOG_eeg_high_corr_percentage",
         ),
     ],
     "Muscle": [
@@ -187,11 +233,54 @@ def _attempt_from_name(path: Path) -> Optional[int]:
 
 
 def _latest_attempt_tsv(group_metrics_dir: Path) -> Optional[Path]:
-    files = list(group_metrics_dir.glob("Global_Quality_Index_attempt_*.tsv"))
+    """Find the latest GQI attempt TSV, scanning per-modality subdirs first.
+
+    Looks in ``group_metrics/meg/`` and ``group_metrics/eeg/`` for
+    per-modality files (``Global_Quality_Index_attempt_*_{meg,eeg}.tsv``).
+    Falls back to legacy combined files in ``group_metrics/`` for backward
+    compatibility with older analysis runs.
+    """
+    files: list = []
+    # Per-modality subdirectories (new layout)
+    for subdir in ("meg", "eeg"):
+        d = group_metrics_dir / subdir
+        if d.is_dir():
+            files.extend(d.glob("Global_Quality_Index_attempt_*.tsv"))
+    # Fallback: legacy combined files in root group_metrics/
+    if not files:
+        files = list(group_metrics_dir.glob("Global_Quality_Index_attempt_*.tsv"))
     if not files:
         return None
     files.sort(key=lambda p: (_attempt_from_name(p) or -1, p.stat().st_mtime), reverse=True)
     return files[0]
+
+
+def _all_attempt_tsvs(group_metrics_dir: Path, attempt: Optional[int] = None) -> List[Path]:
+    """Return all GQI TSVs for an attempt (or latest), from per-modality subdirs.
+
+    Falls back to legacy combined files in root group_metrics/ for backward
+    compatibility.
+    """
+    files: list = []
+    # Per-modality subdirectories (new layout)
+    for subdir in ("meg", "eeg"):
+        d = group_metrics_dir / subdir
+        if d.is_dir():
+            files.extend(d.glob("Global_Quality_Index_attempt_*.tsv"))
+    # Fallback: legacy combined files in root group_metrics/
+    if not files:
+        files = list(group_metrics_dir.glob("Global_Quality_Index_attempt_*.tsv"))
+    if not files:
+        return []
+
+    if attempt is not None:
+        files = [f for f in files if _attempt_from_name(f) == attempt]
+    else:
+        # Keep only files from the latest attempt number
+        latest = max(_attempt_from_name(f) or 0 for f in files)
+        files = [f for f in files if (_attempt_from_name(f) or 0) == latest]
+
+    return sorted(files, key=lambda p: p.name)
 
 
 def _resolve_input_paths(
@@ -250,11 +339,18 @@ def _resolve_input_paths(
             raise FileNotFoundError(f"Input TSV does not exist: {tsv_path}")
     else:
         if attempt is not None:
-            tsv_path = group_metrics_dir / f"Global_Quality_Index_attempt_{attempt}.tsv"
-            if not tsv_path.exists():
+            # Look in per-modality subdirs first, then fall back to root
+            tsv_candidates = _all_attempt_tsvs(group_metrics_dir, attempt=attempt)
+            if not tsv_candidates:
+                # Legacy fallback: try the combined file at root level
+                legacy = group_metrics_dir / f"Global_Quality_Index_attempt_{attempt}.tsv"
+                if legacy.exists():
+                    tsv_candidates = [legacy]
+            if not tsv_candidates:
                 raise FileNotFoundError(
-                    f"Requested attempt {attempt} not found: {tsv_path}"
+                    f"Requested attempt {attempt} not found in {group_metrics_dir}"
                 )
+            tsv_path = tsv_candidates[0]
         else:
             tsv_path = _latest_attempt_tsv(group_metrics_dir)
             if tsv_path is None:
@@ -297,7 +393,32 @@ def _load_one_dataset_bundle(
         analysis_id=analysis_id,
     )
 
-    df_raw = pd.read_csv(tsv_path, sep="\t", low_memory=False)
+    # Load all per-modality TSVs for this attempt and concatenate them.
+    # _resolve_input_paths returns one representative tsv_path; we also
+    # look for sibling modality TSVs from the same attempt.
+    summary_root = Path(megqc_root) / "summary_reports"
+    group_metrics_dir = summary_root / "group_metrics"
+    all_tsvs = _all_attempt_tsvs(group_metrics_dir, attempt=resolved_attempt)
+    if not all_tsvs:
+        # Fallback: use the single TSV resolved above (legacy combined file)
+        all_tsvs = [tsv_path]
+
+    dfs = []
+    for tp in all_tsvs:
+        df_part = pd.read_csv(tp, sep="\t", low_memory=False)
+        # Tag modality from filename or parent directory
+        if "modality" not in df_part.columns:
+            tname = tp.name.lower()
+            tparent = tp.parent.name.lower()
+            if "_eeg" in tname or tparent == "eeg":
+                df_part["modality"] = "eeg"
+            elif "_meg" in tname or tparent == "meg":
+                df_part["modality"] = "meg"
+            else:
+                df_part["modality"] = "unknown"
+        dfs.append(df_part)
+
+    df_raw = pd.concat(dfs, ignore_index=True) if dfs else pd.DataFrame()
     df = _prepare_table(df_raw)
     dataset_name = os.path.basename(os.path.normpath(dataset_path))
     df["dataset"] = dataset_name
@@ -336,8 +457,20 @@ def _prepare_table(df: pd.DataFrame) -> pd.DataFrame:
 
     out["subject"] = out["subject"].fillna("n/a").astype(str)
     out["task"] = out["task"].fillna("unknown").astype(str)
-    out["task_label"] = out["task"].map(lambda t: f"task={t}")
-    out["recording_label"] = out["subject"] + "|" + out["task_label"]
+    out["task_label"] = out["task"].astype(str)  # Clean label: just the task name (e.g. 'rest', not 'task=rest')
+
+    # Build recording_label: sub + task [+ run when present] — uniquely identifies a BIDS recording
+    if "run" in out.columns:
+        out["run"] = out["run"].fillna("n/a").astype(str)
+        out["recording_label"] = out.apply(
+            lambda r: (
+                r["subject"] + "|" + r["task_label"]
+                + (f"|run-{r['run']}" if r["run"] not in ("n/a", "nan", "") else "")
+            ),
+            axis=1,
+        )
+    else:
+        out["recording_label"] = out["subject"] + "|" + out["task_label"]
 
     if {"Muscle_events_num", "Muscle_events_total"}.issubset(out.columns):
         num = _coerce_numeric(out["Muscle_events_num"])
@@ -371,6 +504,14 @@ def _series_for_component(df: pd.DataFrame, spec: ComponentSpec, view: str) -> p
 
     if view == "grad":
         s = _from_col(spec.grad_col)
+        if s.notna().any():
+            return s
+        if spec.global_col:
+            return _from_col(spec.global_col)
+        return s
+
+    if view == "eeg":
+        s = _from_col(spec.eeg_col)
         if s.notna().any():
             return s
         if spec.global_col:
@@ -434,7 +575,7 @@ def _with_all_tasks_by_dataset(df: pd.DataFrame) -> pd.DataFrame:
         return df
     out = df.copy()
     out["dataset"] = out.get("dataset", "dataset").astype(str)
-    out["task_label"] = out.get("task_label", "task=unknown").astype(str)
+    out["task_label"] = out.get("task_label", "unknown").astype(str)
 
     per_task = out.copy()
     per_task["task_label"] = per_task["dataset"] + " | " + per_task["task_label"]
@@ -458,18 +599,63 @@ def _with_all_tasks_by_dataset(df: pd.DataFrame) -> pd.DataFrame:
 
 def _has_channel_type_data(df: pd.DataFrame, view: str) -> bool:
     """True when a channel-type view has at least one finite metric column."""
-    if view not in {"mag", "grad"}:
+    if view not in {"mag", "grad", "eeg"}:
         return True
     cols: List[str] = []
     for specs in COMPONENTS.values():
         for spec in specs:
-            col = spec.mag_col if view == "mag" else spec.grad_col
+            if view == "mag":
+                col = spec.mag_col
+            elif view == "grad":
+                col = spec.grad_col
+            elif view == "eeg":
+                col = spec.eeg_col
+            else:
+                col = None
             if col:
                 cols.append(col)
     for col in cols:
         if col in df.columns and np.isfinite(_coerce_numeric(df[col])).any():
             return True
     return False
+
+
+def _has_modality(df: pd.DataFrame, modality: str) -> bool:
+    """True when the dataframe contains rows belonging to *modality*.
+
+    Uses the ``modality`` column (tagged from TSV filename / parent directory)
+    as the authoritative source so that a MEG file which happens to contain a
+    few EEG channels is *not* mistaken for an EEG recording.
+
+    Falls back to :func:`_has_channel_type_data` only for legacy combined TSVs
+    that have no ``modality`` column or where every row is ``"unknown"``.
+    """
+    if "modality" in df.columns:
+        known = df.loc[df["modality"].isin({"meg", "eeg", "ieeg"})]
+        if not known.empty:
+            return bool(known["modality"].eq(modality).any())
+    # Legacy / unknown fallback
+    if modality == "meg":
+        return _has_channel_type_data(df, "mag") or _has_channel_type_data(df, "grad")
+    if modality == "eeg":
+        return _has_channel_type_data(df, "eeg")
+    return False
+
+
+def _filter_by_modality(df: pd.DataFrame, modality: str) -> pd.DataFrame:
+    """Return only rows belonging to *modality*, or the full df for legacy data.
+
+    When the ``modality`` column exists and has at least one non-unknown entry
+    the df is filtered to the requested modality.  This prevents MEG rows from
+    polluting an EEG report (and vice-versa) even when both modalities are
+    present in a concatenated dataframe.
+    """
+    if "modality" in df.columns:
+        known = df.loc[df["modality"].isin({"meg", "eeg", "ieeg"})]
+        if not known.empty:
+            filtered = df.loc[df["modality"] == modality]
+            return filtered if not filtered.empty else df
+    return df
 
 
 def _group_order(df: pd.DataFrame) -> List[str]:
@@ -1087,11 +1273,9 @@ def plot_violin_with_subject_points(
     fig.update_layout(
         title={"text": title, "x": 0.5, "y": 0.98, "xanchor": "center"},
         template="plotly_white",
-        xaxis_title="Task / condition",
+        xaxis_title="Task",
         yaxis_title=y_label,
-        legend={"orientation": "h", "y": 1.08, "x": 0.0, "groupclick": "togglegroup"},
-        margin={"l": 55, "r": 30, "t": 120, "b": 60},
-        height=620,
+        **_adaptive_legend_layout(len(labels), groupclick="togglegroup"),
         violinmode="group",
     )
     fig.update_xaxes(
@@ -1256,11 +1440,9 @@ def plot_box_with_subject_points(
     fig.update_layout(
         title={"text": title, "x": 0.5, "y": 0.98, "xanchor": "center"},
         template="plotly_white",
-        xaxis_title="Task / condition",
+        xaxis_title="Task",
         yaxis_title=y_label,
-        legend={"orientation": "h", "y": 1.08, "x": 0.0, "groupclick": "togglegroup"},
-        margin={"l": 55, "r": 30, "t": 120, "b": 60},
-        height=620,
+        **_adaptive_legend_layout(len(labels), groupclick="togglegroup"),
         boxmode="overlay",
     )
     fig.update_xaxes(
@@ -1343,9 +1525,7 @@ def plot_histogram_by_task(df: pd.DataFrame, title: str, x_label: str) -> Option
         xaxis_title=x_label,
         yaxis_title="Density",
         barmode="overlay",
-        legend={"orientation": "h", "y": 1.08, "x": 0.0, "groupclick": "togglegroup"},
-        margin={"l": 55, "r": 30, "t": 120, "b": 60},
-        height=620,
+        **_adaptive_legend_layout(len(groups), groupclick="togglegroup"),
     )
     _attach_distribution_style_controls(fig, default_line_width=2.8, default_marker_size=8.0)
     return fig
@@ -1384,9 +1564,7 @@ def plot_density_by_task(df: pd.DataFrame, title: str, x_label: str) -> Optional
         template="plotly_white",
         xaxis_title=x_label,
         yaxis_title="Kernel density",
-        legend={"orientation": "h", "y": 1.08, "x": 0.0, "groupclick": "togglegroup"},
-        margin={"l": 55, "r": 30, "t": 120, "b": 60},
-        height=620,
+        **_adaptive_legend_layout(len(fig.data), groupclick="togglegroup"),
     )
     _attach_distribution_style_controls(fig, default_line_width=2.8, default_marker_size=8.0)
     return fig
@@ -1610,6 +1788,17 @@ def _summary_distribution_grid_html(
             ]
             c = next((x for x in candidates if x is not None), None)
             return int(round(c)) if c is not None else None
+        if view == "eeg":
+            candidates = [
+                _row_val("ECG_eeg_total_channels"),
+                _row_val("EOG_eeg_total_channels"),
+                _num_pct("STD_ts_noisy_channels_eeg_num", "STD_ts_noisy_channels_eeg_percentage"),
+                _num_pct("PTP_ts_noisy_channels_eeg_num", "PTP_ts_noisy_channels_eeg_percentage"),
+                _num_pct("STD_ts_flat_channels_eeg_num", "STD_ts_flat_channels_eeg_percentage"),
+                _num_pct("PTP_ts_flat_channels_eeg_num", "PTP_ts_flat_channels_eeg_percentage"),
+            ]
+            c = next((x for x in candidates if x is not None), None)
+            return int(round(c)) if c is not None else None
 
         mag_candidates = [
             _row_val("ECG_mag_total_channels"),
@@ -1778,11 +1967,9 @@ def plot_task_profiles(df: pd.DataFrame, title: str, y_label: str) -> Optional[g
     fig.update_layout(
         title={"text": title, "x": 0.5, "y": 0.98, "xanchor": "center"},
         template="plotly_white",
-        xaxis_title="Task / condition",
+        xaxis_title="Task",
         yaxis_title=y_label,
-        legend={"orientation": "h", "y": 1.08, "x": 0.0},
-        margin={"l": 55, "r": 30, "t": 120, "b": 60},
-        height=620,
+        **_adaptive_legend_layout(1),
     )
     return fig
 
@@ -1820,7 +2007,7 @@ def plot_subject_task_heatmap(df: pd.DataFrame, title: str, color_title: str) ->
     fig.update_layout(
         title={"text": title, "x": 0.5, "y": 0.98, "xanchor": "center"},
         template="plotly_white",
-        xaxis_title="Task / condition",
+        xaxis_title="Task",
         yaxis_title="Subject",
         margin={"l": 70, "r": 40, "t": 90, "b": 60},
         height=max(560, 28 * len(y) + 220),
@@ -1961,13 +2148,29 @@ def _figure_to_div(
     if fig is None:
         return "<p>No data available for this panel.</p>"
     fig_out = go.Figure(fig)
+
+    # ── Zone 1: extract title into an independent HTML block ─────────
+    title_html = ""
+    fig_title = fig_out.layout.title
+    if fig_title:
+        title_text = ""
+        if isinstance(fig_title, str):
+            title_text = fig_title
+        else:
+            title_text = str(getattr(fig_title, "text", "") or "")
+        if title_text:
+            title_html = f"<div class='fig-title'>{html.escape(title_text)}</div>"
+            fig_out.update_layout(title=None)
+
+    # ── Zone 2 (legend) stays inside the Plotly figure at y>1 ────────
+    # ── Zone 3 (plot) occupies the remaining Plotly area ─────────────
     if include_axis_size_control:
         _attach_axis_label_size_controller(fig_out)
     controls = _extract_figure_controls(fig_out) if include_plot_controls else []
     height = fig_out.layout.height
     if height is None or (isinstance(height, (float, int)) and not np.isfinite(height)):
         height = 620
-    return _register_lazy_figure(fig_out, height_px=f"{int(max(420, float(height)))}px", controls=controls)
+    return title_html + _register_lazy_figure(fig_out, height_px=f"{int(max(420, float(height)))}px", controls=controls)
 
 
 def _figure_block(fig: Optional[go.Figure], interpretation: str) -> str:
@@ -2079,7 +2282,7 @@ def _summary_table_html(df: pd.DataFrame, selected_cols: Sequence[str]) -> str:
                 f"<td>{int(row['n_rows'])}</td></tr>"
             )
     task_table = (
-        "<table><thead><tr><th>Task / condition</th><th>N subjects</th><th>N rows</th></tr></thead>"
+        "<table><thead><tr><th>Task</th><th>N subjects</th><th>N rows</th></tr></thead>"
         f"<tbody>{''.join(task_rows) if task_rows else '<tr><td colspan=3>n/a</td></tr>'}</tbody></table>"
     )
 
@@ -2090,7 +2293,7 @@ def _summary_table_html(df: pd.DataFrame, selected_cols: Sequence[str]) -> str:
         f"<p><strong>N task-level rows:</strong> {n_rows}</p>"
         f"<p><strong>Tasks:</strong> {', '.join(tasks) if tasks else 'n/a'}</p>"
         "</div>"
-        "<div class='tile'><h3>Subjects per task / condition</h3>"
+        "<div class='tile'><h3>Subjects per task</h3>"
         f"{task_table}</div>"
         "<div class='tile'><h3>Column availability</h3>"
         "<table><thead><tr><th>Column</th><th>Available n</th><th>Missing n</th></tr></thead>"
@@ -2151,7 +2354,7 @@ def _metric_component_panel(
                 _figure_block(
                     boxplot,
                     (
-                        f"X-axis is task / condition. Y-axis is {spec.label} in {spec.unit}. "
+                        f"X-axis is task. Y-axis is {spec.label} in {spec.unit}. "
                         "Each box summarizes the empirical spread (median, quartiles, whiskers) for one task-level group. "
                         "Jittered dots are one robust subject summary per task group and are colored by subject identity."
                     ),
@@ -2162,7 +2365,7 @@ def _metric_component_panel(
                 _figure_block(
                     violin,
                     (
-                        f"X-axis is task / condition. Y-axis is {spec.label} in {spec.unit}. "
+                        f"X-axis is task. Y-axis is {spec.label} in {spec.unit}. "
                         f"Each violin shows the full task-level distribution across subject-task rows; wider segments indicate higher density. "
                         "Jittered dots are one robust value per subject per task group (median if multiple rows exist) and are colored by subject identity."
                     ),
@@ -2222,7 +2425,7 @@ def _metric_component_panel(
                     _figure_block(
                         ds_profile,
                         (
-                            f"X-axis is task / condition; Y-axis is {spec.label} ({spec.unit}). "
+                            f"X-axis is task; Y-axis is {spec.label} ({spec.unit}). "
                             "Thin lines are within-subject trajectories and thick line is cohort median for this dataset only."
                         ),
                     ),
@@ -2265,7 +2468,7 @@ def _metric_component_panel(
             _figure_block(
                 profile,
                 (
-                    f"X-axis is task / condition; Y-axis is {spec.label} ({spec.unit}). "
+                    f"X-axis is task; Y-axis is {spec.label} ({spec.unit}). "
                     "Thin lines are within-subject trajectories across tasks; the thick line is cohort median per task. "
                     "Use this panel to separate subject-specific shifts from cohort-level task effects."
                 ),
@@ -2383,10 +2586,12 @@ def _tab_content(
         view = "combined"
     elif top_tab == "MAG":
         view = "mag"
+    elif top_tab == "EEG":
+        view = "eeg"
     else:
         view = "grad"
 
-    has_view_data = _has_channel_type_data(df, view) if view in {"mag", "grad"} else True
+    has_view_data = _has_channel_type_data(df, view) if view in {"mag", "grad", "eeg"} else True
     metric_tabs: List[Tuple[str, str]] = []
     if has_view_data:
         for metric in METRIC_ORDER:
@@ -2469,14 +2674,41 @@ def _build_report_html(
     attempt_text: str,
     general_settings_snapshots: Dict[str, str],
     gqi_settings_snapshots: Dict[str, str],
+    allowed_tabs: Optional[Sequence[str]] = None,
 ) -> str:
     _reset_lazy_figure_store()
     generated = dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     version = getattr(meg_qc, "__version__", "unknown")
 
+    # Determine which tabs to include
+    tabs_to_use = list(allowed_tabs) if allowed_tabs is not None else list(TOP_TABS)
+    if allowed_tabs is not None:
+        # Caller explicitly selected these tabs — trust the selection
+        active_tabs = list(allowed_tabs)
+    else:
+        active_tabs = []
+        for top_tab in tabs_to_use:
+            if top_tab == "Combined (mag+grad)":
+                view = "combined"
+            elif top_tab == "MAG":
+                view = "mag"
+            elif top_tab == "EEG":
+                view = "eeg"
+            else:
+                view = "grad"
+            if view == "combined":
+                # Combined tab should appear only if mag or grad data exists
+                if _has_channel_type_data(df, "mag") or _has_channel_type_data(df, "grad"):
+                    active_tabs.append(top_tab)
+            else:
+                if _has_channel_type_data(df, view):
+                    active_tabs.append(top_tab)
+        if not active_tabs:
+            active_tabs = list(tabs_to_use)  # fallback: show all requested tabs
+
     tab_buttons = []
     tab_panels = []
-    for idx, top_tab in enumerate(TOP_TABS):
+    for idx, top_tab in enumerate(active_tabs):
         tab_id = f"qc-top-tab-{idx}"
         active = " active" if idx == 0 else ""
         tab_buttons.append(f"<button class='tab-btn{active}' data-target='{tab_id}'>{top_tab}</button>")
@@ -2578,6 +2810,14 @@ def _build_report_html(
     }}
     .tile {{ border: 1px solid #d9e7f8; border-radius: 10px; padding: 10px; background: #fbfdff; }}
     .fig {{ border-top: 1px solid #e7eef8; margin-top: 10px; padding-top: 10px; overflow: visible; }}
+    .fig-title {{
+      font-size: 16px;
+      font-weight: 700;
+      color: #1a3a5c;
+      text-align: center;
+      padding: 10px 8px 2px;
+      line-height: 1.3;
+    }}
     .fig .js-plotly-plot {{ width: 100% !important; }}
     .lazy-plot-wrap {{ width: 100%; }}
     .plot-controls {{
@@ -3229,19 +3469,77 @@ def make_group_qc_plots_meg_qc(
     if output_html:
         out_path = Path(output_html)
         out_path.parent.mkdir(parents=True, exist_ok=True)
+        out_path.write_text(report_html, encoding="utf-8")
+        print(f"___MEGqc___: QC group report created: {out_path}")
     else:
-        suffix = f"_attempt_{bundle.attempt}" if bundle.attempt is not None else ""
-        out_path = bundle.reports_dir / f"QC_group_report_{bundle.dataset_name}{suffix}.html"
+        # Only per-modality reports; no combined agnostic report at top level
+        out_path = None
 
-    out_path.write_text(report_html, encoding="utf-8")
-    print(f"___MEGqc___: QC group report created: {out_path}")
-    print(f"___MEGqc___: Source TSV used: {bundle.tsv_path}")
-    if bundle.cfg_path is not None:
-        print(f"___MEGqc___: Config snapshot used: {bundle.cfg_path}")
+    if out_path:
+        print(f"___MEGqc___: Source TSV used: {bundle.tsv_path}")
+        if bundle.cfg_path is not None:
+            print(f"___MEGqc___: Config snapshot used: {bundle.cfg_path}")
+        else:
+            print("___MEGqc___: Config snapshot used: none found for selected attempt")
+        print(f"___MEGqc___: Derivatives root: {bundle.derivatives_root}")
     else:
-        print("___MEGqc___: Config snapshot used: none found for selected attempt")
-    print(f"___MEGqc___: Derivatives root: {bundle.derivatives_root}")
-    return out_path
+        print(f"___MEGqc___: Source TSV used: {bundle.tsv_path}")
+        if bundle.cfg_path is not None:
+            print(f"___MEGqc___: Config snapshot used: {bundle.cfg_path}")
+        else:
+            print("___MEGqc___: Config snapshot used: none found for selected attempt")
+        print(f"___MEGqc___: Derivatives root: {bundle.derivatives_root}")
+
+    # ── Per-modality separate HTML reports ──────────────────────────────
+    _common_src = [
+        f"{bundle.dataset_name}: tsv={bundle.tsv_path}",
+        f"{bundle.dataset_name}: config={bundle.cfg_path if bundle.cfg_path is not None else 'No matched config file found'}",
+    ]
+    _common_kw = dict(
+        attempt_text=str(bundle.attempt) if bundle.attempt is not None else "n/a",
+        general_settings_snapshots={bundle.dataset_name: bundle.general_settings_snapshot},
+        gqi_settings_snapshots={bundle.dataset_name: bundle.gqi_settings_snapshot},
+    )
+    _sfx = f"_attempt_{bundle.attempt}" if bundle.attempt is not None else ""
+
+    # MEG-only report (Combined+MAG+GRAD) — only if this dataset has MEG recordings.
+    # _has_modality uses the BIDS 'modality' column (set from TSV subfolder/filename)
+    # so MEG files containing a few EEG channels are NOT counted as EEG datasets.
+    has_meg = _has_modality(bundle.df, "meg")
+    if has_meg:
+        meg_df = _filter_by_modality(bundle.df, "meg")
+        meg_html = _build_report_html(
+            report_name=bundle.dataset_name, df=meg_df, source_rows=_common_src,
+            allowed_tabs=["Combined (mag+grad)", "MAG", "GRAD"], **_common_kw,
+        )
+        meg_dir = bundle.reports_dir / "meg"
+        meg_dir.mkdir(parents=True, exist_ok=True)
+        meg_path = meg_dir / f"QC_group_report_{bundle.dataset_name}{_sfx}_meg.html"
+        meg_path.write_text(meg_html, encoding="utf-8")
+        print(f"___MEGqc___:   MEG QC report: {meg_path}")
+
+    # EEG-only report — only if this dataset has genuine EEG recordings.
+    has_eeg = _has_modality(bundle.df, "eeg")
+    if has_eeg:
+        eeg_df = _filter_by_modality(bundle.df, "eeg")
+        eeg_html = _build_report_html(
+            report_name=bundle.dataset_name, df=eeg_df, source_rows=_common_src,
+            allowed_tabs=["EEG"], **_common_kw,
+        )
+        eeg_dir = bundle.reports_dir / "eeg"
+        eeg_dir.mkdir(parents=True, exist_ok=True)
+        eeg_path = eeg_dir / f"QC_group_report_{bundle.dataset_name}{_sfx}_eeg.html"
+        eeg_path.write_text(eeg_html, encoding="utf-8")
+        print(f"___MEGqc___:   EEG QC report: {eeg_path}")
+
+    if out_path:
+        return out_path
+    # Return primary per-modality path
+    if has_meg:
+        return bundle.reports_dir / "meg" / f"QC_group_report_{bundle.dataset_name}{_sfx}_meg.html"
+    if has_eeg:
+        return bundle.reports_dir / "eeg" / f"QC_group_report_{bundle.dataset_name}{_sfx}_eeg.html"
+    return None
 
 
 def make_group_qc_plots_multi_meg_qc(
@@ -3299,13 +3597,58 @@ def make_group_qc_plots_multi_meg_qc(
     if output_html:
         out_path = Path(output_html)
         out_path.parent.mkdir(parents=True, exist_ok=True)
+        out_path.write_text(report_html, encoding="utf-8")
+        print(f"___MEGqc___: QC multi-dataset report created: {out_path}")
+        for b in bundles:
+            print(f"___MEGqc___:   {b.dataset_name} -> {b.tsv_path}")
     else:
-        suffix = f"_attempt_{attempt}" if attempt is not None else ""
-        safe_name = "_".join(names)
-        out_path = bundles[0].reports_dir / f"QC_group_report_multi_{safe_name}{suffix}.html"
+        # Only per-modality reports; no combined agnostic report at top level
+        out_path = None
+        for b in bundles:
+            print(f"___MEGqc___:   {b.dataset_name} -> {b.tsv_path}")
 
-    out_path.write_text(report_html, encoding="utf-8")
-    print(f"___MEGqc___: QC multi-dataset report created: {out_path}")
-    for b in bundles:
-        print(f"___MEGqc___:   {b.dataset_name} -> {b.tsv_path}")
+    # ── Per-modality separate HTML reports ──────────────────────────────
+    _common_kw = dict(
+        source_rows=source_rows,
+        attempt_text=attempt_text,
+        general_settings_snapshots=general_snapshots,
+        gqi_settings_snapshots=gqi_snapshots,
+    )
+    base_dir = bundles[0].reports_dir
+    suffix = f"_attempt_{attempt}" if attempt is not None else ""
+    safe_name = "_".join(names)
+
+    # Use BIDS modality column for authoritative MEG/EEG classification.
+    # _has_modality checks the 'modality' column set from TSV subfolder/filename,
+    # so MEG datasets that contain a few EEG channels do NOT appear in EEG reports.
+    has_meg = _has_modality(df_all, "meg")
+    if has_meg:
+        meg_df = _filter_by_modality(df_all, "meg")
+        meg_html = _build_report_html(
+            report_name=report_name, df=meg_df,
+            allowed_tabs=["Combined (mag+grad)", "MAG", "GRAD"], **_common_kw,
+        )
+        meg_dir = base_dir / "meg"
+        meg_dir.mkdir(parents=True, exist_ok=True)
+        meg_path = meg_dir / f"QC_group_report_multi_{safe_name}{suffix}_meg.html"
+        meg_path.write_text(meg_html, encoding="utf-8")
+        print(f"___MEGqc___:   MEG QC multi report: {meg_path}")
+        if out_path is None:
+            out_path = meg_path
+
+    has_eeg = _has_modality(df_all, "eeg")
+    if has_eeg:
+        eeg_df = _filter_by_modality(df_all, "eeg")
+        eeg_html = _build_report_html(
+            report_name=report_name, df=eeg_df,
+            allowed_tabs=["EEG"], **_common_kw,
+        )
+        eeg_dir = base_dir / "eeg"
+        eeg_dir.mkdir(parents=True, exist_ok=True)
+        eeg_path = eeg_dir / f"QC_group_report_multi_{safe_name}{suffix}_eeg.html"
+        eeg_path.write_text(eeg_html, encoding="utf-8")
+        print(f"___MEGqc___:   EEG QC multi report: {eeg_path}")
+        if out_path is None:
+            out_path = eeg_path
+
     return out_path

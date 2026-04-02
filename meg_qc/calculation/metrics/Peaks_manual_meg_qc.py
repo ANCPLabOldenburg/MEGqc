@@ -192,7 +192,7 @@ def get_ptp_epochs(channels: List, epochs_mg: mne.Epochs, sfreq: int, ptp_thresh
 
 def make_simple_metric_ptp_manual(ptp_manual_params: dict, big_ptp_with_value_all_data: dict,
                                   small_ptp_with_value_all_data: dict, channels: dict, deriv_epoch_ptp: dict,
-                                  metric_local: bool, m_or_g_chosen: List):
+                                  metric_local: bool, m_or_g_chosen: List, onset_times: list=None):
     """
     Create a simple metric for peak-to-peak amplitude. 
     Global: The metric is calculated for all data (not epoched) and 
@@ -230,8 +230,8 @@ def make_simple_metric_ptp_manual(ptp_manual_params: dict, big_ptp_with_value_al
     else:
         metric_local_description = 'Not calculated. Ne epochs found'
 
-    metric_global_content = {'mag': None, 'grad': None}
-    metric_local_content = {'mag': None, 'grad': None}
+    metric_global_content = {'mag': None, 'grad': None, 'eeg': None}
+    metric_local_content = {'mag': None, 'grad': None, 'eeg': None}
     for m_or_g in m_or_g_chosen:
         metric_global_content[m_or_g] = make_dict_global_std_ptp(ptp_manual_params, big_ptp_with_value_all_data[m_or_g],
                                                                  small_ptp_with_value_all_data[m_or_g],
@@ -242,14 +242,17 @@ def make_simple_metric_ptp_manual(ptp_manual_params: dict, big_ptp_with_value_al
                                                                    deriv_epoch_ptp[m_or_g][1].content,
                                                                    deriv_epoch_ptp[m_or_g][2].content,
                                                                    percent_noisy_flat_allowed=ptp_manual_params[
-                                                                       'allow_percent_noisy_flat_epochs'])
+                                                                       'allow_percent_noisy_flat_epochs'],
+                                                                   onset_times=onset_times)
             # deriv_epoch_std[m_or_g][1].content is df with big std(noisy), df_epoch_std[m_or_g][2].content is df with small std(flat)
         else:
             metric_local_content[m_or_g] = None
 
     simple_metric = simple_metric_basic(metric_global_name, metric_global_description, metric_global_content['mag'],
                                         metric_global_content['grad'], metric_local_name, metric_local_description,
-                                        metric_local_content['mag'], metric_local_content['grad'])
+                                        metric_local_content['mag'], metric_local_content['grad'],
+                                        metric_global_content_eeg=metric_global_content.get('eeg'),
+                                        metric_local_content_eeg=metric_local_content.get('eeg'))
 
     return simple_metric
 
@@ -298,7 +301,7 @@ def PP_manual_meg_qc(
         String with notes about PtP manual for report
 
     """
-    data, shielding_str, meg_system = load_data(data_path)
+    data, shielding_str, meg_system, _modality = load_data(data_path)
 
     sfreq = data.info['sfreq']
 
@@ -328,7 +331,7 @@ def PP_manual_meg_qc(
         big_ptp_with_value_all_data[m_or_g], small_ptp_with_value_all_data[m_or_g] = get_big_small_std_ptp_all_data(
             peak_ampl[m_or_g], channels[m_or_g], ptp_manual_params['std_lvl'])
 
-    if dict_epochs_mg['mag'] is not None or dict_epochs_mg['grad'] is not None:  # if epochs are present
+    if dict_epochs_mg['mag'] is not None or dict_epochs_mg['grad'] is not None or dict_epochs_mg.get('eeg') is not None:  # if epochs are present
         for m_or_g in m_or_g_chosen:
             df_ptp = get_ptp_epochs(channels[m_or_g], dict_epochs_mg[m_or_g], sfreq,
                                     ptp_manual_params['ptp_thresh_lvl'], ptp_manual_params['max_pair_dist_sec'])
@@ -352,7 +355,8 @@ def PP_manual_meg_qc(
 
     simple_metric_ptp_manual = make_simple_metric_ptp_manual(ptp_manual_params, big_ptp_with_value_all_data,
                                                              small_ptp_with_value_all_data, channels,
-                                                             noisy_flat_epochs_derivs, metric_local, m_or_g_chosen)
+                                                             noisy_flat_epochs_derivs, metric_local, m_or_g_chosen,
+                                                             onset_times=dict_epochs_mg.get('epoch_onset_times_s'))
 
     # Extract chs_by_lobe into a data frame
     df_deriv = chs_dict_to_csv(chs_by_lobe_ptp, file_name_prefix='PtPsManual')

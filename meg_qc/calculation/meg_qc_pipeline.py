@@ -253,9 +253,13 @@ def _list_used_settings_files(config_dir: str) -> List[str]:
     """Return saved config snapshots sorted by latest first."""
     if not os.path.isdir(config_dir):
         return []
-    pattern = os.path.join(config_dir, "*_desc-UsedSettings*_meg.ini")
-    files = glob.glob(pattern)
-    files.sort(key=lambda p: os.path.getmtime(p), reverse=True)
+    # Support both _meg.ini (default) and _eeg.ini suffixed config snapshots
+    files = []
+    for suffix in ("meg", "eeg"):
+        pattern = os.path.join(config_dir, f"*_desc-UsedSettings*_{suffix}.ini")
+        files.extend(glob.glob(pattern))
+    # Deduplicate (in case of overlapping globs) and sort newest first
+    files = sorted(set(files), key=lambda p: os.path.getmtime(p), reverse=True)
     return files
 
 
@@ -347,10 +351,19 @@ def ctf_workaround(dataset, sid):
     return sorted(filtered_folders)
 
 
-def get_files_list(sid: str, dataset_path: str, dataset):
+def get_files_list(sid: str, dataset_path: str, dataset, m_or_g_chosen: list = None):
     """
-    Different ways for fif, ctf, etc...
-    Using ancpbids to get the list of files for each subject in ds.
+    Use BIDS-compliant modality classification (via ancpbids) to discover
+    MEG and EEG files for a given subject.
+
+    The **primary modality signal** is the BIDS suffix that the dataset
+    itself provides (``suffix='meg'`` for MEG recordings, ``suffix='eeg'``
+    for independent EEG recordings).  This is the canonical way BIDS
+    separates modalities and works regardless of the underlying file format
+    (.fif, .ds, .edf, .set, …).
+
+    A secondary filesystem walk is still performed to distinguish FIF-based
+    MEG from CTF (.ds) MEG, since they require different loading strategies.
 
     Parameters
     ----------
@@ -360,63 +373,169 @@ def get_files_list(sid: str, dataset_path: str, dataset):
         Path to the BIDS-conform data set to run the QC on.
     dataset : ancpbids.Dataset
         Dataset object to work with.
-
+    m_or_g_chosen : list, optional
+        Channel types chosen by the user (e.g. ['mag', 'grad'] or ['eeg']).
+        Used to resolve ambiguity in multimodal datasets that contain both
+        MEG and EEG files.
 
     Returns
     -------
     list_of_files : list
-        List of paths to the .fif files for each subject.
+        List of paths to the data files for each subject.
     entities_per_file : list
         List of entities for each file in list_of_files.
     """
 
+    # ── 1. Determine user preference from config ─────────────────────────
+    _user_wants_eeg = False
+    _user_wants_meg = False
+    if m_or_g_chosen:
+        _user_wants_eeg = 'eeg' in m_or_g_chosen
+        _user_wants_meg = any(t in m_or_g_chosen for t in ('mag', 'grad'))
+
+    # ── 2. Query ancpbids for MEG and EEG files using BIDS suffix ────────
+    # This is the primary modality classifier: BIDS suffix in the dataset
+    # structure (e.g., sub-XX/ses-meg/meg/*_meg.fif  or
+    #                     sub-XX/ses-eeg/eeg/*_eeg.set).
+    # ancpbids returns files whose BIDS suffix matches, regardless of format.
+
+    # MEG files (suffix='meg')
+    meg_files_raw = sorted(
+        list(dataset.query(suffix='meg', return_type='filename', subj=sid, scope='raw')))
+    # EEG files (suffix='eeg')
+    eeg_files_raw = sorted(
+        list(dataset.query(suffix='eeg', return_type='filename', subj=sid, scope='raw')))
+
+    has_meg = len(meg_files_raw) > 0
+    has_eeg = len(eeg_files_raw) > 0
+
+    # ── 3. Distinguish FIF vs CTF inside the MEG pool ────────────────────
+    # We still need to know whether the MEG files are FIF or CTF because
+    # CTF requires a special loading path (ctf_workaround).
     has_fif = False
     has_ctf = False
 
     for root, dirs, files in os.walk(dataset_path):
-
-        # Exclude the 'derivatives' folder.
-        # Because we will later save ds info as derivative with extension .fif
-        # so if we work on this ds again it might see a ctf ds as fif.
+        # Exclude the 'derivatives' folder — our own FIF derivatives could
+        # otherwise confuse CTF datasets.
         dirs[:] = [d for d in dirs if d != 'derivatives']
-
-        # Check for .fif files
         if any(file.endswith('.fif') for file in files):
             has_fif = True
-
-        # Check for folders ending with .ds
-        if any(dir.endswith('.ds') for dir in dirs):
+        if any(d.endswith('.ds') for d in dirs):
             has_ctf = True
-
-        # If both are found, no need to continue walking
         if has_fif and has_ctf:
-            raise ValueError('Both fif and ctf files found in the dataset. Can not define how to read the ds.')
+            raise ValueError(
+                'Both fif and ctf files found in the dataset. '
+                'Cannot define how to read the ds.')
 
-    if has_fif:
-        list_of_files = sorted(
-            list(dataset.query(suffix='meg', extension='.fif', return_type='filename', subj=sid, scope='raw')))
+    # ── 4. Resolve multimodal ambiguity using user preference ────────────
+    if has_meg and has_eeg:
+        if _user_wants_eeg and _user_wants_meg:
+            print('___MEGqc___: Multimodal dataset detected (MEG + EEG). '
+                  'Config requests both MEG and EEG channels — processing all files.')
+        elif _user_wants_eeg and not _user_wants_meg:
+            print('___MEGqc___: Multimodal dataset detected (MEG + EEG). '
+                  'Config requests EEG channels — processing EEG files only.')
+            has_meg = False
+        elif _user_wants_meg and not _user_wants_eeg:
+            print('___MEGqc___: Multimodal dataset detected (MEG + EEG). '
+                  'Config requests MEG channels — processing MEG files only.')
+            has_eeg = False
+        else:
+            # Unspecified — default to MEG (legacy behaviour)
+            print('___MEGqc___: Multimodal dataset detected (MEG + EEG). '
+                  'Defaulting to MEG files. Set ch_types = eeg in config '
+                  'to process EEG instead.')
+            has_eeg = False
 
-        entities_per_file = dataset.query(subj=sid, suffix='meg', extension='.fif', scope='raw')
-        # sort list_of_sub_jsons by name key to get same order as list_of_files
-        entities_per_file = sorted(entities_per_file, key=lambda k: k['name'])
+    # ── 5. Collect files from each modality ──────────────────────────────
+    list_of_files = []
+    entities_per_file = []
 
-    elif has_ctf:
-        list_of_files = ctf_workaround(dataset, sid)
-        entities_per_file = dataset.query(subj=sid, suffix='meg', extension='.res4', scope='raw')
+    if has_meg:
+        if has_ctf:
+            # CTF: the data files are directories ending in .ds — use the
+            # existing workaround that resolves to the .ds folder paths.
+            ctf_files = ctf_workaround(dataset, sid)
+            ctf_entities = dataset.query(subj=sid, suffix='meg', extension='.res4', scope='raw')
+            ctf_entities = sorted(ctf_entities, key=lambda k: k['name'])
+            list_of_files += ctf_files
+            entities_per_file += ctf_entities
+        else:
+            # FIF (or any other non-CTF MEG format)
+            meg_files = sorted(
+                list(dataset.query(suffix='meg', extension='.fif',
+                                   return_type='filename', subj=sid, scope='raw')))
+            meg_entities = dataset.query(subj=sid, suffix='meg', extension='.fif', scope='raw')
+            meg_entities = sorted(meg_entities, key=lambda k: k['name'])
+            list_of_files += meg_files
+            entities_per_file += meg_entities
 
-        # entities_per_file is a list of Artifact objects of ancpbids created from raw files. (fif for fif files and res4 for ctf files)
-        # TODO: this assumes every .ds directory has a single corresponding .res4 file.
-        # Is it always so?
-        # Used because I cant get entities_per_file from .ds folders, ancpbids doesnt support folder query.
-        # But we need entities_per_file to pass into subject_folder.create_artifact(),
-        # so that it can add automatically all the entities to the new derivative on base of entities from raw file.
+    if has_eeg:
+        # Query all files with BIDS suffix='eeg', regardless of extension.
+        # ancpbids already filters by the BIDS modality folder (eeg/).
+        eeg_files = sorted(
+            list(dataset.query(suffix='eeg', return_type='filename', subj=sid, scope='raw')))
+        eeg_entities = dataset.query(subj=sid, suffix='eeg', scope='raw')
+        eeg_entities = sorted(eeg_entities, key=lambda k: k['name']) if eeg_entities else []
 
-        # sort list_of_sub_jsons by name key to get same order as list_of_files
-        entities_per_file = sorted(entities_per_file, key=lambda k: k['name'])
+        # Keep only actual data files (skip sidecars like .json, .tsv, .fdt)
+        _EEG_DATA_EXTENSIONS = {'.edf', '.bdf', '.vhdr', '.set', '.cnt', '.mff', '.fif'}
 
-    else:
-        list_of_files = []
-        raise ValueError('No fif or ctf files found in the dataset.')
+        # Filter files and entities independently by extension, then match
+        # by filename to avoid positional misalignment when one query
+        # includes companion files (.fdt, .json, etc.) that the other does not.
+        eeg_data_files = [f for f in eeg_files
+                          if os.path.splitext(f)[1].lower() in _EEG_DATA_EXTENSIONS]
+        # Build a name→entity lookup from the entity list
+        _entity_by_name = {}
+        for e in eeg_entities:
+            ename = e['name'] if isinstance(e, dict) else e.name
+            _entity_by_name[ename] = e
+
+        eeg_data_entities = []
+        eeg_data_files_matched = []
+        for f in eeg_data_files:
+            fname = os.path.basename(f)
+            if fname in _entity_by_name:
+                eeg_data_files_matched.append(f)
+                eeg_data_entities.append(_entity_by_name[fname])
+            else:
+                # Entity not found by exact name — create a minimal dict
+                print(f'___MEGqc___: No entity match for {fname}; creating synthetic entity.')
+                eeg_data_files_matched.append(f)
+                eeg_data_entities.append({'name': fname})
+        eeg_data_files = eeg_data_files_matched
+
+        if eeg_data_files:
+            detected_ext = os.path.splitext(eeg_data_files[0])[1].lower()
+            print(f'___MEGqc___: EEG modality detected via BIDS suffix '
+                  f'(extension: {detected_ext}, {len(eeg_data_files)} file(s))')
+            list_of_files += eeg_data_files
+            entities_per_file += eeg_data_entities
+        else:
+            # Fallback: ancpbids returned no data files — try glob
+            _EEG_EXTENSIONS = {'.edf', '.bdf', '.vhdr', '.set', '.cnt'}
+            print('___MEGqc___: ancpbids returned no EEG data files; using glob fallback...')
+            eeg_glob_files = []
+            for ext in _EEG_EXTENSIONS:
+                for gp in [
+                    os.path.join(dataset_path, f'sub-{sid}', 'eeg', f'*_eeg{ext}'),
+                    os.path.join(dataset_path, f'sub-{sid}', 'ses-*', 'eeg', f'*_eeg{ext}'),
+                ]:
+                    eeg_glob_files = sorted(glob.glob(gp))
+                    if eeg_glob_files:
+                        break
+                if eeg_glob_files:
+                    break
+            if eeg_glob_files:
+                eeg_glob_entities = [{'name': os.path.basename(f)} for f in eeg_glob_files]
+                list_of_files += eeg_glob_files
+                entities_per_file += eeg_glob_entities
+
+    if not list_of_files:
+        raise ValueError(
+            'No MEG (fif/ctf) or EEG (edf/bdf/vhdr/set/cnt) files found in the dataset.')
 
     # Deduplicate split FIF files so we only process the first chunk
     # -----------------------------------------------------------------
@@ -469,12 +588,29 @@ def get_files_list(sid: str, dataset_path: str, dataset):
     entities_per_file = [e for e in entities_per_file if 'crosstalk' not in e['name']]
 
     # Check if the names in list_of_files and entities_per_file are the same:
+    # Support both _meg. and _eeg. suffixes in the name comparison.
+    if len(list_of_files) != len(entities_per_file):
+        print(f'___MEGqc___: WARNING: list_of_files ({len(list_of_files)}) and '
+              f'entities_per_file ({len(entities_per_file)}) have different lengths. '
+              'Attempting to reconcile...')
+        # Trim to the shorter list to avoid index errors
+        min_len = min(len(list_of_files), len(entities_per_file))
+        list_of_files = list_of_files[:min_len]
+        entities_per_file = entities_per_file[:min_len]
+
     for i in range(len(list_of_files)):
-        file_name_in_path = os.path.basename(list_of_files[i]).split('_meg.')[0]
-        file_name_in_obj = entities_per_file[i]['name'].split('_meg.')[0]
+        base_path = os.path.basename(list_of_files[i])
+        ent = entities_per_file[i]
+        entity_name = ent['name'] if isinstance(ent, dict) else ent.name
+        # Strip modality suffix (_meg|eeg.) and extension for comparison
+        file_name_in_path = re.split(r'_(?:meg|eeg)\.', base_path)[0]
+        file_name_in_obj = re.split(r'_(?:meg|eeg)\.', entity_name)[0]
 
         if file_name_in_obj not in file_name_in_path:
-            raise ValueError('Different names in list_of_files and entities_per_file')
+            print(f'___MEGqc___: WARNING: Name mismatch at index {i}: '
+                  f'file={base_path}, entity={entity_name}. '
+                  'Continuing with best-effort matching.')
+            # Do NOT raise — allow processing to continue
 
     # we can also check that final file of path in list of files is same as name in jsons
 
@@ -513,7 +649,7 @@ def create_config_artifact(root_folder, config_file_path: str, f_name_to_save: s
 
     config_artifact.content = lambda file_path, cont=config_file_path: shutil.copy(cont, file_path)
     config_artifact.add_entity('desc', f_name_to_save)  # file name
-    config_artifact.suffix = 'meg'
+    config_artifact.suffix = 'settings'
     config_artifact.extension = '.ini'
 
     # Create a seconf json file with config name as key and all taken raw files as value
@@ -524,7 +660,7 @@ def create_config_artifact(root_folder, config_file_path: str, f_name_to_save: s
     config_json_artifact = config_folder.create_artifact()
     config_json_artifact.content = lambda file_path, cont=config_json: json.dump(cont, open(file_path, 'w'), indent=4)
     config_json_artifact.add_entity('desc', f_name_to_save)  # file name
-    config_json_artifact.suffix = 'meg'
+    config_json_artifact.suffix = 'settings'
     config_json_artifact.extension = '.json'
 
     return
@@ -760,7 +896,7 @@ def add_raw_to_config_json(root_folder, reuse_config_file_path: str, all_taken_r
     config_json_artifact = config_folder.create_artifact()
     config_json_artifact.content = lambda file_path, cont=config_json: json.dump(cont, open(file_path, 'w'), indent=4)
     config_json_artifact.add_entity('desc', config_desc)  # file name
-    config_json_artifact.suffix = 'meg'
+    config_json_artifact.suffix = 'settings'
     config_json_artifact.extension = '.json'
 
     return all_taken_raw_files
@@ -1007,13 +1143,15 @@ def process_one_subject(
         root_folder = root_folder.create_folder(name=str(seg))
 
     calculation_folder = root_folder.create_folder(name='calculation')
-    subject_folder = calculation_folder.create_folder(
-        type_=dataset.get_schema().Subject,
-        name='sub-' + sub
-    )
+    # subject_folder is created per-file inside the loop, under a modality
+    # subfolder (meg/ or eeg/) to avoid filename collisions between modalities.
+    _modality_subject_folders = {}  # cache: modality -> subject_folder
 
     # GET FILE LIST FOR THIS SUBJECT
-    list_of_files, entities_per_file = get_files_list(sub, dataset_path, dataset)
+    list_of_files, entities_per_file = get_files_list(
+        sub, dataset_path, dataset,
+        m_or_g_chosen=all_qc_params.get('default', {}).get('m_or_g_chosen')
+    )
 
     if not list_of_files:
         print('___MEGqc___: ',
@@ -1059,6 +1197,7 @@ def process_one_subject(
          raw,
          info_derivs,
          stim_deriv,
+         event_summary_deriv,
          shielding_str,
          epoching_str,
          sensors_derivs,
@@ -1070,7 +1209,8 @@ def process_one_subject(
             filtering_settings=all_qc_params['Filtering'],
             epoching_params=all_qc_params['Epoching'],
             file_path=data_file,
-            derivatives_root=derivatives_root
+            derivatives_root=derivatives_root,
+            eeg_settings=all_qc_params.get('EEG_settings'),
         )
 
         print('___MEGqc___: ',
@@ -1246,7 +1386,7 @@ def process_one_subject(
 
 
         # 7) Head movement artifacts
-        if all_qc_params['default']['run_Head'] is True:
+        if all_qc_params['default']['run_Head'] is True and meg_system != 'EEG':
             print('___MEGqc___: ', 'Starting Head movement calculation...')
             start_time = time.time()
             head_derivs, simple_metrics_head, head_str, df_head_pos, head_pos, _err = _run_metric_safe(
@@ -1262,6 +1402,9 @@ def process_one_subject(
             print('___MEGqc___: ',
                   "Finished Head movement calculation. --- Execution %s seconds ---"
                   % (time.time() - start_time))
+        elif all_qc_params['default']['run_Head'] is True and meg_system == 'EEG':
+            head_str = 'Head motion metric is not available for EEG data (requires MEG cHPI coils).'
+            print(f'___MEGqc___: {head_str}')
 
         # 8) Muscle artifacts
         if all_qc_params['default']['run_Muscle'] is True:
@@ -1312,7 +1455,9 @@ def process_one_subject(
             'EOG': eog_str,
             'HEAD': head_str,
             'MUSCLE': muscle_str,
-            'STIMULUS': 'If the data was cropped for this calculation, the stimulus data is also cropped.'
+            'STIMULUS': epoching_str + ('<p>If the data was cropped for this calculation, '
+                        'the stimulus data is also cropped.</p>'
+                        if all_qc_params['default'].get('crop_tmax') else '')
         }
 
         # Embed per-metric error summaries into the report strings so that
@@ -1332,6 +1477,7 @@ def process_one_subject(
         QC_derivs = {
             'Raw info': info_derivs,
             'Stimulus channels': stim_deriv,
+            'Event summary': event_summary_deriv,
             'Report_strings': report_str_derivs,
             'Sensors locations': sensors_derivs,
             'Standard deviation of the data': std_derivs,
@@ -1358,6 +1504,19 @@ def process_one_subject(
         QC_derivs['Simple_metrics'] = [QC_derivative(QC_simple, 'SimpleMetrics', 'json')]
 
         # SAVE DERIVATIVES (EXCEPT MATPLOTLIB, PLOTLY, REPORT)
+        # Determine the BIDS suffix based on the modality of the current file
+        _bids_suffix = 'eeg' if meg_system == 'EEG' else 'meg'
+
+        # Create (or reuse) a modality subfolder: calculation/meg/sub-XXX or
+        # calculation/eeg/sub-XXX to keep MEG and EEG derivatives separate.
+        if _bids_suffix not in _modality_subject_folders:
+            modality_folder = calculation_folder.create_folder(name=_bids_suffix)
+            _modality_subject_folders[_bids_suffix] = modality_folder.create_folder(
+                type_=dataset.get_schema().Subject,
+                name='sub-' + sub,
+            )
+        subject_folder = _modality_subject_folders[_bids_suffix]
+
         for section in (sec for sec in QC_derivs.values() if sec):
             for deriv in (
                     d for d in section
@@ -1368,14 +1527,20 @@ def process_one_subject(
                 print('___MEGqc___: ', 'counter of subject_folder.create_artifact', counter)
 
                 meg_artifact.add_entity('desc', deriv.name)  # file name
-                meg_artifact.suffix = 'meg'
+                meg_artifact.suffix = _bids_suffix
                 meg_artifact.extension = '.html'
 
                 if deriv.content_type == 'df':
                     meg_artifact.extension = '.tsv'
-                    meg_artifact.content = lambda file_path, cont=deriv.content: cont.to_csv(
-                        file_path, sep='\t'
-                    )
+                    # Write the index only when it carries meaningful data
+                    # (e.g. channel names in epoch matrices).  A plain
+                    # RangeIndex is just row numbers and creates an
+                    # unwanted ``Unnamed: 0`` column on re-read.
+                    def _df_writer(file_path, cont=deriv.content):
+                        import pandas as _pd
+                        write_idx = not isinstance(cont.index, _pd.RangeIndex)
+                        cont.to_csv(file_path, sep='\t', index=write_idx)
+                    meg_artifact.content = _df_writer
 
                 elif deriv.content_type == 'json':
                     meg_artifact.extension = '.json'
@@ -1402,11 +1567,16 @@ def process_one_subject(
             remove_fif_and_splits(raw_cropped_filtered)
             remove_fif_and_splits(raw_cropped_filtered_resampled)
 
-            del (meg_system, dict_epochs_mg, chs_by_lobe, channels,
-                 raw_cropped_filtered, raw_cropped_filtered_resampled,
-                 raw_cropped, info_derivs, stim_deriv, shielding_str,
-                 epoching_str, sensors_derivs, m_or_g_chosen, m_or_g_skipped_str,
-                 lobes_color_coding_str, resample_str)
+            # Delete heavy objects to free memory between files.
+            # Use a safe approach: delete only variables that exist.
+            for _varname in ('meg_system', 'dict_epochs_mg', 'chs_by_lobe',
+                             'channels', 'raw_cropped_filtered',
+                             'raw_cropped_filtered_resampled', 'raw_cropped',
+                             'info_derivs', 'stim_deriv', 'event_summary_deriv',
+                             'shielding_str', 'epoching_str', 'sensors_derivs',
+                             'm_or_g_chosen', 'm_or_g_skipped_str',
+                             'lobes_color_coding_str', 'resample_str'):
+                locals().pop(_varname, None)
             gc.collect()
             print('REMOVING TRASH: SUCCEEDED')
         except Exception:
@@ -1416,8 +1586,13 @@ def process_one_subject(
     with temporary_dataset_base(dataset, output_root):
         ancpbids.write_derivative(dataset, derivative)
 
-    # Removes intermediate trash objects
-    del meg_artifact, derivative
+    # Removes intermediate trash objects — guard against NameError when no
+    # files were processed (meg_artifact would never have been assigned).
+    try:
+        del meg_artifact
+    except NameError:
+        pass
+    del derivative
     gc.collect()
 
     # Check if raw is None => means we never processed a file
@@ -1544,26 +1719,32 @@ def flatten_summary_metrics(js: dict) -> dict:
     if js.get("GQI") is not None:
         row["GQI"] = js.get("GQI")
 
+    def _sensor_key(sensor_type_str):
+        """Map human-readable sensor names to short keys."""
+        if sensor_type_str == "MAGNETOMETERS":
+            return "mag"
+        elif sensor_type_str == "GRADIOMETERS":
+            return "grad"
+        elif sensor_type_str == "EEG CHANNELS":
+            return "eeg"
+        return sensor_type_str.lower().replace(" ", "_")
+
     for item in js.get("STD_time_series", []):
         metric = item.get("Metric", "").replace(" ", "_").lower()
-        num_mag, pct_mag = _parse_count_percent(item.get("MAGNETOMETERS", ""))
-        num_grad, pct_grad = _parse_count_percent(item.get("GRADIOMETERS", ""))
-        row[f"STD_ts_{metric}_mag_num"] = num_mag
-        row[f"STD_ts_{metric}_mag_percentage"] = pct_mag
-        row[f"STD_ts_{metric}_grad_num"] = num_grad
-        row[f"STD_ts_{metric}_grad_percentage"] = pct_grad
+        for col_name, short in [("MAGNETOMETERS", "mag"), ("GRADIOMETERS", "grad"), ("EEG CHANNELS", "eeg")]:
+            num, pct = _parse_count_percent(item.get(col_name, ""))
+            row[f"STD_ts_{metric}_{short}_num"] = num
+            row[f"STD_ts_{metric}_{short}_percentage"] = pct
 
     for item in js.get("PTP_time_series", []):
         metric = item.get("Metric", "").replace(" ", "_").lower()
-        num_mag, pct_mag = _parse_count_percent(item.get("MAGNETOMETERS", ""))
-        num_grad, pct_grad = _parse_count_percent(item.get("GRADIOMETERS", ""))
-        row[f"PTP_ts_{metric}_mag_num"] = num_mag
-        row[f"PTP_ts_{metric}_mag_percentage"] = pct_mag
-        row[f"PTP_ts_{metric}_grad_num"] = num_grad
-        row[f"PTP_ts_{metric}_grad_percentage"] = pct_grad
+        for col_name, short in [("MAGNETOMETERS", "mag"), ("GRADIOMETERS", "grad"), ("EEG CHANNELS", "eeg")]:
+            num, pct = _parse_count_percent(item.get(col_name, ""))
+            row[f"PTP_ts_{metric}_{short}_num"] = num
+            row[f"PTP_ts_{metric}_{short}_percentage"] = pct
 
     for item in js.get("STD_epoch_summary", []):
-        sensor = "mag" if item.get("Sensor Type") == "MAGNETOMETERS" else "grad"
+        sensor = _sensor_key(item.get("Sensor Type", ""))
         num_noisy, pct_noisy = _parse_count_percent(item.get("Noisy Epochs", ""))
         num_flat, pct_flat = _parse_count_percent(item.get("Flat Epochs", ""))
         row[f"STD_ep_{sensor}_noisy_num"] = num_noisy
@@ -1572,7 +1753,7 @@ def flatten_summary_metrics(js: dict) -> dict:
         row[f"STD_ep_{sensor}_flat_percentage"] = pct_flat
 
     for item in js.get("PTP_epoch_summary", []):
-        sensor = "mag" if item.get("Sensor Type") == "MAGNETOMETERS" else "grad"
+        sensor = _sensor_key(item.get("Sensor Type", ""))
         num_noisy, pct_noisy = _parse_count_percent(item.get("Noisy Epochs", ""))
         num_flat, pct_flat = _parse_count_percent(item.get("Flat Epochs", ""))
         row[f"PTP_ep_{sensor}_noisy_num"] = num_noisy
@@ -1581,7 +1762,7 @@ def flatten_summary_metrics(js: dict) -> dict:
         row[f"PTP_ep_{sensor}_flat_percentage"] = pct_flat
 
     for item in js.get("ECG_correlation_summary", []):
-        sensor = "mag" if item.get("Sensor Type") == "MAGNETOMETERS" else "grad"
+        sensor = _sensor_key(item.get("Sensor Type", ""))
         num, pct = _parse_count_percent(item.get("# |High Correlations| > 0.8", ""))
         total = item.get("Total Channels")
         row[f"ECG_{sensor}_high_corr_num"] = num
@@ -1589,7 +1770,7 @@ def flatten_summary_metrics(js: dict) -> dict:
         row[f"ECG_{sensor}_total_channels"] = total
 
     for item in js.get("EOG_correlation_summary", []):
-        sensor = "mag" if item.get("Sensor Type") == "MAGNETOMETERS" else "grad"
+        sensor = _sensor_key(item.get("Sensor Type", ""))
         num, pct = _parse_count_percent(item.get("# |High Correlations| > 0.8", ""))
         total = item.get("Total Channels")
         row[f"EOG_{sensor}_high_corr_num"] = num

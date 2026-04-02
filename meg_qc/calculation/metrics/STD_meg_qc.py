@@ -177,6 +177,10 @@ def get_noisy_flat_std_ptp_epochs(df_std: pd.DataFrame, ch_type: str, std_or_ptp
 
     epochs = [int(ep) for ep in df_std.columns.tolist()] #get epoch numbers
 
+    # Save true channel count BEFORE adding summary rows so the denominator
+    # in percentage / threshold calculations is always correct.
+    n_channels = len(df_std.index)
+
     # Make a separate DataFrame and calculate the mean of stds for each channel over all epochs together
     df_std_with_mean = df_std.copy()
     df_std_with_mean['mean'] = df_std_with_mean.mean(axis=1)
@@ -195,10 +199,12 @@ def get_noisy_flat_std_ptp_epochs(df_std: pd.DataFrame, ch_type: str, std_or_ptp
     # Now see which channles in epoch are over std_level or under -std_level:
     
     #append raws to df_noisy_epoch to hold the % of noisy/flat channels in each epoch:
-
+    # NOTE: use the SAME label string here as is written in the loop and read in
+    # make_dict_local_std_ptp, otherwise pandas creates a duplicate "ghost" row
+    # which inflates len(df) and corrupts iloc[:-3] slicing.
     df_noisy_epoch.loc['number noisy channels'] = np.nan
     df_noisy_epoch.loc['% noisy channels'] = np.nan
-    df_noisy_epoch.loc['noisy > %s perc' % percent_noisy_flat_allowed] = np.nan
+    df_noisy_epoch.loc['noisy < %s perc' % percent_noisy_flat_allowed] = np.nan
 
     df_flat_epoch.loc['number flat channels'] = np.nan
     df_flat_epoch.loc['% flat channels'] = np.nan
@@ -221,13 +227,15 @@ def get_noisy_flat_std_ptp_epochs(df_std: pd.DataFrame, ch_type: str, std_or_ptp
         df_noisy_epoch.loc['number noisy channels', ep] = df_noisy_epoch.iloc[:-3,ep].sum()
         df_flat_epoch.loc['number flat channels', ep] = df_flat_epoch.iloc[:-3,ep].sum()
 
-        # Calculate percent of noisy channels in this epoch:
-        df_noisy_epoch.loc['% noisy channels', ep] = round(df_noisy_epoch.iloc[:-3,ep].sum()/len(df_noisy_epoch)*100, 1)
-        df_flat_epoch.loc['% flat channels', ep] = round(df_flat_epoch.iloc[:-3,ep].sum()/len(df_flat_epoch)*100, 1)
+        # Calculate percent of noisy/flat channels in this epoch.
+        # Use n_channels (saved before summary rows were added) as the denominator
+        # so that the 3 summary rows are never counted in the percentage.
+        df_noisy_epoch.loc['% noisy channels', ep] = round(df_noisy_epoch.iloc[:-3,ep].sum() / n_channels * 100, 1)
+        df_flat_epoch.loc['% flat channels', ep] = round(df_flat_epoch.iloc[:-3,ep].sum() / n_channels * 100, 1)
 
-        # Now check if the epoch has over 70% of noisy/flat channels in it -> it is a noisy/flat epoch:
-        df_noisy_epoch.loc['noisy < %s perc' % percent_noisy_flat_allowed, ep] = df_noisy_epoch.iloc[:-3,ep].sum() > len(df_noisy_epoch)*percent_noisy_flat_allowed/100
-        df_flat_epoch.loc['flat < %s perc' % percent_noisy_flat_allowed, ep] = df_flat_epoch.iloc[:-3,ep].sum() > len(df_flat_epoch)*percent_noisy_flat_allowed/100
+        # Now check if the epoch has over percent_noisy_flat_allowed% of noisy/flat channels:
+        df_noisy_epoch.loc['noisy < %s perc' % percent_noisy_flat_allowed, ep] = df_noisy_epoch.iloc[:-3,ep].sum() > n_channels * percent_noisy_flat_allowed / 100
+        df_flat_epoch.loc['flat < %s perc' % percent_noisy_flat_allowed, ep] = df_flat_epoch.iloc[:-3,ep].sum() > n_channels * percent_noisy_flat_allowed / 100
 
 
     # Create derivatives:
@@ -280,7 +288,7 @@ def make_dict_global_std_ptp(std_ptp_params: dict, big_std_with_value_all_data: 
     return metric_global_content
 
 
-def make_dict_local_std_ptp(std_ptp_params: dict, noisy_epochs_df: pd.DataFrame, flat_epochs_df: pd.DataFrame, percent_noisy_flat_allowed: float=70):
+def make_dict_local_std_ptp(std_ptp_params: dict, noisy_epochs_df: pd.DataFrame, flat_epochs_df: pd.DataFrame, percent_noisy_flat_allowed: float=70, onset_times: list=None):
 
     """
     Make a dictionary with local metric content for std or ptp metric.
@@ -308,8 +316,9 @@ def make_dict_local_std_ptp(std_ptp_params: dict, noisy_epochs_df: pd.DataFrame,
     epochs = [int(ep) for ep in epochs[:-1]]
 
     epochs_details = []
-    for ep in epochs:
-        epochs_details += [{'epoch': ep, 'number_of_noisy_ch': int(noisy_epochs_df.loc['number noisy channels',ep]), 'perc_of_noisy_ch': float(noisy_epochs_df.loc['% noisy channels',ep]), 'epoch_too_noisy': noisy_epochs_df.loc['noisy < %s perc' % percent_noisy_flat_allowed, ep], 'number_of_flat_ch': int(flat_epochs_df.loc['number flat channels', ep]), 'perc_of_flat_ch': float(flat_epochs_df.loc['% flat channels', ep]), 'epoch_too_flat': flat_epochs_df.loc['flat < %s perc' % percent_noisy_flat_allowed,ep]}]
+    for i, ep in enumerate(epochs):
+        onset_s = round(float(onset_times[i]), 4) if (onset_times is not None and i < len(onset_times)) else None
+        epochs_details += [{'epoch': ep, 'onset_time_s': onset_s, 'number_of_noisy_ch': int(noisy_epochs_df.loc['number noisy channels',ep]), 'perc_of_noisy_ch': float(noisy_epochs_df.loc['% noisy channels',ep]), 'epoch_too_noisy': noisy_epochs_df.loc['noisy < %s perc' % percent_noisy_flat_allowed, ep], 'number_of_flat_ch': int(flat_epochs_df.loc['number flat channels', ep]), 'perc_of_flat_ch': float(flat_epochs_df.loc['% flat channels', ep]), 'epoch_too_flat': flat_epochs_df.loc['flat < %s perc' % percent_noisy_flat_allowed,ep]}]
 
     total_num_noisy_ep=len([ep for ep in epochs_details if ep['epoch_too_noisy'] is True])
     total_perc_noisy_ep=round(total_num_noisy_ep/len(epochs)*100)
@@ -331,7 +340,7 @@ def make_dict_local_std_ptp(std_ptp_params: dict, noisy_epochs_df: pd.DataFrame,
 
 
 
-def make_simple_metric_std(std_params:  dict, big_std_with_value_all_data: List[dict], small_std_with_value_all_data: List[dict], channels: List[str], deriv_epoch_std: dict, metric_local_present: bool, m_or_g_chosen: List[dict]):
+def make_simple_metric_std(std_params:  dict, big_std_with_value_all_data: List[dict], small_std_with_value_all_data: List[dict], channels: List[str], deriv_epoch_std: dict, metric_local_present: bool, m_or_g_chosen: List[dict], onset_times: list=None):
 
     """
     Make simple metric for STD.
@@ -371,19 +380,19 @@ def make_simple_metric_std(std_params:  dict, big_std_with_value_all_data: List[
     else:
         metric_local_description = 'Not calculated. No epochs found'
 
-    metric_global_content={'mag': None, 'grad': None}
-    metric_local_content={'mag': None, 'grad': None}
+    metric_global_content={'mag': None, 'grad': None, 'eeg': None}
+    metric_local_content={'mag': None, 'grad': None, 'eeg': None}
     for m_or_g in m_or_g_chosen:
 
         metric_global_content[m_or_g]=make_dict_global_std_ptp(std_params, big_std_with_value_all_data[m_or_g], small_std_with_value_all_data[m_or_g], channels[m_or_g], 'std')
         
         if metric_local_present is True:
-            metric_local_content[m_or_g]=make_dict_local_std_ptp(std_params, deriv_epoch_std[m_or_g][1].content, deriv_epoch_std[m_or_g][2].content, percent_noisy_flat_allowed=std_params['allow_percent_noisy_flat_epochs'])
+            metric_local_content[m_or_g]=make_dict_local_std_ptp(std_params, deriv_epoch_std[m_or_g][1].content, deriv_epoch_std[m_or_g][2].content, percent_noisy_flat_allowed=std_params['allow_percent_noisy_flat_epochs'], onset_times=onset_times)
             #deriv_epoch_std[m_or_g][1].content is df with big std(noisy), df_epoch_std[m_or_g][2].content is df with small std(flat)
         else:
             metric_local_content[m_or_g]=None
     
-    simple_metric = simple_metric_basic(metric_global_name, metric_global_description, metric_global_content['mag'], metric_global_content['grad'], metric_local_name, metric_local_description, metric_local_content['mag'], metric_local_content['grad'])
+    simple_metric = simple_metric_basic(metric_global_name, metric_global_description, metric_global_content['mag'], metric_global_content['grad'], metric_local_name, metric_local_description, metric_local_content['mag'], metric_local_content['grad'], metric_global_content_eeg=metric_global_content.get('eeg'), metric_local_content_eeg=metric_local_content.get('eeg'))
 
     return simple_metric
 
@@ -423,7 +432,7 @@ def STD_meg_qc(std_params: dict, channels: dict, chs_by_lobe: dict, dict_epochs_
     
     """
     # Load data
-    data, shielding_str, meg_system = load_data(data_path)
+    data, shielding_str, meg_system, _modality = load_data(data_path)
 
     # data.load_data()
 
@@ -451,7 +460,7 @@ def STD_meg_qc(std_params: dict, channels: dict, chs_by_lobe: dict, dict_epochs_
 
         big_std_with_value_all_data[m_or_g], small_std_with_value_all_data[m_or_g] = get_big_small_std_ptp_all_data(std_all_data[m_or_g], channels[m_or_g], std_params['std_lvl'])
 
-    if dict_epochs_mg['mag'] is not None or dict_epochs_mg['grad'] is not None: #If epochs are present
+    if dict_epochs_mg['mag'] is not None or dict_epochs_mg['grad'] is not None or dict_epochs_mg.get('eeg') is not None: #If epochs are present
         for m_or_g in m_or_g_chosen:
             df_std = get_std_epochs(channels[m_or_g], dict_epochs_mg[m_or_g])
 
@@ -468,7 +477,7 @@ def STD_meg_qc(std_params: dict, channels: dict, chs_by_lobe: dict, dict_epochs_
         print('___MEGqc___: ', std_str)
 
 
-    simple_metric_std = make_simple_metric_std(std_params, big_std_with_value_all_data, small_std_with_value_all_data, channels, noisy_flat_epochs_derivs, metric_local, m_or_g_chosen)
+    simple_metric_std = make_simple_metric_std(std_params, big_std_with_value_all_data, small_std_with_value_all_data, channels, noisy_flat_epochs_derivs, metric_local, m_or_g_chosen, onset_times=dict_epochs_mg.get('epoch_onset_times_s'))
 
     #Extract chs_by_lobe into a data frame
     df_deriv = chs_dict_to_csv(chs_by_lobe_std,  file_name_prefix = 'STDs')

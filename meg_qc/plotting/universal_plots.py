@@ -185,6 +185,12 @@ def get_tit_and_unit(m_or_g: str, psd: bool = False):
             unit='Tesla/m'
         elif psd is True:
             unit='Tesla/m / Hz'
+    elif m_or_g=='eeg':
+        m_or_g_tit='EEG channels'
+        if psd is False:
+            unit='Volts'
+        elif psd is True:
+            unit='Volts/Hz'
     elif m_or_g == 'ECG':
         m_or_g_tit = 'ECG channel'
         unit = 'V'
@@ -196,6 +202,400 @@ def get_tit_and_unit(m_or_g: str, psd: bool = False):
         unit='?'
 
     return m_or_g_tit, unit
+
+
+
+
+
+# ── Stimulus / Event Summary Plotting ──────────────────────────────────────
+
+
+def _safe_load_event_summary_json(f_path: str) -> dict:
+    """Load an EventSummary JSON file, returning empty dict on failure."""
+    import json
+    try:
+        with open(f_path, 'r', encoding='utf-8') as fh:
+            return json.load(fh)
+    except Exception as exc:
+        print(f"___MEGqc___: Could not load EventSummary JSON '{f_path}': {exc}")
+        return {}
+
+
+def plot_stim_events_comparison_table(f_path: str) -> List[QC_derivative]:
+    """Build a Plotly Table comparing stim-channel events vs BIDS events.tsv.
+
+    The table shows:
+    - Which event source was used for epoching (BIDS TSV / stim channel / fixed-length)
+    - Per-stim-channel event counts broken down by event ID
+    - Per-trial-type event counts from the BIDS events.tsv
+    - Final epoch counts after merge
+
+    Falls back gracefully when any data is missing.
+
+    Parameters
+    ----------
+    f_path : str
+        Path to the ``desc-EventSummary_meg.json`` file.
+
+    Returns
+    -------
+    List[QC_derivative]
+    """
+    data = _safe_load_event_summary_json(f_path)
+    if not data:
+        return []
+
+    event_summary = data.get('event_summary', {})
+    stim_ch_counts = data.get('stim_channel_event_counts', {})
+    bids_info = data.get('bids_events_info', {})
+
+    derivs = []
+
+    # ── 1. Source & epoch summary table ───────────────────────────────────
+    source = event_summary.get('source', 'unknown')
+    source_labels = {
+        'bids_tsv':     'BIDS *_events.tsv',
+        'find_events':  'Stimulus channel (mne.find_events)',
+        'fixed_length': 'Fixed-length segmentation',
+    }
+    source_label = source_labels.get(source, source)
+    id_to_tt = event_summary.get('id_to_trial_type', {})
+    count_before = event_summary.get('count_before_merge', {})
+    count_after = event_summary.get('count_after_merge', {})
+    all_ids = event_summary.get('all_ids', [])
+
+    if all_ids and source != 'fixed_length':
+        header_vals = ['Event ID', 'Trial type', 'Events detected', 'Epochs used']
+        cell_ids, cell_tt, cell_before, cell_after = [], [], [], []
+        for eid in all_ids:
+            cell_ids.append(str(eid))
+            cell_tt.append(str(id_to_tt.get(eid, id_to_tt.get(str(eid), ''))))
+            cell_before.append(str(count_before.get(eid, count_before.get(str(eid), 0))))
+            cell_after.append(str(count_after.get(eid, count_after.get(str(eid), 0))))
+        # Totals row
+        cell_ids.append('<b>Total</b>')
+        cell_tt.append('')
+        cell_before.append(f"<b>{event_summary.get('total_before_merge', '—')}</b>")
+        cell_after.append(f"<b>{event_summary.get('total_after_merge', '—')}</b>")
+
+        fig_summary = go.Figure(data=[go.Table(
+            header=dict(values=header_vals,
+                        fill_color='#4472C4', font=dict(color='white', size=13),
+                        align='center'),
+            cells=dict(values=[cell_ids, cell_tt, cell_before, cell_after],
+                       fill_color=[['#F2F7FB', 'white'] * ((len(cell_ids) + 1) // 2)],
+                       align='center', font=dict(size=12)),
+        )])
+        dropped = event_summary.get('dropped_count', 0)
+        drop_note = (f' — {dropped} event(s) dropped/merged due to overlapping onsets'
+                     if dropped else '')
+        fig_summary.update_layout(
+            title=dict(
+                text=(f'Epoching summary<br>'
+                      f'<sup style="color:#555;">Source: {source_label}{drop_note}</sup>'),
+                x=0.5,
+            ),
+            margin=dict(l=20, r=20, t=60, b=20),
+            height=max(200, 55 + len(cell_ids) * 28),
+        )
+        derivs.append(QC_derivative(
+            content=fig_summary,
+            name='Stimulus - Epoch summary table',
+            content_type='plotly',
+            fig_order=-3,
+        ))
+
+    # ── 2. Stim channel comparison table ──────────────────────────────────
+    # Show every stim channel with its per-ID breakdown so the user can
+    # identify which channel carries which triggers.
+    if stim_ch_counts:
+        # Collect all unique event IDs across all channels
+        all_ch_ids = sorted({
+            eid for ch_counts in stim_ch_counts.values()
+            for eid in ch_counts
+        })
+        header = ['Channel'] + [f'ID {eid}' for eid in all_ch_ids] + ['Total']
+        ch_names, totals_col = [], []
+        id_columns = {eid: [] for eid in all_ch_ids}
+        for ch_name, ch_counts in stim_ch_counts.items():
+            if not ch_counts:
+                continue  # skip channels with no events
+            ch_names.append(ch_name)
+            total = 0
+            for eid in all_ch_ids:
+                n = ch_counts.get(eid, 0)
+                id_columns[eid].append(str(n) if n else '')
+                total += n
+            totals_col.append(str(total))
+
+        if ch_names:
+            cell_values = [ch_names] + [id_columns[eid] for eid in all_ch_ids] + [totals_col]
+            fig_stim_ch = go.Figure(data=[go.Table(
+                header=dict(values=header,
+                            fill_color='#548235', font=dict(color='white', size=12),
+                            align='center'),
+                cells=dict(values=cell_values,
+                           fill_color=[['#F5FAF0', 'white'] * ((len(ch_names) + 1) // 2)],
+                           align='center', font=dict(size=11)),
+            )])
+            fig_stim_ch.update_layout(
+                title=dict(
+                    text=('Per-channel stim event counts<br>'
+                          '<sup style="color:#555;">Each row is a physical stim channel; '
+                          'columns are trigger IDs</sup>'),
+                    x=0.5,
+                ),
+                margin=dict(l=20, r=20, t=60, b=20),
+                height=max(200, 55 + len(ch_names) * 26),
+            )
+            derivs.append(QC_derivative(
+                content=fig_stim_ch,
+                name='Stimulus - Stim channel events',
+                content_type='plotly',
+                fig_order=-2,
+            ))
+
+    # ── 3. BIDS events.tsv summary table ──────────────────────────────────
+    bids_id_counts = bids_info.get('id_counts', {})
+    bids_id_to_tt = bids_info.get('id_to_trial_type', {})
+    if bids_id_counts:
+        b_ids = sorted(bids_id_counts.keys(), key=lambda x: int(x))
+        header = ['Event ID', 'Trial type', 'Count']
+        col_ids = [str(eid) for eid in b_ids] + ['<b>Total</b>']
+        col_tt = [str(bids_id_to_tt.get(str(eid), bids_id_to_tt.get(int(eid), '')))
+                  for eid in b_ids] + ['']
+        col_cnt = [str(bids_id_counts[eid]) for eid in b_ids] + [
+            f"<b>{bids_info.get('total_events', sum(bids_id_counts.values()))}</b>"
+        ]
+        fig_bids = go.Figure(data=[go.Table(
+            header=dict(values=header,
+                        fill_color='#BF8F00', font=dict(color='white', size=13),
+                        align='center'),
+            cells=dict(values=[col_ids, col_tt, col_cnt],
+                       fill_color=[['#FFF8E7', 'white'] * ((len(col_ids) + 1) // 2)],
+                       align='center', font=dict(size=12)),
+        )])
+        fig_bids.update_layout(
+            title=dict(
+                text=('BIDS events.tsv summary<br>'
+                      '<sup style="color:#555;">Events from the sidecar '
+                      '*_events.tsv file</sup>'),
+                x=0.5,
+            ),
+            margin=dict(l=20, r=20, t=60, b=20),
+            height=max(200, 55 + len(col_ids) * 28),
+        )
+        derivs.append(QC_derivative(
+            content=fig_bids,
+            name='Stimulus - BIDS events summary',
+            content_type='plotly',
+            fig_order=-1,
+        ))
+
+    return derivs
+
+
+def plot_event_timeline(f_path: str) -> List[QC_derivative]:
+    """Build an interactive event timeline that overlays BIDS events.tsv events
+    with stim-channel events for easy visual comparison.
+
+    Y-axis rows:
+    - 'events.tsv' row with trial_type labels (when available)
+    - One row per stim channel (only channels with events)
+
+    Parameters
+    ----------
+    f_path : str
+        Path to the ``desc-EventSummary_meg.json`` file.
+
+    Returns
+    -------
+    List[QC_derivative]
+    """
+    data = _safe_load_event_summary_json(f_path)
+    if not data:
+        return []
+
+    bids_info = data.get('bids_events_info', {})
+    stim_ch_counts = data.get('stim_channel_event_counts', {})
+
+    has_bids = bool(bids_info.get('event_onsets_s'))
+    has_stim_channels = any(counts for counts in stim_ch_counts.values())
+
+    if not has_bids and not has_stim_channels:
+        return []
+
+    colors = [
+        '#E63946', '#457B9D', '#F4A261', '#2A9D8F', '#9B5DE5',
+        '#E76F51', '#264653', '#E9C46A', '#00B4D8', '#06D6A0',
+        '#FF006E', '#8338EC', '#3A86FF', '#FB5607', '#FFBE0B',
+    ]
+
+    fig = go.Figure()
+    category_rows = []
+    bids_id_to_tt = bids_info.get('id_to_trial_type', {})
+
+    # ── BIDS events.tsv rows (one row per unique event ID) ──────────────
+    if has_bids:
+        onsets = bids_info['event_onsets_s']
+        eids = bids_info['event_ids']
+
+        unique_ids = sorted(set(eids))
+        for idx, uid in enumerate(unique_ids):
+            trial_label = bids_id_to_tt.get(str(uid), bids_id_to_tt.get(uid, f'ID-{uid}'))
+            row_label = f'tsv {trial_label}'
+            category_rows.append(row_label)
+            mask = [i for i, e in enumerate(eids) if e == uid]
+            x_vals = [onsets[i] for i in mask]
+            fig.add_trace(go.Scatter(
+                x=x_vals,
+                y=[row_label] * len(x_vals),
+                mode='markers',
+                name=f'{trial_label} (n={len(mask)})',
+                legendgroup='events_tsv',
+                legendgrouptitle_text='events.tsv',
+                marker=dict(
+                    color=colors[idx % len(colors)],
+                    size=8,
+                    symbol='diamond',
+                ),
+                hovertext=[
+                    f'{trial_label} (ID {uid})<br>time: {t:.4f} s'
+                    for t in x_vals
+                ],
+                hoverinfo='text',
+            ))
+
+    # ── Stim channel rows ─────────────────────────────────────────────────
+    # We only show aggregate markers per channel (one marker per event).
+    # The stim_channel_event_counts only has counts, not individual onsets.
+    # We'll use the raw stimulus TSV to get onsets (plotted by plot_stim_csv).
+    # Here we show a summarized representation via the epoch onsets when
+    # channels have events.
+    # For now we add one summary row per active channel showing which IDs it has.
+    ch_idx = 0
+    for ch_name, ch_counts in stim_ch_counts.items():
+        if not ch_counts:
+            continue
+        category_rows.append(ch_name)
+        total = sum(ch_counts.values())
+        ids_str = ', '.join(f'{eid}×{cnt}' for eid, cnt in sorted(ch_counts.items()))
+        # Place a single marker at x=0 to represent this channel's summary
+        fig.add_trace(go.Scatter(
+            x=[0],
+            y=[ch_name],
+            mode='markers+text',
+            text=[f'  {total} events: {ids_str}'],
+            textposition='middle right',
+            textfont=dict(size=10, color='#333'),
+            legendgroup='stim_channels',
+            legendgrouptitle_text='Stim channels',
+            name=f'{ch_name} (n={total})',
+            marker=dict(
+                color=colors[ch_idx % len(colors)],
+                size=10,
+                symbol='square',
+            ),
+            hovertext=f'{ch_name}: {total} events<br>IDs: {ids_str}',
+            hoverinfo='text',
+            showlegend=True,
+        ))
+        ch_idx += 1
+
+    fig.update_layout(
+        title=dict(
+            text=('Event timeline: BIDS events.tsv vs Stim channels<br>'
+                  '<sup style="color:#555;">Diamonds = events.tsv onsets; '
+                  'Squares = stim channel summaries</sup>'),
+            x=0.5,
+        ),
+        xaxis_title='Time (s)',
+        yaxis=dict(
+            type='category',
+            categoryorder='array',
+            categoryarray=category_rows[::-1],
+        ),
+        showlegend=True,
+        legend=dict(title='Event sources', x=1.02, y=1),
+        margin=dict(l=20, r=20, t=60, b=40),
+        height=max(300, 100 + len(category_rows) * 50),
+    )
+
+    return [QC_derivative(
+        content=fig,
+        name='Stimulus - Event timeline',
+        content_type='plotly',
+        fig_order=0,
+    )]
+
+
+def plot_event_count_bar(f_path: str) -> List[QC_derivative]:
+    """Build a grouped bar chart showing event counts per ID, with
+    'before merge' and 'after merge (epochs used)' side-by-side bars.
+
+    Parameters
+    ----------
+    f_path : str
+        Path to the ``desc-EventSummary_meg.json`` file.
+
+    Returns
+    -------
+    List[QC_derivative]
+    """
+    data = _safe_load_event_summary_json(f_path)
+    if not data:
+        return []
+
+    event_summary = data.get('event_summary', {})
+    count_before = event_summary.get('count_before_merge', {})
+    count_after = event_summary.get('count_after_merge', {})
+    all_ids = event_summary.get('all_ids', [])
+    id_to_tt = event_summary.get('id_to_trial_type', {})
+    source = event_summary.get('source', 'unknown')
+
+    if not all_ids or source == 'fixed_length':
+        return []
+
+    x_labels = []
+    for eid in all_ids:
+        label = id_to_tt.get(eid, id_to_tt.get(str(eid), ''))
+        if label:
+            x_labels.append(f'ID {eid}<br>{label}')
+        else:
+            x_labels.append(f'ID {eid}')
+
+    vals_before = [count_before.get(eid, count_before.get(str(eid), 0)) for eid in all_ids]
+    vals_after = [count_after.get(eid, count_after.get(str(eid), 0)) for eid in all_ids]
+
+    fig = go.Figure()
+    fig.add_trace(go.Bar(
+        x=x_labels, y=vals_before, name='Events detected',
+        marker_color='#457B9D', text=vals_before, textposition='outside',
+    ))
+    fig.add_trace(go.Bar(
+        x=x_labels, y=vals_after, name='Epochs used (after merge)',
+        marker_color='#E63946', text=vals_after, textposition='outside',
+    ))
+    fig.update_layout(
+        barmode='group',
+        title=dict(
+            text=('Events per ID: detected vs epochs used<br>'
+                  '<sup style="color:#555;">Bars show counts before and after '
+                  'event_repeated merge/drop</sup>'),
+            x=0.5,
+        ),
+        xaxis_title='Event ID / Trial type',
+        yaxis_title='Count',
+        legend=dict(x=0.7, y=1),
+        margin=dict(l=40, r=20, t=60, b=40),
+    )
+
+    return [QC_derivative(
+        content=fig,
+        name='Stimulus - Event count bar chart',
+        content_type='plotly',
+        fig_order=1,
+    )]
 
 
 def plot_stim_csv_simple(f_path: str) -> List[QC_derivative]:
@@ -378,26 +778,42 @@ def plot_stim_csv(f_path: str) -> List[QC_derivative]:
                 ordered_ids = sorted([int(v) for v in unique_values])
                 category_labels = [f'ID-{v}' for v in ordered_ids]
 
+                # Pre-compute per-ID event counts for annotations
+                id_counts = {stim_id: int(np.sum(y_data == stim_id)) for stim_id in ordered_ids}
+                total_events = sum(id_counts.values())
+
                 # Plot each stimulus ID on its own categorical y row.
                 for idx, stim_id in enumerate(ordered_ids):
                     indices = y_data == stim_id
+                    n_events = id_counts[stim_id]
                     if not np.any(indices):
                         continue
                     fig.add_trace(
                         go.Scatter(
                             x=time[indices],
-                            y=[f'ID-{stim_id}'] * int(np.sum(indices)),
+                            y=[f'ID-{stim_id}'] * n_events,
                             mode='markers',
-                            name=f'ID-{stim_id}',
+                            name=f'ID-{stim_id}  (n={n_events})',
                             marker=dict(color=colors[idx % len(colors)], size=6),
                             hoverinfo='text',
-                            text=[f'ID-{stim_id}, time-{t}s' for t in time[indices]],
+                            text=[
+                                f'ID: {stim_id} | count: {n_events} | time: {t:.4f} s'
+                                for t in time[indices]
+                            ],
                         )
                     )
 
+                # Build a subtitle line with total and per-ID breakdown
+                id_summary = ',  '.join(
+                    f'ID-{sid}: {id_counts[sid]}' for sid in ordered_ids
+                )
+                subtitle = f'Total events: {total_events}  |  {id_summary}'
+
                 fig.update_layout(
-                    title=col,
-                    title_x=0.5,  # Center the title
+                    title=dict(
+                        text=f'{col}<br><sup style="color:#555;">{subtitle}</sup>',
+                        x=0.5,
+                    ),
                     xaxis_title='Time (s)',
                     yaxis_title='Stimulus ID',
                     yaxis=dict(
@@ -406,7 +822,7 @@ def plot_stim_csv(f_path: str) -> List[QC_derivative]:
                         categoryarray=category_labels[::-1],  # keep first ID on top
                     ),
                     showlegend=True,
-                    legend=dict(title='Stim IDs', x=1, y=1)
+                    legend=dict(title='Stim IDs (n = event count)', x=1, y=1)
                 )
             else:
                 # Create the figure as originally
@@ -1021,17 +1437,20 @@ def boxplot_epoched_xaxis_channels_csv(std_csv_path: str, ch_type: str, what_dat
         epoch_labels.append(int(match.group(1)) if match else idx)
 
     if 'Name' in filtered_df.columns:
-        channel_labels = filtered_df['Name'].astype(str).tolist()
+        channel_labels_natural = filtered_df['Name'].astype(str).tolist()
     else:
-        channel_labels = [f"{ch_type}_{idx}" for idx in range(data_matrix.shape[0])]
+        channel_labels_natural = [f"{ch_type}_{idx}" for idx in range(data_matrix.shape[0])]
     n_channels = data_matrix.shape[0]
 
-    # Match group-level style: sort channels by robust channel summary.
+    # Keep natural (original) order for toggle button.
+    data_matrix_natural = data_matrix.copy()
+
+    # Match group-level style: sort channels by robust channel summary (high→low).
     sort_key = np.nanmedian(data_matrix, axis=1)
     sort_key = np.nan_to_num(sort_key, nan=-np.inf)
     sort_idx = np.argsort(sort_key)[::-1]
     data_matrix = data_matrix[sort_idx, :]
-    channel_labels = [channel_labels[i] for i in sort_idx]
+    channel_labels = [channel_labels_natural[i] for i in sort_idx]
     channel_idx = np.arange(n_channels)
 
     # Epoch profile (collapse channels): bands + a central curve with 3 variants.
@@ -1049,6 +1468,14 @@ def boxplot_epoched_xaxis_channels_csv(std_csv_path: str, ch_type: str, what_dat
     q75_channel = np.nanquantile(data_matrix, 0.75, axis=1)
     q95_channel = np.nanquantile(data_matrix, 0.95, axis=1)
     mean_channel = np.nanmean(data_matrix, axis=1)
+
+    # Natural-order channel profiles (for toggle button).
+    q05_channel_nat = np.nanquantile(data_matrix_natural, 0.05, axis=1)
+    q25_channel_nat = np.nanquantile(data_matrix_natural, 0.25, axis=1)
+    q50_channel_nat = np.nanquantile(data_matrix_natural, 0.50, axis=1)
+    q75_channel_nat = np.nanquantile(data_matrix_natural, 0.75, axis=1)
+    q95_channel_nat = np.nanquantile(data_matrix_natural, 0.95, axis=1)
+    mean_channel_nat = np.nanmean(data_matrix_natural, axis=1)
 
     finite_values = data_matrix[np.isfinite(data_matrix)]
     if finite_values.size:
@@ -1239,6 +1666,46 @@ def boxplot_epoched_xaxis_channels_csv(std_csv_path: str, ch_type: str, what_dat
     # Buttons for channel profile side strip.
     channel_trace_indices = [12, 13, 14]
 
+    # ── Prepare data for channel-order toggle button ──────────────────────
+    # Trace layout: 0-6 top panel, 7 heatmap, 8-14 right panel.
+    # all_order_idx targets heatmap + all right-panel traces.
+    all_order_idx = [7, 8, 9, 10, 11, 12, 13, 14]
+
+    # Customdata arrays (2D for heatmap, 1D for curve traces, empty for bands).
+    customdata_sorted = np.tile(
+        np.array(channel_labels, dtype=object)[:, None],
+        (1, len(epoch_labels)),
+    ).tolist()
+    customdata_natural = np.tile(
+        np.array(channel_labels_natural, dtype=object)[:, None],
+        (1, len(epoch_labels)),
+    ).tolist()
+    cd_sorted_1d = np.array(channel_labels, dtype=object).tolist()
+    cd_natural_1d = np.array(channel_labels_natural, dtype=object).tolist()
+
+    # Restyle dicts for each order (one value per trace in all_order_idx).
+    # z: only heatmap uses z; scatter traces silently ignore it.
+    # x: heatmap gets epoch_labels (unchanged); scatter traces get profile values.
+    # customdata: heatmap gets 2D labels; bands get [] (unused); curves get 1D labels.
+    sorted_restyle = {
+        'z': [data_matrix.tolist(), [], [], [], [], [], [], []],
+        'x': [epoch_labels,
+              q95_channel.tolist(), q05_channel.tolist(),
+              q75_channel.tolist(), q25_channel.tolist(),
+              q50_channel.tolist(), mean_channel.tolist(), q95_channel.tolist()],
+        'customdata': [customdata_sorted, [], [], [], [],
+                       cd_sorted_1d, cd_sorted_1d, cd_sorted_1d],
+    }
+    natural_restyle = {
+        'z': [data_matrix_natural.tolist(), [], [], [], [], [], [], []],
+        'x': [epoch_labels,
+              q95_channel_nat.tolist(), q05_channel_nat.tolist(),
+              q75_channel_nat.tolist(), q25_channel_nat.tolist(),
+              q50_channel_nat.tolist(), mean_channel_nat.tolist(), q95_channel_nat.tolist()],
+        'customdata': [customdata_natural, [], [], [], [],
+                       cd_natural_1d, cd_natural_1d, cd_natural_1d],
+    }
+
     fig.update_layout(
         title={
             'text': metric_title + ' channel x epoch heatmap with top epoch profile for ' + ch_tit,
@@ -1247,7 +1714,7 @@ def boxplot_epoched_xaxis_channels_csv(std_csv_path: str, ch_type: str, what_dat
             'xanchor': 'center',
             'yanchor': 'top',
         },
-        margin=dict(t=154, l=80, r=40, b=162),
+        margin=dict(t=154, l=80, r=40, b=200),
         legend=dict(
             orientation='h',
             yanchor='bottom',
@@ -1292,6 +1759,36 @@ def boxplot_epoched_xaxis_channels_csv(std_csv_path: str, ch_type: str, what_dat
                     dict(label='Right: Median', method='restyle', args=[{'visible': [True, False, False]}, channel_trace_indices]),
                     dict(label='Right: Mean', method='restyle', args=[{'visible': [False, True, False]}, channel_trace_indices]),
                     dict(label='Right: Upper tail', method='restyle', args=[{'visible': [False, False, True]}, channel_trace_indices]),
+                ],
+            ),
+            dict(
+                type='buttons',
+                direction='right',
+                x=0.00,
+                y=-0.28,
+                xanchor='left',
+                yanchor='top',
+                showactive=True,
+                bgcolor='#FFF8E1',
+                bordercolor='#D4A017',
+                borderwidth=1,
+                font=dict(size=12, color='#7B6B1A'),
+                pad=dict(r=8, t=4, l=4, b=4),
+                buttons=[
+                    dict(
+                        label='Channels: Sorted (high→low)',
+                        method='update',
+                        args=[sorted_restyle,
+                              {'yaxis3.title.text': 'Sorted channel index'},
+                              all_order_idx],
+                    ),
+                    dict(
+                        label='Channels: Natural order',
+                        method='update',
+                        args=[natural_restyle,
+                              {'yaxis3.title.text': 'Channel index (original)'},
+                              all_order_idx],
+                    ),
                 ],
             ),
         ],
@@ -2536,8 +3033,17 @@ def make_head_annots_plot(raw: mne.io.Raw, head_pos: np.ndarray):
 def plot_ECG_EOG_channel_csv(f_path):
 
     """
-    Plot the ECG channel data and detected peaks
-    
+    Plot the ECG channel data and detected peaks.
+
+    When the TSV contains ``n_events`` and ``events_rate_per_min`` metadata
+    (written by the calculation module even when the averaged waveform shape
+    check fails), these values are displayed as an annotation on the figure so
+    the user can see how many events were detected and at what rate.
+
+    If the ``mean_rwave`` column is entirely NaN (indicating that the mean
+    waveform shape check failed or the data was too noisy), an informative note
+    is added to the plot.
+
     Parameters
     ----------
     f_path : str
@@ -2556,7 +3062,14 @@ def plot_ECG_EOG_channel_csv(f_path):
     if 'ecgchannel' not in base_name.lower() and 'eogchannel' not in base_name.lower():
         return []
 
-    df = pd.read_csv(f_path, sep='\t', dtype={6: str})
+    # Read with explicit string dtype for the text column only.
+    # Using positional dtype={6: str} breaks when columns shift after adding
+    # n_events / events_rate_per_min — read everything as default types and
+    # let pandas infer numerics correctly.
+    df = pd.read_csv(f_path, sep='\t')
+    # Ensure text column stays as string
+    if 'recorded_or_reconstructed' in df.columns:
+        df['recorded_or_reconstructed'] = df['recorded_or_reconstructed'].astype(str)
 
     # Find the column containing the ECG/EOG data. Depending on how the TSV was
     # written, the first column may be an unnamed index column.  Hence, search
@@ -2569,12 +3082,40 @@ def plot_ECG_EOG_channel_csv(f_path):
     ch_name = channel_cols[0] if channel_cols else df.columns[0]
     ch_data = df[ch_name].values
 
-    if not ch_data.any():  # Check if all values are falsy (0, False, or empty)
+    if len(ch_data) == 0:  # Only skip if truly empty
         return []
     
     peaks = df['event_indexes'].dropna()
-    peaks = [int(x) for x in peaks]
-    fs = int(df['fs'].dropna().iloc[0])
+    peaks = [int(float(x)) for x in peaks]
+    fs = int(float(df['fs'].dropna().iloc[0]))
+
+    # ── Extract event metadata when available ────────────────────────────
+    n_events = None
+    events_rate = None
+    if 'n_events' in df.columns:
+        n_events_vals = df['n_events'].dropna()
+        if len(n_events_vals) > 0:
+            n_events = int(float(n_events_vals.iloc[0]))
+    if 'events_rate_per_min' in df.columns:
+        rate_vals = df['events_rate_per_min'].dropna()
+        if len(rate_vals) > 0:
+            events_rate = float(rate_vals.iloc[0])
+
+    # Determine whether this is ECG or EOG from the channel name / filename
+    is_ecg = 'ecg' in ch_name.lower() or 'ecgchannel' in base_name.lower()
+    event_kind = 'heartbeat' if is_ecg else 'blink'
+
+    # Check whether the mean waveform shape check failed (mean_rwave all NaN
+    # but events were still detected) — this gives us context for the annotation
+    mean_rwave_ok = True
+    if 'mean_rwave' in df.columns:
+        if df['mean_rwave'].isna().all():
+            mean_rwave_ok = False
+    # Also check the shifted column for ECG
+    shifted_ok = True
+    if is_ecg and 'mean_rwave_shifted' in df.columns:
+        if df['mean_rwave_shifted'].isna().all():
+            shifted_ok = False
 
     time = np.arange(len(ch_data))/fs
     fig = go.Figure()
@@ -2582,13 +3123,22 @@ def plot_ECG_EOG_channel_csv(f_path):
                              hovertemplate='Time: %{x} s<br>Amplitude: %{y} V<br>'))
     fig.add_trace(go.Scatter(x=time[peaks], y=ch_data[peaks], mode='markers', name='peak',
                              hovertemplate='Time: %{x} s<br>Amplitude: %{y} V<br>'))
-    fig.update_layout(xaxis_title='time, s', 
+
+    # ── Build informative title ─────────────────────────────────────────
+    title_parts = [ch_name]
+    if n_events is not None:
+        title_parts.append(f"{n_events} {event_kind} events detected")
+    if events_rate is not None:
+        title_parts.append(f"{events_rate} per min")
+
+    fig.update_layout(
+                xaxis_title='Time, s',
                 yaxis = dict(
                 showexponent = 'all',
                 exponentformat = 'e'),
                 yaxis_title='Amplitude, V',
                 title={
-                'text': ch_name,
+                'text': ' -- '.join(title_parts),
                 'y':0.85,
                 'x':0.5,
                 'xanchor': 'center',
@@ -2798,8 +3348,15 @@ def plot_affected_channels_csv(df, artifact_lvl: float, t: np.ndarray, m_or_g: s
 def plot_mean_rwave_csv(f_path: str, ecg_or_eog: str):
 
     """
-    Plon mean rwave(ECG) or mean blink (EOG) from data in CSV file.
+    Plot mean R-wave (ECG) or mean blink (EOG) from data in CSV file.
 
+    When the averaged waveform failed the expected shape check (``mean_good is
+    False`` in the calculation module), ``mean_rwave_shifted`` will be entirely
+    NaN.  In that case the function still plots the *unshifted* mean waveform
+    with a prominent annotation explaining that the shape check failed.
+
+    Event count and rate metadata (``n_events``, ``events_rate_per_min``) are
+    shown on the plot when available.
 
     Parameters
     ----------
@@ -2822,34 +3379,88 @@ def plot_mean_rwave_csv(f_path: str, ecg_or_eog: str):
         return []
 
     # Load the data from the .tsv file into a DataFrame
-    df = pd.read_csv(f_path, sep='\t', dtype={6: str})
+    df = pd.read_csv(f_path, sep='\t')
+    if 'recorded_or_reconstructed' in df.columns:
+        df['recorded_or_reconstructed'] = df['recorded_or_reconstructed'].astype(str)
 
     if df['mean_rwave'].empty or df['mean_rwave'].isna().all():
+        # No valid mean waveform — do not produce a plot figure.
+        # The informative message about this is already in the ReportStrings
+        # JSON and will be displayed as a Metric Status header banner in the
+        # HTML report.
         return []
 
+    # ── Extract event metadata ───────────────────────────────────────────
+    n_events = None
+    events_rate = None
+    if 'n_events' in df.columns:
+        n_events_vals = df['n_events'].dropna()
+        if len(n_events_vals) > 0:
+            n_events = int(float(n_events_vals.iloc[0]))
+    if 'events_rate_per_min' in df.columns:
+        rate_vals = df['events_rate_per_min'].dropna()
+        if len(rate_vals) > 0:
+            events_rate = float(rate_vals.iloc[0])
+
     # Set the plot's title and labels
-    if 'recorded' in df['recorded_or_reconstructed'][0].lower():
+    rec_val = str(df['recorded_or_reconstructed'].dropna().iloc[0]) if 'recorded_or_reconstructed' in df.columns and not df['recorded_or_reconstructed'].dropna().empty else ''
+    if 'recorded' in rec_val.lower():
         which = ' recorded'
-    elif 'reconstructed' in df['recorded_or_reconstructed'][0].lower():
+    elif 'reconstructed' in rec_val.lower():
         which = ' reconstructed'
     else:
         which = ''
-    
-    #TODO: can there be the case that no shift was done and column is empty? should not be...
-    # Create a scatter plot
+
+    # ── Detect whether the shifted waveform is available ─────────────────
+    has_shifted = (
+        ecg_or_eog.lower() == 'ecg'
+        and 'mean_rwave_shifted' in df.columns
+        and not df['mean_rwave_shifted'].isna().all()
+    )
+    # shape_check_failed when mean_rwave exists but shifted doesn't (ECG) or
+    # when the waveform is present but the caller flags it as bad
+    shape_check_failed = (
+        ecg_or_eog.lower() == 'ecg' and not has_shifted
+    )
+
+    # Create the figure
     fig = go.Figure()
-    fig.add_trace(go.Scatter (x=df['mean_rwave_time'], y=df['mean_rwave'], mode='lines', name='Original '+ ecg_or_eog.upper(),
-        hovertemplate='Time: %{x} s<br>Amplitude: %{y} V<br>'))
-    if ecg_or_eog.lower() == 'ecg':
-        fig.add_trace(go.Scatter (x=df['mean_rwave_time'], y=df['mean_rwave_shifted'], mode='lines', name='Shifted ' + ecg_or_eog.upper(),
+    fig.add_trace(go.Scatter(
+        x=df['mean_rwave_time'], y=df['mean_rwave'],
+        mode='lines', name='Original ' + ecg_or_eog.upper(),
         hovertemplate='Time: %{x} s<br>Amplitude: %{y} V<br>'))
 
+    if has_shifted:
+        fig.add_trace(go.Scatter(
+            x=df['mean_rwave_time'], y=df['mean_rwave_shifted'],
+            mode='lines', name='Shifted ' + ecg_or_eog.upper(),
+            hovertemplate='Time: %{x} s<br>Amplitude: %{y} V<br>'))
+
+    # ── Build title ──────────────────────────────────────────────────────
+    annot_text = ""
     if ecg_or_eog.lower() == 'ecg':
-        plot_tit = 'Mean' + which + ' R wave was shifted to align with the ' + ecg_or_eog.upper() + ' signal found on MEG channels.'
-        annot_text = "The alignment is necessary for performing Pearson correlation between ECG signal found in each channel and reference mean signal of the ECG recording."
+        if shape_check_failed:
+            plot_tit = (
+                'Mean' + which + ' R wave (shape check FAILED -- '
+                'shifted alignment unavailable)'
+            )
+        else:
+            plot_tit = (
+                'Mean' + which + ' R wave was shifted to align with the '
+                + ecg_or_eog.upper() + ' signal found on MEG channels.'
+            )
+            annot_text = (
+                "The alignment is necessary for performing Pearson correlation "
+                "between ECG signal found in each channel and reference mean "
+                "signal of the ECG recording."
+            )
     elif ecg_or_eog.lower() == 'eog':
         plot_tit = 'Mean' + which + ' blink signal'
-        annot_text = ""
+        if n_events is not None:
+            plot_tit += f' ({n_events} events'
+            if events_rate is not None:
+                plot_tit += f', {events_rate} per min'
+            plot_tit += ')'
 
     fig.update_layout(
             xaxis_title='Time, s',
@@ -2873,7 +3484,7 @@ def plot_mean_rwave_csv(f_path: str, ecg_or_eog: str):
                 yref="paper",
                 font=dict(size=12),
                 align="center"
-        )])
+        )] if annot_text else [])
 
     mean_ecg_eog_ch_deriv = [QC_derivative(fig, ecg_or_eog+'mean_ch_data', 'plotly', fig_order = 2)]
 
@@ -3162,6 +3773,11 @@ def build_metric_derivatives_from_tsv(metric: str, tsv_paths: List[str], m_or_g_
 
         if 'desc-stimulus' in basename:
             _extend_safe(stim_derivs, plot_stim_csv, tsv_path)
+
+        if 'desc-EventSummary' in basename:
+            _extend_safe(stim_derivs, plot_stim_events_comparison_table, tsv_path)
+            _extend_safe(stim_derivs, plot_event_timeline, tsv_path)
+            _extend_safe(stim_derivs, plot_event_count_bar, tsv_path)
 
         if 'STD' in metric.upper():
             if include_sensor_plots:

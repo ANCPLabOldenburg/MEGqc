@@ -71,7 +71,9 @@ def find_powerline_noise_short(raw, psd_params, psd_params_internal, m_or_g_chos
     noisy_freqs = {}
     for m_or_g in m_or_g_chosen:
 
-        psds, freqs = raw.compute_psd(method=method, fmin=psd_params['freq_min'], fmax=psd_params['freq_max'], picks=channels[m_or_g], n_jobs=1, n_fft=nfft, n_per_seg=nperseg).get_data(return_freqs=True)
+        # Clamp fmax to Nyquist to prevent ValueError with low-sampling-rate data
+        fmax_safe = min(psd_params['freq_max'], sfreq / 2.0 - 1.0)
+        psds, freqs = raw.compute_psd(method=method, fmin=psd_params['freq_min'], fmax=fmax_safe, picks=channels[m_or_g], n_jobs=1, n_fft=nfft, n_per_seg=nperseg).get_data(return_freqs=True)
         avg_psd=np.mean(psds,axis=0) # average psd over all channels
         prominence_pos=(max(avg_psd) - min(avg_psd)) / prominence_lvl_pos_avg
 
@@ -297,7 +299,7 @@ def calculate_muscle_NO_threshold(
         gc.collect()
 
         # Load raw muscle stage signal
-        raw, shielding_str, meg_system = load_data(raw_muscle_path)
+        raw, shielding_str, meg_system, _modality = load_data(raw_muscle_path)
         # raw.load_data()
 
         #cut attached beginning and end from annot_muscle, scores_muscle:
@@ -437,7 +439,7 @@ def MUSCLE_meg_qc(
     """
 
     # Load data
-    raw_orig, shielding_str, meg_system = load_data(data_path)
+    raw_orig, shielding_str, meg_system, _modality = load_data(data_path)
 
 
     if noisy_freqs_global is None: # if PSD was not calculated before, calculate noise frequencies now:
@@ -448,6 +450,13 @@ def MUSCLE_meg_qc(
 
 
     muscle_freqs = muscle_params['muscle_freqs']
+
+    # Clamp muscle frequency range to Nyquist
+    nyquist = raw_orig.info['sfreq'] / 2.0
+    if muscle_freqs[1] >= nyquist:
+        print(f'___MEGqc___: Muscle fmax clamped from {muscle_freqs[1]} Hz to '
+              f'{nyquist - 1.0} Hz (Nyquist = {nyquist} Hz).')
+        muscle_freqs = [muscle_freqs[0], nyquist - 1.0]
    
     raw = raw_orig # make a copy of the raw data, to make sure the original data is not changed while filtering for this metric.
 
@@ -459,11 +468,17 @@ def MUSCLE_meg_qc(
         m_or_g_decided=['grad']
         muscle_str = 'For this data file artifact detection was performed on gradiometers, they are less sensitive to muscle activity than magnetometers. '
         print('___MEGqc___: ', muscle_str)
+    elif 'eeg' in m_or_g_chosen and 'mag' not in m_or_g_chosen and 'grad' not in m_or_g_chosen:
+        m_or_g_decided=['eeg']
+        muscle_freqs = muscle_params.get('muscle_freqs_eeg', [20, 100])
+        muscle_str = 'For this data file artifact detection was performed on EEG channels. EEG muscle artifacts are detected in the 20-100 Hz band. '
+        print('___MEGqc___: ', muscle_str)
     else:
-        print('___MEGqc___: ', 'No magnetometers or gradiometers found in data. Artifact detection skipped.')
-        return [], []
-    
-    muscle_note = "This metric shows high frequency artifacts in range between 110-140 Hz. High power in this frequency band compared to the rest of the signal is strongly correlated with muscles artifacts, as suggested by MNE. However, high frequency oscillations may also occure in this range for reasons other than muscle activity (for example, in an empty room recording). "
+        muscle_str = 'No magnetometers, gradiometers or EEG channels found in data. Artifact detection skipped.'
+        print('___MEGqc___: ', muscle_str)
+        return [], {'description': muscle_str}, muscle_str, None
+
+    muscle_note = "This metric shows high frequency artifacts in range between {}-{} Hz. High power in this frequency band compared to the rest of the signal is strongly correlated with muscles artifacts, as suggested by MNE. However, high frequency oscillations may also occure in this range for reasons other than muscle activity (for example, in an empty room recording). ".format(int(muscle_freqs[0]), int(muscle_freqs[1]))
     muscle_str_joined=muscle_note+"<p>"+muscle_str+"</p>"
 
     attach_sec = 3 # seconds

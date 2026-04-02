@@ -891,15 +891,15 @@ def make_simple_metric_psd(mean_brain_waves_dict: dict, noise_ampl_global:dict, 
     metric_local_name = 'PSD_local'
     metric_local_description = 'Noise frequencies detected locally (present only on individual channels). Details show each detected noisy frequency in Hz with info about its amplitude and this amplitude relative to the whole signal amplitude. Brain wave bands per every channel - see csv files.'
 
-    metric_global_content={'mag': None, 'grad': None}
-    metric_local_content={'mag': None, 'grad': None}
+    metric_global_content={'mag': None, 'grad': None, 'eeg': None}
+    metric_local_content={'mag': None, 'grad': None, 'eeg': None}
 
     for m_or_g in m_or_g_chosen:
 
         metric_global_content[m_or_g]=make_dict_global_psd(mean_brain_waves_dict[m_or_g], noisy_freqs_global[m_or_g], noise_ampl_global[m_or_g], noise_ampl_relative_to_all_signal_global[m_or_g])
         metric_local_content[m_or_g]=make_dict_local_psd(noisy_freqs_local[m_or_g], noise_ampl_local[m_or_g], noise_ampl_relative_to_all_signal_local[m_or_g], channels[m_or_g])
         
-    simple_metric = simple_metric_basic(metric_global_name, metric_global_description, metric_global_content['mag'], metric_global_content['grad'], metric_local_name, metric_local_description, metric_local_content['mag'], metric_local_content['grad'], psd=True)
+    simple_metric = simple_metric_basic(metric_global_name, metric_global_description, metric_global_content['mag'], metric_global_content['grad'], metric_local_name, metric_local_description, metric_local_content['mag'], metric_local_content['grad'], psd=True, metric_global_content_eeg=metric_global_content.get('eeg'), metric_local_content_eeg=metric_local_content.get('eeg'))
 
     return simple_metric
 
@@ -1025,7 +1025,7 @@ def PSD_meg_qc(psd_params: dict, psd_params_internal: dict, channels:dict, chs_b
 
     """
     # Load data
-    raw, shielding_str, meg_system = load_data(data_path)
+    raw, shielding_str, meg_system, _modality = load_data(data_path)
 
     # raw.load_data()
 
@@ -1033,13 +1033,14 @@ def PSD_meg_qc(psd_params: dict, psd_params_internal: dict, channels:dict, chs_b
     freqs = {}
     psds = {}
     derivs_psd = []
-    mean_brain_waves_dict = {'mag':{}, 'grad':{}}
-    noise_ampl_global={'mag':[], 'grad':[]}
-    noise_ampl_relative_to_all_signal_global={'mag':[], 'grad':[]}
-    noisy_freqs_global={'mag':[], 'grad':[]}
-    noise_ampl_local={'mag':[], 'grad':[]}
-    noise_ampl_relative_to_all_signal_local={'mag':[], 'grad':[]}
-    noisy_freqs_local={'mag':[], 'grad':[]}
+    # Initialize dicts with keys for all requested channel types (mag, grad, eeg)
+    mean_brain_waves_dict = {k: {} for k in m_or_g_chosen}
+    noise_ampl_global = {k: [] for k in m_or_g_chosen}
+    noise_ampl_relative_to_all_signal_global = {k: [] for k in m_or_g_chosen}
+    noisy_freqs_global = {k: [] for k in m_or_g_chosen}
+    noise_ampl_local = {k: [] for k in m_or_g_chosen}
+    noise_ampl_relative_to_all_signal_local = {k: [] for k in m_or_g_chosen}
+    noisy_freqs_local = {k: [] for k in m_or_g_chosen}
 
     method = psd_params_internal['method']
     prominence_lvl_pos_avg = psd_params_internal['prominence_lvl_pos_avg']
@@ -1047,11 +1048,18 @@ def PSD_meg_qc(psd_params: dict, psd_params_internal: dict, channels:dict, chs_b
 
     nfft, nperseg = get_nfft_nperseg(raw, psd_params['psd_step_size'])
 
+    # Clamp fmax to Nyquist to prevent ValueError with low-sampling-rate data
+    nyquist = raw.info['sfreq'] / 2.0
+    fmax_safe = min(psd_params['freq_max'], nyquist - 1.0)
+    if fmax_safe < psd_params['freq_max']:
+        print(f'___MEGqc___: PSD fmax clamped from {psd_params["freq_max"]} Hz to '
+              f'{fmax_safe} Hz (Nyquist = {nyquist} Hz).')
+
     chs_by_lobe_psd=copy.deepcopy(chs_by_lobe)
 
     for m_or_g in m_or_g_chosen:
 
-        psds[m_or_g], freqs[m_or_g] = raw.compute_psd(method=method, fmin=psd_params['freq_min'], fmax=psd_params['freq_max'], picks=channels[m_or_g], n_fft=nfft, n_per_seg=nperseg).get_data(return_freqs=True)
+        psds[m_or_g], freqs[m_or_g] = raw.compute_psd(method=method, fmin=psd_params['freq_min'], fmax=fmax_safe, picks=channels[m_or_g], n_fft=nfft, n_per_seg=nperseg).get_data(return_freqs=True)
         psds[m_or_g]=np.sqrt(psds[m_or_g]) # amplitude of the noise in this band. without sqrt it is power.
 
         # Add psds and freqs into chs_by_lobe dict:

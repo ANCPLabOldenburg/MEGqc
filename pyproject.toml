@@ -4,10 +4,10 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "meg_qc"
-description = "Tool for automated MEG data quality control"
+description = "Tool for automated MEG and EEG data quality control"
 readme = "README.md"
 requires-python = "==3.10.*"
-version = "0.7.8"
+version = "0.9.0"
 license = "MIT"
 authors = [
     {name = "Karel Lopez Vilaret", email = "karel.mauricio.lopez.vilaret@uni-oldenburg.de"},

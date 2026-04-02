@@ -204,7 +204,17 @@ def get_head_positions(raw: mne.io.Raw):
     # Next steps - for all systems:
     print('___MEGqc___: ', 'Start computing head positions...')
     start_time = time.time()
-    head_pos = mne.chpi.compute_head_pos(raw.info, chpi_locs)
+    try:
+        head_pos = mne.chpi.compute_head_pos(raw.info, chpi_locs)
+    except (AssertionError, RuntimeError, ValueError) as exc:
+        print(f'___MEGqc___: compute_head_pos failed: {exc}')
+        no_head_pos_str = (
+            'Head positions could not be computed. '
+            'This typically happens when fewer than 3 HPI coil positions '
+            'were digitised or the initial HPI fit is missing from the file. '
+            'Ensure the recording includes valid HPI digitisation points.'
+        )
+        return head_pos, no_head_pos_str
     print('___MEGqc___: ',
           "Finished computing head positions. --- Execution %s seconds ---" % (time.time() - start_time))
     # print('___MEGqc___: ', 'Head positions:', head_pos)
@@ -242,7 +252,7 @@ def HEAD_movement_meg_qc(data_path: str):
         Head positions and rotations calculated by MNE.
 
     """
-    raw, shielding_str, meg_system = load_data(data_path)
+    raw, shielding_str, meg_system, _modality = load_data(data_path)
 
     # Compute head positions using mne:
     head_pos, head_str = get_head_positions(raw)
