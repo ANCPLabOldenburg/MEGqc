@@ -7,7 +7,7 @@ name = "meg_qc"
 description = "Tool for automated MEG and EEG data quality control"
 readme = "README.md"
 requires-python = "==3.10.*"
-version = "0.9.0"
+version = "0.9.4"
 license = "MIT"
 authors = [
     {name = "Karel Lopez Vilaret", email = "karel.mauricio.lopez.vilaret@uni-oldenburg.de"},
@@ -43,7 +43,20 @@ globalqualityindex = "meg_qc.test:run_gqi"
 
 [tool.setuptools]
 include-package-data = true
-package-data = {"meg_qc.miscellaneous.GUI" = ["logo.png"]}
+package-data = {
+    "meg_qc.miscellaneous.GUI" = [
+        "logo.png",
+        "assets/macos/AppIcon.icns",
+        "assets/macos/AppIcon16.png",
+        "assets/macos/AppIcon32.png",
+        "assets/macos/AppIcon64.png",
+        "assets/macos/AppIcon128.png",
+        "assets/macos/AppIcon256.png",
+        "assets/macos/AppIcon512.png",
+        "assets/macos/AppIcon1024.png",
+        "assets/windows/AppIcon.ico",
+    ]
+}
 
 [tool.setuptools.packages.find]
 include = ["meg_qc*"]

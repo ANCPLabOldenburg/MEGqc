@@ -34,7 +34,7 @@ from PyQt6.QtWidgets import (
     QLineEdit, QProgressBar, QColorDialog, QApplication, QToolTip,
 )
 from PyQt6.QtCore import Qt, pyqtSignal, QTimer, QSettings, QThread, pyqtSlot
-from PyQt6.QtGui import QColor, QCursor
+from PyQt6.QtGui import QColor, QCursor, QPalette
 
 from .annotation_manager import (
     AnnotationManager, AnnotationSet, EpochAnnotation, EventMarker,
@@ -209,8 +209,12 @@ class TimeSeriesWidget(QWidget):
         main_layout.setContentsMargins(0, 0, 0, 0)
         main_layout.setSpacing(2)
 
-        toolbar = self._build_toolbar()
-        main_layout.addWidget(toolbar)
+        self._toolbar_widget = self._build_toolbar()
+        self._toolbar_toggle_btn = self._make_section_toggle(
+            "Display Controls", self._toolbar_widget, expanded=True
+        )
+        main_layout.addWidget(self._toolbar_toggle_btn)
+        main_layout.addWidget(self._toolbar_widget)
 
         # Plot area
         splitter = QSplitter(Qt.Orientation.Horizontal)
@@ -262,10 +266,36 @@ class TimeSeriesWidget(QWidget):
         main_layout.addWidget(nav)
 
         self._annot_panel = self._build_annotation_panel()
+        self._annot_toggle_btn = self._make_section_toggle(
+            "MEGqc Annotation Overlays", self._annot_panel, expanded=False
+        )
+        main_layout.addWidget(self._annot_toggle_btn)
         main_layout.addWidget(self._annot_panel)
 
         # Loading overlay (must be last to stay on top)
         self._loading_overlay = _LoadingOverlay(self)
+
+    def _make_section_toggle(
+        self, title: str, widget: "QWidget", expanded: bool = True
+    ) -> "QPushButton":
+        """Return a flat, checkable toggle button that shows/hides *widget*.
+
+        The button arrow prefix (▼/▶) updates automatically.
+        """
+        btn = QPushButton(("\u25bc " if expanded else "\u25b6 ") + title)
+        btn.setCheckable(True)
+        btn.setChecked(expanded)
+        btn.setFlat(True)
+        btn.setObjectName("sectionToggle")
+        btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        widget.setVisible(expanded)
+
+        def _on_toggle(checked: bool, w=widget, b=btn, t=title) -> None:
+            w.setVisible(checked)
+            b.setText(("\u25bc " if checked else "\u25b6 ") + t)
+
+        btn.clicked.connect(_on_toggle)
+        return btn
 
     def _build_toolbar(self) -> QWidget:
         container = QWidget()
@@ -1033,7 +1063,10 @@ class TimeSeriesWidget(QWidget):
         flagged_channels = self._get_active_channel_flags()
         scale = self._scale_factor
         plot_item = self._plot_widget.getPlotItem()
-        default_label_color = "#cccccc" if self._dark_plot else "#000000"
+        default_label_color = "#cccccc" if self._dark_plot else (
+            QApplication.instance().palette().color(QPalette.ColorRole.WindowText).name()
+            if QApplication.instance() else "#000000"
+        )
 
         if self._normalize:
             # Normalize mode: per-channel normalization, each channel
@@ -2159,13 +2192,33 @@ class TimeSeriesWidget(QWidget):
     def _apply_plot_theme(self):
         plot_bg = "#1e1e1e" if self._dark_plot else "#ffffff"
         self._plot_widget.setBackground(plot_bg)
-        fg = "#cccccc" if self._dark_plot else "#000000"
-        for axis_name in ("bottom", "left"):
-            axis = self._plot_widget.getPlotItem().getAxis(axis_name)
-            axis.setPen(pg.mkPen(color=fg))
-            axis.setTextPen(pg.mkPen(color=fg))
 
+        # X axis (bottom): sits inside the plot canvas frame.
+        # Its text must contrast with the CANVAS background (dark_plot flag),
+        # NOT with the application theme colour.
+        x_fg = "#cccccc" if self._dark_plot else "#222222"
+
+        # Y axis (left) and channel-label area: these QWidget strips inherit
+        # the application Window background from the active theme, so their
+        # text must contrast with the THEME, not the canvas.
+        # Works the same on macOS, Windows and Linux.
+        app = QApplication.instance()
+        y_fg = (
+            app.palette().color(QPalette.ColorRole.WindowText).name()
+            if app is not None
+            else ("#cccccc" if self._dark_plot else "#222222")
+        )
+
+        x_axis = self._plot_widget.getPlotItem().getAxis("bottom")
+        x_axis.setPen(pg.mkPen(color=x_fg))
+        x_axis.setTextPen(pg.mkPen(color=x_fg))
+
+        y_axis = self._plot_widget.getPlotItem().getAxis("left")
+        y_axis.setPen(pg.mkPen(color=y_fg))
+        y_axis.setTextPen(pg.mkPen(color=y_fg))
     def refresh_theme(self):
+        # Re-apply axis/background colours for the new app theme, then redraw.
+        self._apply_plot_theme()
         if self._raw is not None:
             self._redraw()
 

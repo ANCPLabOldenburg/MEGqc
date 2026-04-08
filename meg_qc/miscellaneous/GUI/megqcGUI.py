@@ -34,10 +34,11 @@ except ImportError:
 from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QPushButton, QLineEdit, QLabel,
     QFileDialog, QPlainTextEdit, QVBoxLayout, QHBoxLayout, QFormLayout,
-    QGroupBox, QSpinBox, QTabWidget, QScrollArea, QMessageBox,
+    QGroupBox, QSpinBox, QTabWidget, QScrollArea, QFrame, QMessageBox,
     QListWidget, QCheckBox, QTableWidget, QTableWidgetItem, QHeaderView,
     QDialog, QComboBox, QDoubleSpinBox, QDialogButtonBox, QGridLayout,
-    QInputDialog, QTreeView, QListView, QAbstractItemView,
+    QInputDialog, QTreeView, QListView, QAbstractItemView, QSizePolicy,
+    QAbstractScrollArea,
 )
 from PyQt6.QtCore import (
     QObject,
@@ -67,6 +68,8 @@ try:
     HAS_WEBENGINE = True
 except ImportError:
     HAS_WEBENGINE = False
+# Output monitoring: live terminal streaming + CLI launcher
+from .output_monitoring import LiveTerminalDialog, open_cli_terminal
 # Use Qt5 widget integration and not the OS integrations (This will prevent incompatibilities)
 QCoreApplication.setAttribute(Qt.ApplicationAttribute.AA_DontUseNativeDialogs)
 
@@ -79,9 +82,35 @@ PKG_ROOT = GUI_DIR.parent.parent
 
 SETTINGS_PATH = PKG_ROOT / "settings" / "settings.ini"
 INTERNAL_PATH = PKG_ROOT / "settings" / "settings_internal.ini"
-# Logo e icon se quedan en la carpeta GUI
+# Logo shown in the header of the Run tab
 LOGO_PATH = GUI_DIR / "logo.png"
-ICON_PATH = LOGO_PATH
+
+# Window / taskbar icon — platform-specific bundled assets
+_ASSETS = GUI_DIR / "assets"
+_WIN_ICON  = _ASSETS / "windows" / "AppIcon.ico"
+_MAC_ICON  = _ASSETS / "macos"   / "AppIcon.icns"
+# PNG sizes available for Linux (and as fallback on any platform)
+_PNG_SIZES = [16, 32, 64, 128, 256, 512]
+
+
+def _build_app_icon() -> "QIcon":
+    """Return the best available QIcon for the current platform."""
+    import sys as _sys
+    if _sys.platform == "win32" and _WIN_ICON.exists():
+        return QIcon(str(_WIN_ICON))
+    if _sys.platform == "darwin" and _MAC_ICON.exists():
+        return QIcon(str(_MAC_ICON))
+    # Linux (or fallback): compose a multi-resolution icon from the PNG set
+    icon = QIcon()
+    macos_dir = _ASSETS / "macos"
+    for size in _PNG_SIZES:
+        p = macos_dir / f"AppIcon{size}.png"
+        if p.exists():
+            icon.addPixmap(QPixmap(str(p)))
+    if icon.isNull() and LOGO_PATH.exists():
+        icon = QIcon(str(LOGO_PATH))
+    return icon
+
 
 
 # megqcGUI.py
@@ -146,6 +175,7 @@ class Worker(QObject):
     started = pyqtSignal()
     finished = pyqtSignal()
     error = pyqtSignal(str)
+    output_ready = pyqtSignal(str)  # emits captured stdout/stderr lines
 
     def __init__(self, func, *args):
         super().__init__()
@@ -230,6 +260,26 @@ class Worker(QObject):
             self.error.emit(f"Process exited with code {exit_code}")
         self._cleanup()
 
+    def _on_stdout_ready(self) -> None:
+        """Read available stdout/stderr data, emit via output_ready AND
+        echo to the parent-process stdout so both the Live Terminal dialog
+        *and* any real terminal (Linux/Windows) receive the output.
+        """
+        if self.process is None:
+            return
+        data = self.process.readAllStandardOutput()
+        if data:
+            text = bytes(data).decode("utf-8", errors="replace")
+            # GUI live terminal
+            self.output_ready.emit(text)
+            # Real terminal (for users on Linux / Windows or who launched
+            # megqc from a terminal on macOS).
+            try:
+                sys.stdout.write(text)
+                sys.stdout.flush()
+            except Exception:
+                pass
+
     # ------------------------------------------------------------------
     # Public API used by the GUI
     # ------------------------------------------------------------------
@@ -244,12 +294,13 @@ class Worker(QObject):
         payload = self._build_payload()
 
         process = QProcess(self)
-        process.setProcessChannelMode(QProcess.ProcessChannelMode.ForwardedChannels)
+        process.setProcessChannelMode(QProcess.ProcessChannelMode.MergedChannels)
+        process.readyReadStandardOutput.connect(self._on_stdout_ready)
         process.finished.connect(self._on_finished)
         process.errorOccurred.connect(self._on_error)
         process.started.connect(self._on_started)
         process.setProgram(sys.executable)
-        process.setArguments(["-m", entry_module, "--func", func_path, "--args", payload])
+        process.setArguments(["-u", "-m", entry_module, "--func", func_path, "--args", payload])
         self.process = process
         process.start()
 
@@ -274,9 +325,9 @@ class Worker(QObject):
         if pid > 0:
             _terminate_process_tree(pid)
 
-        # ``kill`` complements the explicit tree teardown above.  When the
-        # child already exited this is a no-op, otherwise it ensures the GUI
-        # regains control even if the task ignores SIGTERM.
+        # ``kill`` complements the explicit tree teardown above.  When the child
+        # already exited this is a no-op, otherwise it ensures the GUI regains
+        # control even if the task ignores SIGTERM.
         self.process.kill()
 
 
@@ -833,10 +884,15 @@ class CollapsibleDetachableSection(QWidget):
         # rendering as two separate "bubbles" in expanded state.
         self.frame = QWidget()
         self.frame.setObjectName("sectionFrame")
+        # Expanding policy so the frame grows when the parent allocates more space.
+        self.frame.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
         frame_lay = QVBoxLayout(self.frame)
-        frame_lay.setContentsMargins(0, 0, 0, 0)
+        # 1px side/bottom margins keep children inside the 1px border and
+        # prevent rectangular child widgets from overlapping the rounded
+        # corners of the sectionFrame (border-radius: 8px).
+        frame_lay.setContentsMargins(4, 0, 4, 4)
         frame_lay.setSpacing(0)
-        root.addWidget(self.frame)
+        root.addWidget(self.frame, stretch=1)
 
         header = QWidget()
         header.setObjectName("sectionHeader")
@@ -860,17 +916,21 @@ class CollapsibleDetachableSection(QWidget):
         header_lay.addWidget(self.btn_toggle)
         header_lay.addStretch(1)
         header_lay.addWidget(self.btn_detach)
-        frame_lay.addWidget(header)
+        frame_lay.addWidget(header, stretch=0)
 
         self.body = QWidget()
         self.body.setObjectName("sectionBody")
+        # Expanding policy so the body fills all space below the header.
+        self.body.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
         self.body_lay = QVBoxLayout(self.body)
         self.body_lay.setContentsMargins(0, 0, 0, 0)
         # Inner "mainSection" group boxes are embedded into the outer frame,
         # so they should not draw a second border.
         self.content_widget.setProperty("embeddedSection", True)
         self.body_lay.addWidget(self.content_widget)
-        frame_lay.addWidget(self.body)
+        # stretch=1 so body takes all remaining vertical space inside the frame
+        # (the header stays at its natural height).
+        frame_lay.addWidget(self.body, stretch=1)
 
     def _toggle_collapsed(self, checked: bool) -> None:
         arrow = "▼" if checked else "▶"
@@ -918,6 +978,8 @@ class CollapsibleDetachableSection(QWidget):
         self.btn_detach.setText("Detach")
         self.body.setVisible(self.btn_toggle.isChecked())
 
+
+
 class MainWindow(QMainWindow):
     """
     Main application window for dataset execution and report generation.
@@ -931,8 +993,7 @@ class MainWindow(QMainWindow):
 
         self.setWindowTitle("MEGqc")
         self.resize(700, 780)
-        if ICON_PATH and ICON_PATH.exists():
-            self.setWindowIcon(QIcon(str(ICON_PATH)))
+        self.setWindowIcon(_build_app_icon())
 
         # Runtime config manager state.
         # Package defaults are read-only; GUI edits always go to runtime copies.
@@ -980,7 +1041,7 @@ class MainWindow(QMainWindow):
             logo.setAlignment(Qt.AlignmentFlag.AlignCenter)
             vlay.addWidget(logo)
 
-        vlay.addWidget(self._create_run_tab())
+        vlay.addWidget(self._create_run_tab(), stretch=1)
         self.setCentralWidget(central)
         self.statusBar().setVisible(False)
 
@@ -1011,6 +1072,7 @@ class MainWindow(QMainWindow):
         # Use blue selection in Dark theme (instead of the legacy purple).
         dark.setColor(QPalette.ColorRole.Highlight, QColor(78, 163, 255))
         dark.setColor(QPalette.ColorRole.HighlightedText, Qt.GlobalColor.white)
+        dark.setColor(QPalette.ColorRole.PlaceholderText, QColor(120, 120, 120))
         themes["Dark"] = dark
 
         # LIGHT ☀
@@ -1026,6 +1088,7 @@ class MainWindow(QMainWindow):
         light.setColor(QPalette.ColorRole.ButtonText, Qt.GlobalColor.black)
         light.setColor(QPalette.ColorRole.Highlight, QColor(100, 149, 237))
         light.setColor(QPalette.ColorRole.HighlightedText, Qt.GlobalColor.white)
+        light.setColor(QPalette.ColorRole.PlaceholderText, QColor(160, 160, 160))
         themes["Light"] = light
 
         # BEIGE 🏜
@@ -1041,6 +1104,7 @@ class MainWindow(QMainWindow):
         beige.setColor(QPalette.ColorRole.ButtonText, Qt.GlobalColor.black)
         beige.setColor(QPalette.ColorRole.Highlight, QColor(196, 148, 70))
         beige.setColor(QPalette.ColorRole.HighlightedText, Qt.GlobalColor.white)
+        beige.setColor(QPalette.ColorRole.PlaceholderText, QColor(160, 140, 110))
         themes["Beige"] = beige
 
         # OCEAN 🌊
@@ -1056,6 +1120,7 @@ class MainWindow(QMainWindow):
         ocean.setColor(QPalette.ColorRole.ButtonText, Qt.GlobalColor.black)
         ocean.setColor(QPalette.ColorRole.Highlight, QColor(0, 123, 167))  # deep ocean blue
         ocean.setColor(QPalette.ColorRole.HighlightedText, Qt.GlobalColor.white)
+        ocean.setColor(QPalette.ColorRole.PlaceholderText, QColor(120, 155, 175))
         themes["Ocean"] = ocean
 
         # CONTRAST 🌓
@@ -1071,6 +1136,7 @@ class MainWindow(QMainWindow):
         hc.setColor(QPalette.ColorRole.ButtonText, Qt.GlobalColor.white)
         hc.setColor(QPalette.ColorRole.Highlight, QColor(255, 215, 0))  # vivid gold
         hc.setColor(QPalette.ColorRole.HighlightedText, Qt.GlobalColor.black)
+        hc.setColor(QPalette.ColorRole.PlaceholderText, QColor(140, 140, 140))
         themes["Contrast"] = hc
 
         # SOLARIZED 🌞 (light variant)
@@ -1086,6 +1152,7 @@ class MainWindow(QMainWindow):
         solar.setColor(QPalette.ColorRole.ButtonText, QColor(88, 110, 117))
         solar.setColor(QPalette.ColorRole.Highlight, QColor(38, 139, 210))  # solarized blue
         solar.setColor(QPalette.ColorRole.HighlightedText, Qt.GlobalColor.white)
+        solar.setColor(QPalette.ColorRole.PlaceholderText, QColor(147, 161, 161))
         themes["Solar"] = solar
 
         # CYBERPUNK 🕶
@@ -1101,6 +1168,7 @@ class MainWindow(QMainWindow):
         cyber.setColor(QPalette.ColorRole.ButtonText, QColor(255, 0, 255))
         cyber.setColor(QPalette.ColorRole.Highlight, QColor(255, 0, 128))  # neon pink
         cyber.setColor(QPalette.ColorRole.HighlightedText, Qt.GlobalColor.white)
+        cyber.setColor(QPalette.ColorRole.PlaceholderText, QColor(0, 140, 140))
         themes["Cyber"] = cyber
 
         # DRACULA  🧛
@@ -1116,6 +1184,7 @@ class MainWindow(QMainWindow):
         drac.setColor(QPalette.ColorRole.ButtonText, QColor("#f8f8f2"))
         drac.setColor(QPalette.ColorRole.Highlight, QColor("#bd93f9"))  # purple
         drac.setColor(QPalette.ColorRole.HighlightedText, Qt.GlobalColor.black)
+        drac.setColor(QPalette.ColorRole.PlaceholderText, QColor("#6272a4"))
         themes["Dracula"] = drac
 
         # NORD  🧊
@@ -1131,6 +1200,7 @@ class MainWindow(QMainWindow):
         nord.setColor(QPalette.ColorRole.ButtonText, QColor("#d8dee9"))
         nord.setColor(QPalette.ColorRole.Highlight, QColor("#88c0d0"))  # icy cyan
         nord.setColor(QPalette.ColorRole.HighlightedText, Qt.GlobalColor.black)
+        nord.setColor(QPalette.ColorRole.PlaceholderText, QColor("#4c566a"))
         themes["Nord"] = nord
 
         # GRUVBOX DARK  🪵
@@ -1146,6 +1216,7 @@ class MainWindow(QMainWindow):
         gruv.setColor(QPalette.ColorRole.ButtonText, QColor("#ebdbb2"))
         gruv.setColor(QPalette.ColorRole.Highlight, QColor("#d79921"))  # warm yellow
         gruv.setColor(QPalette.ColorRole.HighlightedText, Qt.GlobalColor.black)
+        gruv.setColor(QPalette.ColorRole.PlaceholderText, QColor("#928374"))
         themes["Gruvbox"] = gruv
 
         # MONOKAI  🌵
@@ -1161,6 +1232,7 @@ class MainWindow(QMainWindow):
         mono.setColor(QPalette.ColorRole.ButtonText, QColor("#f8f8f2"))
         mono.setColor(QPalette.ColorRole.Highlight, QColor("#a6e22e"))  # neon green
         mono.setColor(QPalette.ColorRole.HighlightedText, Qt.GlobalColor.black)
+        mono.setColor(QPalette.ColorRole.PlaceholderText, QColor("#75715e"))
         themes["Monokai"] = mono
 
         # TOKYO NIGHT  🗼
@@ -1176,6 +1248,7 @@ class MainWindow(QMainWindow):
         tokyo.setColor(QPalette.ColorRole.ButtonText, QColor("#c0caf5"))
         tokyo.setColor(QPalette.ColorRole.Highlight, QColor("#7aa2f7"))  # soft blue
         tokyo.setColor(QPalette.ColorRole.HighlightedText, Qt.GlobalColor.white)
+        tokyo.setColor(QPalette.ColorRole.PlaceholderText, QColor("#565f89"))
         themes["Tokyo"] = tokyo
 
         # CATPPUCCIN MOCHA 🐈
@@ -1191,6 +1264,7 @@ class MainWindow(QMainWindow):
         mocha.setColor(QPalette.ColorRole.ButtonText, QColor("#cdd6f4"))
         mocha.setColor(QPalette.ColorRole.Highlight, QColor("#f38ba8"))
         mocha.setColor(QPalette.ColorRole.HighlightedText, Qt.GlobalColor.black)
+        mocha.setColor(QPalette.ColorRole.PlaceholderText, QColor("#6c7086"))
         themes["Mocha"] = mocha
 
         # PALENIGHT 🎆
@@ -1206,6 +1280,7 @@ class MainWindow(QMainWindow):
         pale.setColor(QPalette.ColorRole.ButtonText, QColor("#a6accd"))
         pale.setColor(QPalette.ColorRole.Highlight, QColor("#82aaff"))
         pale.setColor(QPalette.ColorRole.HighlightedText, Qt.GlobalColor.black)
+        pale.setColor(QPalette.ColorRole.PlaceholderText, QColor("#585c79"))
         themes["Palenight"] = pale
 
         return themes
@@ -1388,7 +1463,7 @@ class MainWindow(QMainWindow):
             raise (last_exc or exc)
 
     def _fetch_latest_pypi_version(self, include_pre: bool = False) -> str:
-        """Return the latest meg_qc version string from PyPI.
+        """Return the latest meg_qc version from PyPI.
 
         When *include_pre* is False (default) this returns ``info.version``
         which PyPI always sets to the latest *stable* release.  When True, the
@@ -1716,7 +1791,12 @@ class MainWindow(QMainWindow):
 
         inputs_box = QGroupBox("")
         inputs_box.setObjectName("mainSection")
+        # Mark as embedded so the stylesheet suppresses the inner border
+        # (avoids a double-line with the CollapsibleDetachableSection frame).
+        inputs_box.setProperty("embeddedSection", "true")
         inputs_layout = QVBoxLayout(inputs_box)
+        inputs_layout.setContentsMargins(4, 2, 4, 4)
+        inputs_layout.setSpacing(4)
 
         global_row = QWidget()
         global_lay = QHBoxLayout(global_row)
@@ -1746,6 +1826,7 @@ class MainWindow(QMainWindow):
 
         self.dataset_table = QTableWidget(0, 2)
         self.dataset_table.setHorizontalHeaderLabels(["Dataset path", "Settings"])
+        self.dataset_table.setMinimumHeight(60)  # ensure at least 2 rows visible
         self.dataset_table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
         self.dataset_table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeMode.ResizeToContents)
         self.dataset_table.itemSelectionChanged.connect(self._on_dataset_selection_changed)
@@ -1815,8 +1896,9 @@ class MainWindow(QMainWindow):
         dataset_btn_lay.addWidget(btn_up)
         dataset_btn_lay.addWidget(btn_down)
         inputs_layout.addWidget(dataset_btn_row)
+
         self.section_inputs = CollapsibleDetachableSection("Inputs", inputs_box, parent=w)
-        lay.addWidget(self.section_inputs)
+        lay.addWidget(self.section_inputs, stretch=3)
 
         output_box = QGroupBox("")
         output_box.setObjectName("mainSection")
@@ -2053,8 +2135,29 @@ class MainWindow(QMainWindow):
         # — Log output —
         self.log = QPlainTextEdit()
         self.log.setReadOnly(True)
-        lay.addWidget(QLabel("Log:"))
-        lay.addWidget(self.log)
+        # Header row: "Log:" label + action buttons side by side
+        log_header = QWidget()
+        log_header_lay = QHBoxLayout(log_header)
+        log_header_lay.setContentsMargins(0, 0, 0, 2)
+        log_header_lay.setSpacing(6)
+        log_header_lay.addWidget(QLabel("Log:"))
+        log_header_lay.addStretch(1)
+        self.btn_live_output = QPushButton("Live terminal output")
+        self.btn_live_output.setToolTip(
+            "Open a floating window that streams real-time stdout/stderr "
+            "from background pipeline tasks."
+        )
+        self.btn_live_output.clicked.connect(self._open_live_terminal)
+        log_header_lay.addWidget(self.btn_live_output)
+        self.btn_open_cli = QPushButton("Open CLI")
+        self.btn_open_cli.setToolTip(
+            "Open a system terminal with the MEGqc Python environment activated,\n"
+            "ready to run CLI commands like: run-megqc --inputdata /path/to/dataset"
+        )
+        self.btn_open_cli.clicked.connect(self._open_cli_terminal)
+        log_header_lay.addWidget(self.btn_open_cli)
+        lay.addWidget(log_header)
+        lay.addWidget(self.log, stretch=1)
         lay.addSpacing(10)
 
         bottom_row = QWidget()
@@ -2076,6 +2179,8 @@ class MainWindow(QMainWindow):
         self.btn_gui_settings = QPushButton("GUI settings")
         self.btn_gui_settings.clicked.connect(self._open_gui_settings_dialog)
         bottom_lay.addWidget(self.btn_gui_settings)
+
+
         bottom_lay.addWidget(self.spinner_label)
         bottom_lay.addWidget(self.elapsed_label)
         lay.addWidget(bottom_row)
@@ -2088,40 +2193,13 @@ class MainWindow(QMainWindow):
         return w
 
     # ──────────────────────────────── #
-    # QC Viewer launcher               #
-    # ──────────────────────────────── #
-    def _open_qc_viewer(self):
-        """Open the integrated QC Viewer window."""
-        try:
-            from .qc_viewer import QCViewerWindow
-            initial_dir = self.derivatives_dir.text() if self.derivatives_dir.text() else None
-            self._qc_viewer_window = QCViewerWindow(
-                parent=None,
-                initial_dir=initial_dir,
-            )
-            self._qc_viewer_window.show()
-        except Exception as e:
-            QMessageBox.warning(
-                self,
-                "QC Viewer",
-                f"Failed to open the QC Viewer:\n{e}",
-            )
-
-    # ──────────────────────────────── #
     # helper: browse directory         #
     # ──────────────────────────────── #
     def _browse(self, edit: QLineEdit):
-        # Build options: only show directories, and force Qt's built-in dialog
         options = (
                 QFileDialog.Option.ShowDirsOnly
                 | QFileDialog.Option.DontUseNativeDialog
         )
-
-        # Call Qt's folder picker
-        #   - parent: self
-        #   - window title: "Select Directory"
-        #   - initial directory: use current text in the QLineEdit, or "" for home
-        #   - options: as defined above
         start_dir = edit.text() or ""
         path = QFileDialog.getExistingDirectory(
             self,
@@ -2129,8 +2207,6 @@ class MainWindow(QMainWindow):
             start_dir,
             options
         )
-
-        # If the user picked something, update the QLineEdit
         if path:
             edit.setText(path)
 
@@ -2140,23 +2216,16 @@ class MainWindow(QMainWindow):
         dlg.setFileMode(QFileDialog.FileMode.Directory)
         dlg.setOption(QFileDialog.Option.DontUseNativeDialog, True)
         dlg.setOption(QFileDialog.Option.ShowDirsOnly, True)
-
-        # Enable multi-selection on the internal views
         for view in dlg.findChildren(QListView) + dlg.findChildren(QTreeView):
             view.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
-
-        # Start in the current text or home
         start_dir = self.dataset_input.text().strip()
         if start_dir and os.path.isdir(start_dir):
             dlg.setDirectory(start_dir)
-
         if dlg.exec():
             selected = dlg.selectedFiles()
-            # Filter to only actual directories
             dirs = [p for p in selected if os.path.isdir(p)]
             for d in dirs:
                 self._add_dataset_path(d)
-            # Clear the line edit since items went straight to the table
             self.dataset_input.clear()
 
     def _browse_plot_input_tsv(self):
@@ -2339,7 +2408,6 @@ class MainWindow(QMainWindow):
                 btn.setEnabled(enabled)
 
     def _toggle_per_dataset_config(self, checked: bool):
-        # Keep existing mapping but only apply it when checkbox is active.
         self._refresh_dataset_settings_button_state()
         self._update_config_status()
 
@@ -2382,7 +2450,6 @@ class MainWindow(QMainWindow):
         self._refresh_dataset_settings_button_state()
 
     def _collect_analysis_profile_settings(self) -> Tuple[str, Optional[str], str, str]:
-        """Read analysis/profile execution settings from GUI widgets."""
         mode = self.cmb_analysis_mode.currentText().strip().lower()
         analysis_id = self.edit_analysis_id.text().strip() or None
         cfg_policy = self.cmb_existing_cfg_policy.currentText().strip().lower()
@@ -2391,38 +2458,22 @@ class MainWindow(QMainWindow):
 
     @staticmethod
     def _generate_shared_analysis_id() -> str:
-        """Create a deterministic, human-readable profile ID for GUI runs."""
         return f"analysis_{time.strftime('%Y%m%d_%H%M%S')}"
 
-    def _validate_analysis_selection(
-        self,
-        mode: str,
-        analysis_id: Optional[str],
-        cfg_policy: Optional[str] = None,
-        sub_policy: Optional[str] = None,
-    ) -> bool:
-        """Return ``True`` if analysis mode/id combination is valid."""
+    def _validate_analysis_selection(self, mode, analysis_id, cfg_policy=None, sub_policy=None) -> bool:
         if mode == "reuse" and not analysis_id:
-            QMessageBox.warning(
-                self,
-                "Analysis profile",
-                "analysis_mode='reuse' requires a profile ID.\n"
-                "Set a profile ID or use 'Load profiles...'.",
-            )
+            QMessageBox.warning(self, "Analysis profile",
+                "analysis_mode='reuse' requires a profile ID.\nSet a profile ID or use 'Load profiles...'.")
             return False
         return True
 
     def _discover_profiles_for_datasets(self) -> Tuple[Dict[str, List[str]], List[str]]:
-        """Return per-dataset profile lists and their intersection."""
         datasets = self._collect_dataset_paths()
         derivatives_base = self.derivatives_dir.text().strip() or None
         profile_map: Dict[str, List[str]] = {}
         for ds in datasets:
             try:
-                profile_map[ds] = list_analysis_profiles(
-                    dataset_path=ds,
-                    external_derivatives_root=derivatives_base,
-                )
+                profile_map[ds] = list_analysis_profiles(dataset_path=ds, external_derivatives_root=derivatives_base)
             except Exception:
                 profile_map[ds] = []
         common: List[str] = []
@@ -2434,7 +2485,6 @@ class MainWindow(QMainWindow):
         return profile_map, common
 
     def _refresh_profiles_cache(self):
-        """Scan profile IDs across datasets and emit a concise log summary."""
         datasets = self._collect_dataset_paths()
         if not datasets:
             QMessageBox.warning(self, "Profiles", "Add at least one dataset first.")
@@ -2443,20 +2493,14 @@ class MainWindow(QMainWindow):
         summary = ", ".join(f"{Path(ds).name}:{len(vals)}" for ds, vals in profile_map.items())
         self._log(f"Profile scan completed ({summary}); common={len(common)}.")
         if len(datasets) > 1 and not common:
-            QMessageBox.information(
-                self,
-                "Profiles",
-                "No common profile ID across all selected datasets.\n"
-                "Use legacy mode or create/reuse a shared analysis_id.",
-            )
+            QMessageBox.information(self, "Profiles",
+                "No common profile ID across all selected datasets.\nUse legacy mode or create/reuse a shared analysis_id.")
 
     def _load_available_profiles(self):
-        """Discover profiles and let users pick a compatible one."""
         datasets = self._collect_dataset_paths()
         if not datasets:
             QMessageBox.warning(self, "Profiles", "Add at least one dataset first.")
             return
-
         selected_ds = self._selected_dataset_path() or datasets[0]
         profile_map, common = self._discover_profiles_for_datasets()
         if len(datasets) > 1:
@@ -2465,75 +2509,39 @@ class MainWindow(QMainWindow):
         else:
             options = profile_map.get(selected_ds, [])
             label = f"Available profiles for {Path(selected_ds).name}:"
-
         if not options:
-            QMessageBox.information(
-                self,
-                "Profiles",
-                "No compatible profiles found for current selection.",
-            )
+            QMessageBox.information(self, "Profiles", "No compatible profiles found for current selection.")
             return
-
-        picked, ok = QInputDialog.getItem(
-            self,
-            "Select profile",
-            label,
-            options,
-            0,
-            False,
-        )
+        picked, ok = QInputDialog.getItem(self, "Select profile", label, options, 0, False)
         if ok and picked:
             self.edit_analysis_id.setText(str(picked))
             self.cmb_analysis_mode.setCurrentText("reuse")
             self._log(f"Selected profile: {picked}")
 
-    def _validate_multisample_profile_compatibility(
-        self,
-        mode: str,
-        analysis_id: Optional[str],
-        *,
-        qa_multisample: bool,
-        qc_multisample: bool,
-        require_existing_profiles: bool = True,
-    ) -> bool:
-        """Ensure multisample plotting uses a compatible profile across datasets."""
+    def _validate_multisample_profile_compatibility(self, mode, analysis_id, *, qa_multisample, qc_multisample, require_existing_profiles=True) -> bool:
         if not (qa_multisample or qc_multisample):
             return True
         if mode == "legacy":
             return True
         if mode not in {"reuse", "new"}:
-            QMessageBox.warning(
-                self,
-                "Profile compatibility",
-                "Multisample plotting requires a shared profile strategy.\n"
-                "Use mode='reuse' (existing profile), mode='new' (fresh shared profile),\n"
-                "or legacy mode.",
-            )
+            QMessageBox.warning(self, "Profile compatibility",
+                "Multisample plotting requires a shared profile strategy.\nUse mode='reuse'/'new' or legacy mode.")
             return False
         if not analysis_id:
-            QMessageBox.warning(
-                self,
-                "Profile compatibility",
-                "Multisample plotting requires a profile ID for mode='reuse'/'new'.",
-            )
+            QMessageBox.warning(self, "Profile compatibility",
+                "Multisample plotting requires a profile ID for mode='reuse'/'new'.")
             return False
-        # During Run ALL in mode='new', profiles are created by the calculation
-        # step; do not require them to exist before queueing.
         if mode == "new" and not require_existing_profiles:
             return True
         profile_map, _common = self._discover_profiles_for_datasets()
         missing = [Path(ds).name for ds, vals in profile_map.items() if analysis_id not in set(vals)]
         if missing:
-            QMessageBox.warning(
-                self,
-                "Profile compatibility",
-                "Selected profile is missing for:\n- " + "\n- ".join(missing),
-            )
+            QMessageBox.warning(self, "Profile compatibility",
+                "Selected profile is missing for:\n- " + "\n- ".join(missing))
             return False
         return True
 
     def _toggle_calc_jobs_table(self, checked: bool):
-        # Njobs override toggle only affects editability of the n_jobs column.
         self._refresh_calc_jobs_table()
 
     def _refresh_calc_jobs_table(self):
@@ -2550,7 +2558,6 @@ class MainWindow(QMainWindow):
                 current_values[item.text()] = int(spin.value())
             if item is not None and isinstance(subs_widget, QLineEdit):
                 current_subjects[item.text()] = subs_widget.text().strip() or "all"
-
         self.calc_jobs_table.setRowCount(len(datasets))
         max_jobs = os.cpu_count() or 1
         allow_njobs_override = self.chk_calc_per_dataset_jobs.isChecked()
@@ -2573,12 +2580,8 @@ class MainWindow(QMainWindow):
             self.calc_jobs_table.setCellWidget(row, 3, scan_btn)
 
     def _scan_dataset_subjects(self, dataset_path: str) -> List[str]:
-        """
-        Use ANCPBIDS to list available subjects from raw scope for one dataset.
-        """
         import ancpbids
         from ancpbids import DatasetOptions
-
         dataset = ancpbids.load_dataset(dataset_path, DatasetOptions(lazy_loading=True))
         entities = dataset.query_entities(scope="raw")
         subjects = sorted(list(entities.get("subject", [])))
@@ -2604,12 +2607,10 @@ class MainWindow(QMainWindow):
         if not isinstance(subs_widget, QLineEdit):
             return
         current_raw = subs_widget.text().strip()
-        current_value: Union[str, List[str]]
         if not current_raw or current_raw.lower() == "all":
-            current_value = "all"
+            current_value: Union[str, List[str]] = "all"
         else:
             current_value = [s.strip() for s in current_raw.split(",") if s.strip()]
-
         try:
             subjects = self._scan_dataset_subjects(dataset_path)
         except Exception as exc:
@@ -2618,7 +2619,6 @@ class MainWindow(QMainWindow):
         if not subjects:
             QMessageBox.information(self, "Subject scan", "No subjects found in this dataset.")
             return
-
         dialog = SubjectSelectionDialog(Path(dataset_path).name, subjects, current_value, self)
         if dialog.exec() != QDialog.DialogCode.Accepted:
             return
@@ -2655,7 +2655,7 @@ class MainWindow(QMainWindow):
             overrides[item.text()] = parsed if parsed else "all"
         return overrides or None
 
-    def _set_plot_modes(self, *, qa_subject: bool, qa_group: bool, qa_multisample: bool, qc_group: bool, qc_multisample: bool):
+    def _set_plot_modes(self, *, qa_subject, qa_group, qa_multisample, qc_group, qc_multisample):
         self.chk_qa_subject.setChecked(qa_subject)
         self.chk_qa_group.setChecked(qa_group)
         self.chk_qa_multisample.setChecked(qa_multisample)
@@ -2664,40 +2664,16 @@ class MainWindow(QMainWindow):
         self._update_plot_form_state()
 
     def _set_plot_preset_qa(self):
-        self._set_plot_modes(
-            qa_subject=True,
-            qa_group=True,
-            qa_multisample=True,
-            qc_group=False,
-            qc_multisample=False,
-        )
+        self._set_plot_modes(qa_subject=True, qa_group=True, qa_multisample=True, qc_group=False, qc_multisample=False)
 
     def _set_plot_preset_qc(self):
-        self._set_plot_modes(
-            qa_subject=False,
-            qa_group=False,
-            qa_multisample=False,
-            qc_group=True,
-            qc_multisample=True,
-        )
+        self._set_plot_modes(qa_subject=False, qa_group=False, qa_multisample=False, qc_group=True, qc_multisample=True)
 
     def _set_plot_preset_all(self):
-        self._set_plot_modes(
-            qa_subject=True,
-            qa_group=True,
-            qa_multisample=True,
-            qc_group=True,
-            qc_multisample=True,
-        )
+        self._set_plot_modes(qa_subject=True, qa_group=True, qa_multisample=True, qc_group=True, qc_multisample=True)
 
     def _clear_plot_modes(self):
-        self._set_plot_modes(
-            qa_subject=False,
-            qa_group=False,
-            qa_multisample=False,
-            qc_group=False,
-            qc_multisample=False,
-        )
+        self._set_plot_modes(qa_subject=False, qa_group=False, qa_multisample=False, qc_group=False, qc_multisample=False)
 
     def _update_plot_form_state(self):
         dataset_count = len(self._collect_dataset_paths())
@@ -2708,39 +2684,21 @@ class MainWindow(QMainWindow):
                 chk.setChecked(False)
                 chk.blockSignals(False)
             chk.setEnabled(allow_multisample)
-
         qa_subject_selected = self.chk_qa_subject.isChecked()
         qa_group_selected = self.chk_qa_group.isChecked()
         qa_multisample_selected = self.chk_qa_multisample.isChecked()
         qc_group_selected = self.chk_qc_group.isChecked()
         qc_multisample_selected = self.chk_qc_multisample.isChecked()
-
         input_tsv_allowed = qc_group_selected and dataset_count == 1 and not qc_multisample_selected
         self.plot_input_tsv.setEnabled(input_tsv_allowed)
         if not input_tsv_allowed:
             self.plot_input_tsv.clear()
-
         attempt_allowed = qc_group_selected or qc_multisample_selected
         self.plot_attempt.setEnabled(attempt_allowed)
         if not attempt_allowed:
             self.plot_attempt.setValue(0)
-
-        mode_count = sum(
-            1
-            for selected in [
-                qa_subject_selected,
-                qa_group_selected,
-                qa_multisample_selected,
-                qc_group_selected,
-                qc_multisample_selected,
-            ]
-            if selected
-        )
-        output_allowed = mode_count == 1 and (
-            qa_multisample_selected
-            or qc_multisample_selected
-            or (qc_group_selected and dataset_count == 1)
-        )
+        mode_count = sum(1 for s in [qa_subject_selected, qa_group_selected, qa_multisample_selected, qc_group_selected, qc_multisample_selected] if s)
+        output_allowed = mode_count == 1 and (qa_multisample_selected or qc_multisample_selected or (qc_group_selected and dataset_count == 1))
         self.plot_output_report.setEnabled(output_allowed)
         if not output_allowed:
             self.plot_output_report.clear()
@@ -2749,64 +2707,34 @@ class MainWindow(QMainWindow):
     # start / stop handlers            #
     # ──────────────────────────────── #
     def start_calc(self):
-        """
-        Slot for the “Run Calculation” button.
-        Runs one or more datasets through the shared calculation dispatcher.
-        """
         if not self._ensure_no_active_pipeline_task("Calculation"):
             return
         dataset_paths = self._collect_dataset_paths()
         if not dataset_paths:
             QMessageBox.warning(self, "Calculation", "Please add at least one dataset.")
             return
-
         derivatives_dir = self.derivatives_dir.text().strip() or None
         subs = "all"
         dataset_subs = self._collect_dataset_sub_overrides()
         global_n_jobs = self.jobs.value()
         dataset_njobs = self._collect_calc_njobs_overrides()
         dataset_cfg_overrides = self._collect_dataset_config_overrides()
-        analysis_mode, analysis_id, cfg_policy, sub_policy = (
-            self._collect_analysis_profile_settings()
-        )
-        if not self._validate_analysis_selection(
-            analysis_mode,
-            analysis_id,
-            cfg_policy=cfg_policy,
-            sub_policy=sub_policy,
-        ):
+        analysis_mode, analysis_id, cfg_policy, sub_policy = self._collect_analysis_profile_settings()
+        if not self._validate_analysis_selection(analysis_mode, analysis_id, cfg_policy=cfg_policy, sub_policy=sub_policy):
             return
-
         args = (
-            dataset_paths,
-            str(self.default_settings_path),
-            str(INTERNAL_PATH),
-            subs,
-            global_n_jobs,
-            derivatives_dir,
-            dataset_njobs,
-            dataset_subs,
-            self.global_config_path,
-            dataset_cfg_overrides,
-            analysis_mode,
-            analysis_id,
-            cfg_policy,
-            sub_policy,
-            False,  # interactive_prompts disabled to prevent worker stdin blocking
-            False,  # keep_temp_on_error handled via CLI for debugging runs
+            dataset_paths, str(self.default_settings_path), str(INTERNAL_PATH),
+            subs, global_n_jobs, derivatives_dir, dataset_njobs, dataset_subs,
+            self.global_config_path, dataset_cfg_overrides,
+            analysis_mode, analysis_id, cfg_policy, sub_policy, False, False,
         )
-
         worker = Worker(run_calculation_dispatch, *args)
         self._set_active_run_task("calc")
 
         def on_started():
             self._start_task_timer("calc")
             cfg_note = f"global={self.global_config_path or 'default'}"
-            self._log(
-                f"Calculation started for {len(dataset_paths)} dataset(s) "
-                f"({cfg_note}, per-dataset overrides={len(dataset_cfg_overrides or {})}, "
-                f"analysis={analysis_mode}:{analysis_id or 'legacy'})."
-            )
+            self._log(f"Calculation started for {len(dataset_paths)} dataset(s) ({cfg_note}, analysis={analysis_mode}:{analysis_id or 'legacy'}).")
 
         def on_finished():
             elapsed = self._stop_task_timer("calc")
@@ -2823,23 +2751,17 @@ class MainWindow(QMainWindow):
         worker.started.connect(on_started)
         worker.finished.connect(on_finished)
         worker.error.connect(on_error)
-
         self.workers["calc"] = worker
         try:
             worker.start()
+            self._wire_worker_output(worker)
         except Exception as exc:
             self._stop_task_timer("calc")
             self._log(f"Calculation error: {exc}")
             self.workers.pop("calc", None)
             self._reset_run_controls_if_idle()
 
-
     def stop_calc(self):
-        """
-        Slot for the “Stop Calculation” button.
-        Delegates termination logic to Worker.stop(), which handles
-        both Unix (killpg) and Windows (process.terminate()).
-        """
         worker = self.workers.get("calc")
         if worker:
             worker.stop()
@@ -2848,104 +2770,53 @@ class MainWindow(QMainWindow):
             self.workers.pop("calc", None)
             self._reset_run_controls_if_idle()
 
-
     def start_plot(self):
-        """
-        Slot for the “Run Plotting” button.
-        Runs the shared plotting dispatcher for selected QA/QC modes.
-        """
         if not self._ensure_no_active_pipeline_task("Plotting"):
             return
         dataset_paths = self._collect_dataset_paths()
         if not dataset_paths:
             QMessageBox.warning(self, "Plotting", "Please add at least one dataset.")
             return
-
         derivatives_dir = self.derivatives_dir.text().strip() or None
         n_jobs = self.plot_jobs.value()
         attempt_raw = self.plot_attempt.value()
         attempt = attempt_raw if attempt_raw > 0 else None
         input_tsv = self.plot_input_tsv.text().strip() or None
         output_report = self.plot_output_report.text().strip() or None
-
         qa_subject = self.chk_qa_subject.isChecked()
         qa_group = self.chk_qa_group.isChecked()
         qa_multisample = self.chk_qa_multisample.isChecked()
         qc_group = self.chk_qc_group.isChecked()
         qc_multisample = self.chk_qc_multisample.isChecked()
-        analysis_mode, analysis_id, _cfg_policy, _sub_policy = (
-            self._collect_analysis_profile_settings()
-        )
-        if not self._validate_analysis_selection(
-            analysis_mode,
-            analysis_id,
-            cfg_policy=_cfg_policy,
-            sub_policy=_sub_policy,
-        ):
+        analysis_mode, analysis_id, _cfg_policy, _sub_policy = self._collect_analysis_profile_settings()
+        if not self._validate_analysis_selection(analysis_mode, analysis_id, cfg_policy=_cfg_policy, sub_policy=_sub_policy):
             return
         if analysis_mode == "new" and not analysis_id:
-            QMessageBox.warning(
-                self,
-                "Plotting",
-                "Mode 'new' requires a profile ID for plotting.\n"
-                "Use mode 'reuse' with a profile ID, or 'latest'/'legacy'.",
-            )
+            QMessageBox.warning(self, "Plotting", "Mode 'new' requires a profile ID for plotting.\nUse mode 'reuse' with a profile ID, or 'latest'/'legacy'.")
             return
-        if not self._validate_multisample_profile_compatibility(
-            analysis_mode,
-            analysis_id,
-            qa_multisample=qa_multisample,
-            qc_multisample=qc_multisample,
-        ):
+        if not self._validate_multisample_profile_compatibility(analysis_mode, analysis_id, qa_multisample=qa_multisample, qc_multisample=qc_multisample):
             return
-
         check_qa_subject = qa_subject
         if not any([qa_subject, qa_group, qa_multisample, qc_group, qc_multisample]):
             check_qa_subject = True
-
         try:
-            validate_plot_request(
-                dataset_paths=dataset_paths,
-                qa_subject=check_qa_subject,
-                qa_group=qa_group,
-                qa_multisample=qa_multisample,
-                qc_group=qc_group,
-                qc_multisample=qc_multisample,
-                input_tsv=input_tsv,
-                output_report=output_report,
-            )
+            validate_plot_request(dataset_paths=dataset_paths, qa_subject=check_qa_subject, qa_group=qa_group,
+                                  qa_multisample=qa_multisample, qc_group=qc_group, qc_multisample=qc_multisample,
+                                  input_tsv=input_tsv, output_report=output_report)
         except ValueError as exc:
             QMessageBox.warning(self, "Plotting", str(exc))
             return
-
         args = (
-            dataset_paths,
-            derivatives_dir,
-            output_report,
-            attempt,
-            input_tsv,
-            n_jobs,
-            qa_subject,
-            qa_group,
-            qa_multisample,
-            qc_group,
-            qc_multisample,
-            False,  # qa_all
-            False,  # qc_all
-            False,  # all_modes
-            analysis_mode,
-            analysis_id,
+            dataset_paths, derivatives_dir, output_report, attempt, input_tsv, n_jobs,
+            qa_subject, qa_group, qa_multisample, qc_group, qc_multisample,
+            False, False, False, analysis_mode, analysis_id,
         )
-
         worker = Worker(run_plotting_dispatch, *args)
         self._set_active_run_task("plot")
 
         def on_started():
             self._start_task_timer("plot")
-            self._log(
-                f"Plotting started for {len(dataset_paths)} dataset(s) "
-                f"(analysis={analysis_mode}:{analysis_id or 'legacy'})."
-            )
+            self._log(f"Plotting started for {len(dataset_paths)} dataset(s) (analysis={analysis_mode}:{analysis_id or 'legacy'}).")
 
         def on_finished():
             elapsed = self._stop_task_timer("plot")
@@ -2962,23 +2833,17 @@ class MainWindow(QMainWindow):
         worker.started.connect(on_started)
         worker.finished.connect(on_finished)
         worker.error.connect(on_error)
-
         self.workers["plot"] = worker
         try:
             worker.start()
+            self._wire_worker_output(worker)
         except Exception as exc:
             self._stop_task_timer("plot")
             self._log(f"Plotting error: {exc}")
             self.workers.pop("plot", None)
             self._reset_run_controls_if_idle()
 
-
     def stop_plot(self):
-        """
-        Slot for the “Stop Plotting” button.
-        Calls Worker.stop() to cleanly terminate the plotting process
-        on both Unix and Windows.
-        """
         worker = self.workers.get("plot")
         if worker:
             worker.stop()
@@ -2988,7 +2853,6 @@ class MainWindow(QMainWindow):
             self._reset_run_controls_if_idle()
 
     def start_gqi(self):
-        """Run Global Quality Index calculation for one or more datasets."""
         if not self._ensure_no_active_pipeline_task("GQI"):
             return
         dataset_paths = self._collect_dataset_paths()
@@ -2997,42 +2861,22 @@ class MainWindow(QMainWindow):
             return
         derivatives_dir = self.derivatives_dir.text().strip() or None
         dataset_cfg_overrides = self._collect_dataset_config_overrides()
-        analysis_mode, analysis_id, _cfg_policy, _sub_policy = (
-            self._collect_analysis_profile_settings()
-        )
-        if not self._validate_analysis_selection(
-            analysis_mode,
-            analysis_id,
-            cfg_policy=_cfg_policy,
-            sub_policy=_sub_policy,
-        ):
+        analysis_mode, analysis_id, _cfg_policy, _sub_policy = self._collect_analysis_profile_settings()
+        if not self._validate_analysis_selection(analysis_mode, analysis_id, cfg_policy=_cfg_policy, sub_policy=_sub_policy):
             return
         if analysis_mode == "new" and not analysis_id:
-            QMessageBox.warning(
-                self,
-                "GQI",
-                "Mode 'new' requires a profile ID for GQI recomputation.\n"
-                "Use mode 'reuse' with a profile ID, or 'latest'/'legacy'.",
-            )
+            QMessageBox.warning(self, "GQI", "Mode 'new' requires a profile ID for GQI recomputation.\nUse mode 'reuse' with a profile ID, or 'latest'/'legacy'.")
             return
         args = (
-            dataset_paths,
-            str(self.default_settings_path),
-            derivatives_dir,
-            self.global_config_path,
-            dataset_cfg_overrides,
-            analysis_mode,
-            analysis_id,
+            dataset_paths, str(self.default_settings_path), derivatives_dir,
+            self.global_config_path, dataset_cfg_overrides, analysis_mode, analysis_id,
         )
         worker = Worker(run_gqi_dispatch, *args)
         self._set_active_run_task("gqi")
 
         def on_started():
             self._start_task_timer("gqi")
-            self._log(
-                f"GQI started for {len(dataset_paths)} dataset(s) "
-                f"(analysis={analysis_mode}:{analysis_id or 'legacy'})."
-            )
+            self._log(f"GQI started for {len(dataset_paths)} dataset(s) (analysis={analysis_mode}:{analysis_id or 'legacy'}).")
 
         def on_finished():
             elapsed = self._stop_task_timer("gqi")
@@ -3052,6 +2896,7 @@ class MainWindow(QMainWindow):
         self.workers["gqi"] = worker
         try:
             worker.start()
+            self._wire_worker_output(worker)
         except Exception as exc:
             self._stop_task_timer("gqi")
             self._log(f"GQI error: {exc}")
@@ -3068,29 +2913,20 @@ class MainWindow(QMainWindow):
             self._reset_run_controls_if_idle()
 
     def start_all(self):
-        """Run calculation (including GQI) and then selected plotting scopes."""
         if not self._ensure_no_active_pipeline_task("Run ALL"):
             return
         dataset_paths = self._collect_dataset_paths()
         if not dataset_paths:
             QMessageBox.warning(self, "Run ALL", "Please add at least one dataset.")
             return
-
         derivatives_dir = self.derivatives_dir.text().strip() or None
         dataset_subs = self._collect_dataset_sub_overrides()
         calc_jobs = self.jobs.value()
         plot_jobs = self.plot_jobs.value()
         dataset_njobs = self._collect_calc_njobs_overrides()
         dataset_cfg_overrides = self._collect_dataset_config_overrides()
-        analysis_mode, analysis_id, cfg_policy, sub_policy = (
-            self._collect_analysis_profile_settings()
-        )
-        if not self._validate_analysis_selection(
-            analysis_mode,
-            analysis_id,
-            cfg_policy=cfg_policy,
-            sub_policy=sub_policy,
-        ):
+        analysis_mode, analysis_id, cfg_policy, sub_policy = self._collect_analysis_profile_settings()
+        if not self._validate_analysis_selection(analysis_mode, analysis_id, cfg_policy=cfg_policy, sub_policy=sub_policy):
             return
         qa_subject = self.chk_qa_subject.isChecked()
         qa_group = self.chk_qa_group.isChecked()
@@ -3098,67 +2934,27 @@ class MainWindow(QMainWindow):
         qc_group = self.chk_qc_group.isChecked()
         qc_multisample = self.chk_qc_multisample.isChecked()
         multisample_requested = qa_multisample or qc_multisample
-        if (
-            analysis_mode == "new"
-            and multisample_requested
-            and len(dataset_paths) > 1
-            and not analysis_id
-        ):
-            # Queue-friendly behavior for fresh runs: assign one shared profile
-            # ID so all datasets write to matching profile namespaces and the
-            # multisample plotting stage can run in the same Run ALL job.
+        if analysis_mode == "new" and multisample_requested and len(dataset_paths) > 1 and not analysis_id:
             analysis_id = self._generate_shared_analysis_id()
             self.edit_analysis_id.setText(analysis_id)
-            self._log(
-                "Run ALL assigned shared analysis_id for multisample queue: "
-                f"{analysis_id}"
-            )
-        if not self._validate_multisample_profile_compatibility(
-            analysis_mode,
-            analysis_id,
-            qa_multisample=qa_multisample,
-            qc_multisample=qc_multisample,
-            require_existing_profiles=False,
-        ):
+            self._log(f"Run ALL assigned shared analysis_id for multisample queue: {analysis_id}")
+        if not self._validate_multisample_profile_compatibility(analysis_mode, analysis_id, qa_multisample=qa_multisample, qc_multisample=qc_multisample, require_existing_profiles=False):
             return
         requested_any_scope = any([qa_subject, qa_group, qa_multisample, qc_group, qc_multisample])
-
         args = (
-            dataset_paths,
-            str(self.default_settings_path),
-            str(INTERNAL_PATH),
-            "all",
-            calc_jobs,
-            plot_jobs,
-            derivatives_dir,
-            dataset_njobs,
-            dataset_subs,
-            self.global_config_path,
-            dataset_cfg_overrides,
-            analysis_mode,
-            analysis_id,
-            cfg_policy,
-            sub_policy,
-            False,  # interactive_prompts disabled to prevent worker stdin blocking
-            False,  # keep_temp_on_error (GUI keeps default: clean temp on errors)
-            qa_subject,
-            qa_group,
-            qa_multisample,
-            qc_group,
-            qc_multisample,
-            False,  # qa_all
-            False,  # qc_all
-            not requested_any_scope,  # all_modes fallback when no scopes are selected
+            dataset_paths, str(self.default_settings_path), str(INTERNAL_PATH),
+            "all", calc_jobs, plot_jobs, derivatives_dir, dataset_njobs, dataset_subs,
+            self.global_config_path, dataset_cfg_overrides,
+            analysis_mode, analysis_id, cfg_policy, sub_policy, False, False,
+            qa_subject, qa_group, qa_multisample, qc_group, qc_multisample,
+            False, False, not requested_any_scope,
         )
         worker = Worker(run_all_dispatch, *args)
         self._set_active_run_task("all")
 
         def on_started():
             self._start_task_timer("all")
-            self._log(
-                f"Run ALL started for {len(dataset_paths)} dataset(s) "
-                f"(analysis={analysis_mode}:{analysis_id or 'legacy'})."
-            )
+            self._log(f"Run ALL started for {len(dataset_paths)} dataset(s) (analysis={analysis_mode}:{analysis_id or 'legacy'}).")
 
         def on_finished():
             elapsed = self._stop_task_timer("all")
@@ -3178,6 +2974,7 @@ class MainWindow(QMainWindow):
         self.workers["all"] = worker
         try:
             worker.start()
+            self._wire_worker_output(worker)
         except Exception as exc:
             self._stop_task_timer("all")
             self._log(f"Run ALL error: {exc}")
@@ -3193,6 +2990,74 @@ class MainWindow(QMainWindow):
             self.workers.pop("all", None)
             self._reset_run_controls_if_idle()
 
+    # ──────────────────────────────── #
+    # QC Viewer launcher               #
+    # ──────────────────────────────── #
+    def _open_qc_viewer(self):
+        """Open the integrated QC Viewer window."""
+        try:
+            from .qc_viewer import QCViewerWindow
+            initial_dir = self.derivatives_dir.text() if self.derivatives_dir.text() else None
+            self._qc_viewer_window = QCViewerWindow(
+                parent=None,
+                initial_dir=initial_dir,
+            )
+            self._qc_viewer_window.show()
+        except Exception as e:
+            QMessageBox.warning(
+                self,
+                "QC Viewer",
+                f"Failed to open the QC Viewer:\n{e}",
+            )
+
+    # ──────────────────────────────── #
+    # Live Output terminal             #
+    # ──────────────────────────────── #
+    def _open_live_terminal(self) -> None:
+        """Show (or bring to front) the floating Live Output terminal window.
+
+        The window accumulates all stdout/stderr emitted by active worker
+        processes in real time. Existing workers are automatically wired up
+        when the window opens; new workers are wired in each ``start_*`` method
+        via ``_wire_worker_output``.
+        """
+        dialog = LiveTerminalDialog.get_instance(parent=None)
+        # Wire any already-running workers that were started before the window
+        # was opened (signal connections are de-duplicated by Qt).
+        for name, w in self.workers.items():
+            try:
+                w.output_ready.connect(dialog.append_text, Qt.ConnectionType.UniqueConnection)
+            except TypeError:
+                pass  # already connected
+        dialog.show()
+        dialog.raise_()
+        dialog.activateWindow()
+
+    def _wire_worker_output(self, worker: Worker) -> None:
+        """Connect a new worker's output_ready signal to the Live Output dialog.
+
+        If the dialog is not open, the signal simply has no receiver and the
+        output is silently discarded — no error.
+        """
+        term = LiveTerminalDialog._instance
+        if term is not None and term.isVisible():
+            try:
+                worker.output_ready.connect(term.append_text, Qt.ConnectionType.UniqueConnection)
+            except TypeError:
+                pass
+
+    # ──────────────────────────────── #
+    # ──────────────────────────────── #
+    # Open CLI terminal                #
+    # ──────────────────────────────── #
+    def _open_cli_terminal(self) -> None:
+        """Open a system terminal pre-configured with the MEGqc Python env.
+
+        Delegates to ``output_monitoring.open_cli_terminal`` which handles
+        macOS (Terminal.app), Windows (cmd.exe) and Linux (gnome-terminal /
+        konsole / xfce4-terminal / xterm).
+        """
+        open_cli_terminal(log_callback=self._log)
 
     # ──────────────────────────────── #
     # generic worker wrapper           #
@@ -3211,11 +3076,15 @@ class MainWindow(QMainWindow):
 
 
 def run_megqc_gui():
-    app = QApplication(sys.argv)
-    app.setStyle('Fusion')
-    win = MainWindow()
-    win.show()
+    """Entry point called by the ``megqc`` console script."""
+    from PyQt6.QtWidgets import QApplication
+    app = QApplication.instance() or QApplication(sys.argv)
+    # Fusion style is mandatory: it is the only Qt built-in style that fully
+    # respects custom QPalette colours on macOS and Windows.  Without it,
+    # the platform-native renderer ignores palette overrides and the themed
+    # colours / button shapes look completely wrong.
+    app.setStyle("Fusion")
+    window = MainWindow()
+    window.show()
     sys.exit(app.exec())
 
-if __name__ == '__main__':
-    run_megqc_gui()

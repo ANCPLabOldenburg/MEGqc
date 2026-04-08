@@ -3,3 +3,4 @@ include meg_qc/settings/settings_internal.ini
 include requirements.txt
 include README.md
 include LICENSE
+recursive-include meg_qc/miscellaneous/GUI/assets *
