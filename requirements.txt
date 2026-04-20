@@ -1,13 +1,13 @@
-ancpbids==0.3.0
-prompt_toolkit==3.0.48
-mne~=1.6.0
-pandas>=2.0.3
-plotly==5.24.1
-joblib==1.4.2
-pyqt6
-pyqt6-plugins==6.4.2.2.3; platform_system != "Darwin"
-pyqtgraph>=0.13.3
-PyQt6-WebEngine>=6.6.0
-numba==0.58.1
-psutil==5.9.8
-matplotlib==3.8.4
+# ── MEGqc dev requirements ─────────────────────────────────────────
+# All dependency versions are defined in pyproject.toml (single source
+# of truth).  This file just points there so `pip install -r
+# requirements.txt` still works for convenience.
+#
+# Install variants:
+#   pip install .            → core only (headless / HPC)
+#   pip install .[gui]       → core + desktop GUI
+#   pip install .[accel]     → core + numba acceleration
+#   pip install .[all]       → everything
+#   pip install -e .[all]    → editable dev install (recommended)
+# ───────────────────────────────────────────────────────────────────
+-e .[all]

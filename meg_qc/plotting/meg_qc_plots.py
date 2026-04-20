@@ -483,7 +483,6 @@ METRIC_ORDER = [
 METRIC_LABELS = {
     "STDs": "STD",
     "PtPsManual": "PtP (manual)",
-    "PtPsAuto": "PtP (auto)",
     "PSDs": "PSD",
     "ECGs": "ECG",
     "EOGs": "EOG",
@@ -1431,7 +1430,6 @@ def _build_subject_summary_section(
         "EOG",
         "STD",
         "PTP_MANUAL",
-        "PTP_AUTO",
         "MUSCLE",
         "HEAD",
         "STIMULUS",
@@ -1439,7 +1437,6 @@ def _build_subject_summary_section(
     ]
     metric_labels = {
         "PTP_MANUAL": "PtP (manual)",
-        "PTP_AUTO": "PtP (auto)",
     }
 
     for metric in metric_order:
@@ -1846,7 +1843,7 @@ def _render_detailed_metric_rows(data: Any, *, parent_metric: str) -> List[str]:
             if key in {"mag", "grad", "eeg"}:
                 rows.extend(_render_mag_grad_rows(key, value))
                 continue
-            if key == "details" and parent_metric in {"STD", "PTP_MANUAL", "PTP_AUTO"}:
+            if key == "details" and parent_metric in {"STD", "PTP_MANUAL"}:
                 rows.append(
                     "<tr><td style='border:1px solid #ccc; padding:6px;'><strong>noisy_ch</strong></td>"
                     f"<td style='border:1px solid #ccc; padding:6px;'>{_extract_channel_names_for_table(value.get('noisy_ch', {}))}</td></tr>"
@@ -2564,7 +2561,6 @@ def _build_metric_derivatives(
             'STD': '',
             'PSD': '',
             'PTP_MANUAL': '',
-            'PTP_AUTO': '',
             'ECG': '',
             'EOG': '',
             'HEAD': '',

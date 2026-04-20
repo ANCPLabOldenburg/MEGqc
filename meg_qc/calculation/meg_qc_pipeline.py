@@ -1,5 +1,6 @@
 import os
 import gc
+import io
 import re
 import ancpbids
 from ancpbids.query import query_entities
@@ -13,7 +14,66 @@ import glob
 import hashlib
 from typing import List, Union
 from joblib import Parallel, delayed
-import time
+
+# ---------------------------------------------------------------------------
+# ancpbids bugfix: guard against empty / null JSON sidecar files
+# ---------------------------------------------------------------------------
+# Some BIDS datasets ship empty JSON files (0 bytes) or files containing
+# a bare JSON ``null``.  ``json.load()`` returns ``None`` for both cases.
+# ancpbids' ``_map_object`` then crashes on ``None.keys()``.
+# This only manifests on Windows (case-insensitive FS matches files that
+# Linux/macOS would skip due to case mismatch).  We monkey-patch the two
+# affected methods so the fix lives inside MEGqc — no ancpbids edit needed.
+try:
+    from ancpbids.plugins.plugin_dsloader import DatasetPopulationPlugin as _DSP
+
+    _orig_contents_loader = _DSP._contents_loader
+    _orig_map_object = _DSP._map_object
+
+    def _safe_contents_loader(self, json_file, original_file, model_type):
+        json_object = original_file.load_contents()
+        if json_object is None:
+            return json_object
+        self._map_object(model_type, json_object, json_file)
+        return json_object
+
+    def _safe_map_object(self, model_type, json_object, target=None):
+        if target is None:
+            target = model_type()
+        if json_object is None:
+            return target
+        return _orig_map_object(self, model_type, json_object, target)
+
+    _DSP._contents_loader = _safe_contents_loader
+    _DSP._map_object = _safe_map_object
+except Exception:
+    pass  # Never crash MEGqc over a defensive patch
+
+# ---------------------------------------------------------------------------
+# Windows console encoding fix
+# ---------------------------------------------------------------------------
+# Windows consoles default to a narrow encoding (cp1252, etc.) that cannot
+# represent many Unicode characters used in MEGqc messages.  Setting
+# PYTHONIOENCODING propagates the choice to every joblib worker process that
+# is spawned from this module.
+if sys.platform == "win32":
+    os.environ.setdefault("PYTHONIOENCODING", "utf-8")
+    for _stream_name in ("stdout", "stderr"):
+        _stream = getattr(sys, _stream_name, None)
+        if _stream is not None and hasattr(_stream, "buffer"):
+            try:
+                setattr(
+                    sys,
+                    _stream_name,
+                    io.TextIOWrapper(
+                        _stream.buffer,
+                        encoding="utf-8",
+                        errors="replace",
+                        line_buffering=True,
+                    ),
+                )
+            except Exception:
+                pass
 import datetime as dt
 import importlib.metadata
 
@@ -44,8 +104,14 @@ from meg_qc.plotting.universal_plots import QC_derivative
 from meg_qc.calculation.metrics.STD_meg_qc import STD_meg_qc
 from meg_qc.calculation.metrics.PSD_meg_qc import PSD_meg_qc
 from meg_qc.calculation.metrics.Peaks_manual_meg_qc import PP_manual_meg_qc
-from meg_qc.calculation.metrics.Peaks_manual_meg_qc_numba import PP_manual_meg_qc_numba
-from meg_qc.calculation.metrics.Peaks_auto_meg_qc import PP_auto_meg_qc
+try:
+    from meg_qc.calculation.metrics.Peaks_manual_meg_qc_numba import PP_manual_meg_qc_numba
+    HAS_NUMBA = True
+except ImportError:
+    PP_manual_meg_qc_numba = None  # type: ignore[assignment,misc]
+    HAS_NUMBA = False
+# PTP auto (MNE's annotate_amplitude) has been removed from the pipeline —
+# the manual PTP implementation is more reliable and better integrated.
 from meg_qc.calculation.metrics.ECG_EOG_meg_qc import ECG_meg_qc, EOG_meg_qc
 from meg_qc.calculation.metrics.Head_meg_qc import HEAD_movement_meg_qc
 from meg_qc.calculation.metrics.muscle_meg_qc import MUSCLE_meg_qc
@@ -1181,7 +1247,7 @@ def process_one_subject(
         # Preassign strings with notes for the user (just as in your code)
         shielding_str, m_or_g_skipped_str, epoching_str = '', '', ''
         ecg_str, eog_str, head_str, muscle_str = '', '', '', ''
-        pp_manual_str, pp_auto_str, std_str, psd_str = '', '', '', ''
+        pp_manual_str, std_str, psd_str = '', '', ''
 
         print('___MEGqc___: ', 'Starting initial processing...')
         start_time = time.time()
@@ -1220,11 +1286,11 @@ def process_one_subject(
         # PREDEFINE VARIABLES FOR QC
         noisy_freqs_global = None
         std_derivs, psd_derivs = [], []
-        pp_manual_derivs, pp_auto_derivs = [], []
+        pp_manual_derivs = []
         ecg_derivs, eog_derivs = [], []
         head_derivs, muscle_derivs = [], []
         simple_metrics_psd, simple_metrics_std = [], []
-        simple_metrics_pp_manual, simple_metrics_pp_auto = [], []
+        simple_metrics_pp_manual = []
         simple_metrics_ecg, simple_metrics_eog = [], []
         simple_metrics_head, simple_metrics_muscle = [], []
 
@@ -1279,16 +1345,18 @@ def process_one_subject(
                   "Finished PSD. --- Execution %s seconds ---"
                   % (time.time() - start_time))
 
-        # 3) Peak‑to‑Peak manual
+        # 3) Peak-to-Peak manual
         if all_qc_params['default']['run_PTP_manual'] is True:
             start_time = time.time()
 
             # choose the implementation ----------------------------------
-            if all_qc_params['PTP_manual']['numba_version'] is True:
-                print('___MEGqc___: ', 'Starting Peak‑to‑Peak manual (Numba)...')
+            if all_qc_params['PTP_manual']['numba_version'] is True and HAS_NUMBA:
+                print('___MEGqc___: ', 'Starting Peak-to-Peak manual (Numba)...')
                 func = PP_manual_meg_qc_numba  #  accelerated version
             else:
-                print('___MEGqc___: ', 'Starting Peak‑to‑Peak manual...')
+                if all_qc_params['PTP_manual']['numba_version'] is True and not HAS_NUMBA:
+                    print('___MEGqc___: ', 'Numba not installed – falling back to standard PtP.')
+                print('___MEGqc___: ', 'Starting Peak-to-Peak manual...')
                 func = PP_manual_meg_qc  # standard version
             # -------------------------------------------------------------
 
@@ -1309,31 +1377,10 @@ def process_one_subject(
                 pp_manual_str = f"⚠ PTP manual metric failed: {_err['error_type']}: {_err['error_message']}"
 
             print('___MEGqc___: ',
-                  "Finished Peak‑to‑Peak manual. --- Execution %s seconds ---"
+                  "Finished Peak-to-Peak manual. --- Execution %s seconds ---"
                   % (time.time() - start_time))
 
-        # 4) Peak-to-Peak auto from MNE
-        if all_qc_params['default']['run_PTP_auto_mne'] is True:
-            print('___MEGqc___: ', 'Starting Peak-to-Peak auto...')
-            start_time = time.time()
-            pp_auto_derivs, bad_channels, pp_auto_str, _err = _run_metric_safe(
-                'PTP_auto',
-                PP_auto_meg_qc,
-                all_qc_params['PTP_auto'],
-                channels,
-                raw_cropped_filtered_resampled,
-                m_or_g_chosen,
-                n_outputs=3,
-                empty_outputs=[[], [], '⚠ PTP auto metric failed — see excluded_subjects_errors.json for details.'],
-            )
-            if _err:
-                metric_errors.append(_err)
-                pp_auto_str = f"⚠ PTP auto metric failed: {_err['error_type']}: {_err['error_message']}"
-            print('___MEGqc___: ',
-                  "Finished Peak-to-Peak auto. --- Execution %s seconds ---"
-                  % (time.time() - start_time))
-
-        # 5) ECG
+        # 4) ECG
         if all_qc_params['default']['run_ECG'] is True:
             print('___MEGqc___: ', 'Starting ECG...')
             start_time = time.time()
@@ -1359,7 +1406,7 @@ def process_one_subject(
                   % (time.time() - start_time))
 
 
-        # 6) EOG
+        # 5) EOG
         if all_qc_params['default']['run_EOG'] is True:
             print('___MEGqc___: ', 'Starting EOG...')
             start_time = time.time()
@@ -1385,7 +1432,7 @@ def process_one_subject(
                   % (time.time() - start_time))
 
 
-        # 7) Head movement artifacts
+        # 6) Head movement artifacts
         if all_qc_params['default']['run_Head'] is True and meg_system != 'EEG':
             print('___MEGqc___: ', 'Starting Head movement calculation...')
             start_time = time.time()
@@ -1406,7 +1453,7 @@ def process_one_subject(
             head_str = 'Head motion metric is not available for EEG data (requires MEG cHPI coils).'
             print(f'___MEGqc___: {head_str}')
 
-        # 8) Muscle artifacts
+        # 7) Muscle artifacts
         if all_qc_params['default']['run_Muscle'] is True:
             print('___MEGqc___: ', 'Starting Muscle artifacts calculation...')
             start_time = time.time()
@@ -1450,7 +1497,6 @@ def process_one_subject(
             'STD': std_str,
             'PSD': psd_str,
             'PTP_MANUAL': pp_manual_str,
-            'PTP_AUTO': pp_auto_str,
             'ECG': ecg_str,
             'EOG': eog_str,
             'HEAD': head_str,
@@ -1483,7 +1529,6 @@ def process_one_subject(
             'Standard deviation of the data': std_derivs,
             'Frequency spectrum': psd_derivs,
             'Peak-to-Peak manual': pp_manual_derivs,
-            'Peak-to-Peak auto from MNE': pp_auto_derivs,
             'ECG': ecg_derivs,
             'EOG': eog_derivs,
             'Head movement artifacts': head_derivs,
@@ -1494,7 +1539,6 @@ def process_one_subject(
             'STD': simple_metrics_std,
             'PSD': simple_metrics_psd,
             'PTP_MANUAL': simple_metrics_pp_manual,
-            'PTP_AUTO': simple_metrics_pp_auto,
             'ECG': simple_metrics_ecg,
             'EOG': simple_metrics_eog,
             'HEAD': simple_metrics_head,
@@ -1678,11 +1722,23 @@ def process_one_subject_safe(
             "traceback": tb_str,
             "timestamp": dt.datetime.utcnow().isoformat(timespec="seconds") + "Z",
         }
-        print(
-            f"___MEGqc___: Error processing subject {sub}:\n"
-            f"  {type(e).__name__}: {e}\n"
-            f"{tb_str}"
-        )
+        try:
+            msg = (
+                f"___MEGqc___: Error processing subject {sub}:\n"
+                f"  {type(e).__name__}: {e}\n"
+                f"{tb_str}"
+            )
+            # Guard against narrow terminal encodings (e.g. cp1252 on Windows)
+            # by replacing any un-encodable character rather than crashing.
+            enc = getattr(sys.stdout, 'encoding', 'utf-8') or 'utf-8'
+            print(msg.encode(enc, errors='replace').decode(enc))
+        except Exception:
+            # Last-resort fallback: strip all non-ASCII characters
+            print(
+                f"___MEGqc___: Error processing subject {sub} "
+                f"(message contained un-encodable characters): "
+                f"{type(e).__name__}"
+            )
         return sub, None, error_info
 
 

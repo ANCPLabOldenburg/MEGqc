@@ -31,13 +31,74 @@ from PyQt6.QtCore import Qt, QUrl, pyqtSignal, QThread, QTimer
 
 from .timeseries_widget import TimeSeriesWidget, _LoadWorker, _LoadingOverlay
 
-# Try importing WebEngine; fallback to system browser
+# Try to import WebEngine; fall back gracefully if not installed.
+# megqcGUI.py also imports this at module level (before QApplication) which
+# is required on macOS for Chromium to initialise correctly.
 try:
     from PyQt6.QtWebEngineWidgets import QWebEngineView
     from PyQt6.QtWebEngineCore import QWebEngineSettings
     HAS_WEBENGINE = True
-except ImportError:
+except Exception as _webengine_exc:
+    import sys as _sys
+    print(f"[MEGqc] WebEngine unavailable: {_webengine_exc}", file=_sys.stderr)
+    QWebEngineView = None  # type: ignore[assignment,misc]
+    QWebEngineSettings = None  # type: ignore[assignment,misc]
     HAS_WEBENGINE = False
+
+
+# ── Localhost HTTP server for large Plotly reports ────────────────────────
+# Chromium in PyQt6 imposes strict CSP restrictions on file:// URLs that can
+# prevent large Plotly reports from rendering.  Serving over http://127.0.0.1
+# bypasses all those restrictions (same approach used by Jupyter & Electron).
+_LARGE_FILE_THRESHOLD = 5 * 1024 * 1024  # 5 MB
+
+
+class _LocalHTTPServer:
+    """Background HTTP server for large local HTML files."""
+    _instance = None
+    _thread = None
+
+    @classmethod
+    def serve(cls, filepath: str) -> str:
+        """Return an ``http://127.0.0.1:<port>/filename`` URL."""
+        import threading
+        from http.server import HTTPServer, SimpleHTTPRequestHandler
+
+        p = Path(filepath).resolve()
+        directory = str(p.parent)
+        filename = p.name
+
+        # Shut down any previous server instance
+        if cls._instance is not None:
+            try:
+                cls._instance.shutdown()
+            except Exception:
+                pass
+            cls._instance = None
+
+        handler = lambda *args, **kw: SimpleHTTPRequestHandler(
+            *args, directory=directory, **kw
+        )
+        server = HTTPServer(("127.0.0.1", 0), handler)
+        port = server.server_address[1]
+
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        cls._instance = server
+        cls._thread = thread
+
+        return f"http://127.0.0.1:{port}/{filename}"
+
+    @classmethod
+    def shutdown(cls):
+        """Shut down the background server if running."""
+        if cls._instance is not None:
+            try:
+                cls._instance.shutdown()
+            except Exception:
+                pass
+            cls._instance = None
+            cls._thread = None
 
 
 # MEG file extensions recognised by MNE
@@ -80,24 +141,21 @@ class ContentPanel(QWidget):
         wlay.addStretch(1)
         self._stack.addWidget(welcome)  # index 0
 
-        # Page 1: HTML viewer
-        if HAS_WEBENGINE:
-            self._web_view = QWebEngineView()
-            settings = self._web_view.settings()
-            settings.setAttribute(QWebEngineSettings.WebAttribute.LocalContentCanAccessFileUrls, True)
-            settings.setAttribute(QWebEngineSettings.WebAttribute.LocalContentCanAccessRemoteUrls, True)
-            settings.setAttribute(QWebEngineSettings.WebAttribute.JavascriptEnabled, True)
-            settings.setAttribute(QWebEngineSettings.WebAttribute.PluginsEnabled, True)
-            self._web_view.loadFinished.connect(self._on_html_load_finished)
-            page = self._web_view.page()
-            if hasattr(page, "renderProcessTerminated"):
-                page.renderProcessTerminated.connect(self._on_render_crash)
-            self._stack.addWidget(self._web_view)  # index 1
-        else:
-            fallback = QLabel("PyQt6-WebEngine not installed.\nHTML files will be opened in system browser.")
+        # Page 1: HTML viewer container
+        # Following the BIDS-Manager pattern we create a *fresh*
+        # QWebEngineView for every HTML file and destroy the previous one.
+        self._html_container = QWidget()
+        self._html_container_layout = QVBoxLayout(self._html_container)
+        self._html_container_layout.setContentsMargins(0, 0, 0, 0)
+        self._web_view = None  # created on demand
+        if not HAS_WEBENGINE:
+            fallback = QLabel(
+                "PyQt6-WebEngine not installed.\n"
+                "HTML files will be opened in the system browser."
+            )
             fallback.setAlignment(Qt.AlignmentFlag.AlignCenter)
-            self._web_view = None
-            self._stack.addWidget(fallback)  # index 1
+            self._html_container_layout.addWidget(fallback)
+        self._stack.addWidget(self._html_container)  # index 1
 
         # Page 2: Metadata viewer
         self._meta_page = QWidget()
@@ -169,65 +227,80 @@ class ContentPanel(QWidget):
             self._load_text(filepath)
 
     def _release_previous_data(self):
-        """Free MEG raw data from memory when switching to a different file."""
+        """Free MEG raw data and web views when switching to a different file."""
         if self._current_raw is not None:
             del self._current_raw
             self._current_raw = None
         if hasattr(self._ts_widget, '_raw') and self._ts_widget._raw is not None:
             self._ts_widget.unload_data()
+        self._destroy_web_view()
 
     # ------------------------------------------------------------------ #
     # Specific loaders                                                   #
     # ------------------------------------------------------------------ #
     def _load_html(self, filepath: str):
-        if self._web_view is not None:
-            try:
-                resolved = Path(filepath).resolve()
-                url = QUrl.fromLocalFile(str(resolved))
-                self._stack.setCurrentIndex(1)
-                QApplication.processEvents()
-                self._html_load_path = str(resolved)
-                self._web_view.load(url)
-                self.statusMessage.emit(f"Loading HTML: {Path(filepath).name}...")
-            except Exception:
-                self._load_html_via_content(filepath)
-        else:
-            import webbrowser
-            webbrowser.open(filepath)
-            self.statusMessage.emit(f"Opened in system browser: {Path(filepath).name}")
+        """Display an HTML file.
 
-    def _load_html_via_content(self, filepath: str):
-        try:
-            resolved = Path(filepath).resolve()
-            with open(resolved, encoding="utf-8", errors="replace") as f:
-                html_content = f.read()
-            base_url = QUrl.fromLocalFile(str(resolved.parent) + "/")
-            self._web_view.setHtml(html_content, base_url)
-            self.statusMessage.emit(f"Loading HTML (content mode): {Path(filepath).name}...")
-        except Exception:
+        When PyQt6-WebEngine is available a fresh QWebEngineView is created
+        for every file (BIDS-Manager pattern) giving full JavaScript /
+        Plotly rendering.  When WebEngine is NOT available the file is
+        opened in the system default browser.
+        """
+        if not HAS_WEBENGINE:
             import webbrowser
             webbrowser.open(str(Path(filepath).resolve()))
-            self.statusMessage.emit(f"Opened in browser: {Path(filepath).name}")
+            self.statusMessage.emit(
+                f"Opened in browser: {Path(filepath).name} "
+                "(install PyQt6-WebEngine for in-app rendering)"
+            )
+            return
 
-    def _on_render_crash(self, termination_status, exit_code):
-        self.statusMessage.emit(f"WebEngine crashed (status={termination_status}). Trying system browser...")
-        if self._current_file:
-            import webbrowser
-            webbrowser.open(str(Path(self._current_file).resolve()))
+        # Destroy the previous web view (BIDS-Manager fresh-view pattern)
+        self._destroy_web_view()
 
-    def _on_html_load_finished(self, ok: bool):
-        if ok:
-            name = Path(self._current_file).name if self._current_file else "report"
-            self.statusMessage.emit(f"HTML loaded: {name}")
+        view = QWebEngineView()
+
+        # Enable local file access — PyQt6's Chromium disables these by
+        # default, unlike PyQt5 where they were enabled.
+        if QWebEngineSettings is not None:
+            settings = view.settings()
+            settings.setAttribute(
+                QWebEngineSettings.WebAttribute.LocalContentCanAccessFileUrls, True)
+            settings.setAttribute(
+                QWebEngineSettings.WebAttribute.LocalContentCanAccessRemoteUrls, True)
+            settings.setAttribute(
+                QWebEngineSettings.WebAttribute.JavascriptEnabled, True)
+
+        # For large files, serve via localhost to bypass Chromium's file:// CSP
+        resolved = str(Path(filepath).resolve())
+        try:
+            file_size = Path(filepath).stat().st_size
+        except OSError:
+            file_size = 0
+
+        if file_size > _LARGE_FILE_THRESHOLD:
+            url = QUrl(_LocalHTTPServer.serve(resolved))
         else:
-            if self._current_file and hasattr(self, "_html_load_path"):
-                self.statusMessage.emit("URL load failed, trying content fallback...")
-                self._load_html_via_content(self._current_file)
-            else:
-                self.statusMessage.emit("HTML loading failed. Trying system browser...")
-                if self._current_file:
-                    import webbrowser
-                    webbrowser.open(str(Path(self._current_file).resolve()))
+            url = QUrl.fromLocalFile(resolved)
+
+        view.setUrl(url)
+        self._web_view = view
+        self._html_container_layout.addWidget(view)
+
+        self._stack.setCurrentIndex(1)
+        self.statusMessage.emit(f"Loading HTML: {Path(filepath).name}")
+
+    def _destroy_web_view(self):
+        """Remove and schedule deletion of the current QWebEngineView.
+
+        Mirrors the BIDS-Manager ``clear()`` pattern: the widget is removed
+        from the layout and ``deleteLater()`` is called so Qt cleans it up
+        safely in the next event-loop cycle.
+        """
+        if self._web_view is not None:
+            self._html_container_layout.removeWidget(self._web_view)
+            self._web_view.deleteLater()
+            self._web_view = None
 
     def _load_meg_metadata(self, filepath: str):
         """Load MEG file metadata on the main thread (deferred).
@@ -499,6 +572,8 @@ class ContentPanel(QWidget):
 
     def cleanup(self):
         self._release_previous_data()
+        self._destroy_web_view()
+        _LocalHTTPServer.shutdown()
 
     def refresh_theme(self):
         self._ts_widget.refresh_theme()

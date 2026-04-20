@@ -2520,6 +2520,10 @@ def _plot_summary_distribution_recordings(
             + "<br>channel_type=" + data.get("channel_type", "n/a").astype(str)
         ).to_numpy()
     subject_codes = pd.Categorical(data.get("subject", pd.Series(["n/a"] * len(data))).astype(str)).codes.astype(float)
+    _sc_min = float(subject_codes.min()) if subject_codes.size > 0 else 0.0
+    _sc_max = float(subject_codes.max()) if subject_codes.size > 0 else 1.0
+    if _sc_min == _sc_max:
+        _sc_max = _sc_min + 1.0  # prevent degenerate colorscale (cmin==cmax → NaN in WebGL)
     fig = go.Figure()
     fig.add_trace(
         go.Violin(
@@ -2561,6 +2565,8 @@ def _plot_summary_distribution_recordings(
                 "size": 8.0,
                 "color": subject_codes,
                 "colorscale": "Turbo",
+                "cmin": _sc_min,
+                "cmax": _sc_max,
                 "opacity": 0.76,
                 "line": {"width": 0.35, "color": "rgba(20,20,20,0.5)"},
                 "showscale": False,
@@ -6958,12 +6964,14 @@ def _build_report_html(
       function applySummaryDisplacement(plotEl, level) {{
         const shift = Number(summaryDispMap[level] ?? 0.0);
         if (!plotEl.__summaryBaseX) plotEl.__summaryBaseX = {{}};
+        if (!plotEl.__summaryEverDisplaced) plotEl.__summaryEverDisplaced = false;
         const idxs = _summaryScatterIdx(plotEl);
         const xUpdate = [];
         const traceIdx = [];
         idxs.forEach((i) => {{
           if (!plotEl.__summaryBaseX.hasOwnProperty(i)) {{
-            const base = Array.isArray(plotEl.data[i].x) ? plotEl.data[i].x.slice() : [];
+            const rawX = plotEl.data[i] && plotEl.data[i].x;
+            const base = (rawX != null) ? Array.from(rawX) : [];
             plotEl.__summaryBaseX[i] = base;
           }}
           const base = plotEl.__summaryBaseX[i] || [];
@@ -6971,6 +6979,8 @@ def _build_report_html(
           traceIdx.push(i);
         }});
         if (traceIdx.length === 0) return;
+        if (shift === 0.0 && !plotEl.__summaryEverDisplaced) return;
+        plotEl.__summaryEverDisplaced = true;
         try {{
           Plotly.restyle(plotEl, {{'x': xUpdate}}, traceIdx);
         }} catch (err) {{}}

@@ -11,11 +11,40 @@ from __future__ import annotations
 
 import argparse
 import importlib
+import io
 import json
 import os
 import sys
 import traceback
 from typing import Any, List
+
+
+def _configure_utf8_stdio() -> None:
+    """Reconfigure stdout/stderr to use UTF-8 on Windows.
+
+    Windows consoles default to a narrow encoding (e.g. cp1252) that cannot
+    represent many Unicode characters used in MEGqc messages (e.g. the
+    non-breaking hyphen U+2011, warning sign U+26A0, arrows …).  Setting the
+    environment variable *before* any subprocesses are spawned (joblib workers
+    included) ensures they all inherit UTF-8 I/O.
+    """
+    if sys.platform == "win32":
+        # Propagate to every child process spawned from here (joblib workers).
+        os.environ.setdefault("PYTHONIOENCODING", "utf-8")
+        # Reconfigure the streams of *this* process.
+        for stream_name in ("stdout", "stderr"):
+            stream = getattr(sys, stream_name, None)
+            if stream is not None and hasattr(stream, "buffer"):
+                try:
+                    new_stream = io.TextIOWrapper(
+                        stream.buffer,
+                        encoding="utf-8",
+                        errors="replace",
+                        line_buffering=True,
+                    )
+                    setattr(sys, stream_name, new_stream)
+                except Exception:
+                    pass  # Never crash the worker over I/O reconfiguration
 
 
 def _become_session_leader() -> None:
@@ -40,6 +69,7 @@ def _decode_args(payload: str) -> List[Any]:
 
 
 def main() -> int:
+    _configure_utf8_stdio()
     parser = argparse.ArgumentParser(description="MEGqc GUI worker entry point")
     parser.add_argument("--func", required=True, help="module:function path to invoke")
     parser.add_argument("--args", required=True, help="JSON-encoded positional arguments")

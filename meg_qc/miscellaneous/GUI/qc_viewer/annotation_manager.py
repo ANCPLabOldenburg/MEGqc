@@ -296,11 +296,6 @@ class AnnotationManager:
             self._extract_channel_flags(data, "PTP_MANUAL", sub_key,
                                         self.annotations.ptp_noisy_channels,
                                         self.annotations.ptp_flat_channels)
-        for sub_key in ("ptp_auto_all", "PtP_auto_all_time_series",
-                        "ptp_auto_all_time_series"):
-            self._extract_channel_flags(data, "PTP_AUTO", sub_key,
-                                        self.annotations.ptp_noisy_channels,
-                                        self.annotations.ptp_flat_channels)
         self._extract_psd_flags(data)
         self._extract_ecg_eog_from_json(data)
 

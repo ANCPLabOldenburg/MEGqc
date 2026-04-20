@@ -18,6 +18,203 @@ import configparser
 import hashlib
 import shutil
 import ssl
+import tempfile
+import ctypes
+
+
+# ── Linux xcb-cursor fix ─────────────────────────────────────────────────
+# Starting with Qt 6.5, the xcb platform plugin requires libxcb-cursor.so.0
+# which is NOT installed by default on many Linux distros (e.g. Ubuntu 22.04).
+# On Windows and macOS the Qt wheels bundle everything needed, but on Linux
+# this one library slips through.  The helpers below fetch it into the active
+# .venv (no root needed) so that end-users never have to run
+# ``sudo apt install``.
+
+_XCB_SENTINEL = "_MEGQC_XCB_CURSOR_FIXED"
+_XCB_SO_NAME = "libxcb-cursor.so.0"
+
+
+def _ensure_xcb_cursor() -> None:
+    """Make sure ``libxcb-cursor.so.0`` is loadable on Linux.
+
+    Only runs on Linux.  Strategy:
+      1. Try to load the lib from the default search path — return if OK.
+      2. If a cached copy already exists in ``<venv>/lib/megqc_xcb/``,
+         preload it globally via ``ctypes.CDLL(..., RTLD_GLOBAL)`` so Qt's
+         xcb plugin finds it.  No process restart needed.
+      3. If no cached copy exists, fetch the ``.deb`` with
+         ``apt-get download`` (no root), extract the ``.so``, store it in
+         the venv, then re-exec the process with ``LD_LIBRARY_PATH`` so
+         the dynamic linker picks it up on the fresh start.
+    A sentinel env-var prevents infinite re-exec loops.
+    """
+    if sys.platform != "linux":
+        return
+    if os.environ.get(_XCB_SENTINEL):
+        return  # already attempted — do not loop
+
+    # 1. Already installed system-wide? Nothing to do.
+    try:
+        ctypes.cdll.LoadLibrary(_XCB_SO_NAME)
+        return
+    except OSError:
+        pass
+
+    # Store inside the virtual-env so it lives/dies with the venv.
+    venv_lib_dir = os.path.join(sys.prefix, "lib", "megqc_xcb")
+    so_path = os.path.join(venv_lib_dir, _XCB_SO_NAME)
+
+    # 2. Cached from a previous run? Preload it into the process globally
+    #    so Qt's dlopen() finds it — no re-exec overhead.
+    if os.path.isfile(so_path):
+        try:
+            ctypes.CDLL(so_path, mode=ctypes.RTLD_GLOBAL)
+            print(
+                f"[MEGqc] Preloaded {_XCB_SO_NAME} from {so_path}",
+                file=sys.stderr,
+            )
+            return
+        except OSError:
+            # Corrupted or incompatible — delete and re-fetch below.
+            os.remove(so_path)
+
+    # 3. Not available anywhere — download into the venv.
+    print(
+        f"[MEGqc] {_XCB_SO_NAME} is not installed on this system.\n"
+        f"[MEGqc] Qt 6.5+ requires it for the xcb (X11) platform plugin.\n"
+        f"[MEGqc] Attempting automatic download into the active .venv …",
+        file=sys.stderr,
+    )
+
+    try:
+        _fetch_xcb_cursor_lib(venv_lib_dir)
+    except Exception as exc:
+        print(
+            f"[MEGqc] Auto-fetch failed: {exc}\n"
+            "[MEGqc] Please install the library manually:\n"
+            "[MEGqc]   sudo apt install libxcb-cursor0",
+            file=sys.stderr,
+        )
+        return
+    if not os.path.isfile(so_path):
+        return
+
+    print(
+        f"[MEGqc] Library cached at {so_path}\n"
+        f"[MEGqc] Restarting with LD_LIBRARY_PATH → {venv_lib_dir}",
+        file=sys.stderr,
+    )
+
+    # Re-exec so LD_LIBRARY_PATH takes effect for the dynamic linker.
+    env = os.environ.copy()
+    ld = env.get("LD_LIBRARY_PATH", "")
+    env["LD_LIBRARY_PATH"] = venv_lib_dir + (":" + ld if ld else "")
+    env[_XCB_SENTINEL] = "1"
+    os.execve(sys.executable, [sys.executable] + sys.argv, env)
+
+
+def _fetch_xcb_cursor_lib(dest_dir: str) -> None:
+    """Download ``libxcb-cursor0`` and extract the ``.so`` into *dest_dir*.
+
+    Uses ``apt-get download`` (works without root on Debian/Ubuntu) and
+    ``dpkg-deb -x`` to extract — both are always present on these systems.
+    """
+    os.makedirs(dest_dir, exist_ok=True)
+
+    with tempfile.TemporaryDirectory() as tmp:
+        print(
+            "[MEGqc] Running: apt-get download libxcb-cursor0  (no root required)",
+            file=sys.stderr,
+        )
+        subprocess.run(
+            ["apt-get", "download", "libxcb-cursor0"],
+            cwd=tmp, check=True,
+            stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
+        )
+
+        debs = [f for f in os.listdir(tmp) if f.endswith(".deb")]
+        if not debs:
+            raise RuntimeError("apt-get download did not produce a .deb file")
+
+        deb_path = os.path.join(tmp, debs[0])
+        print(
+            f"[MEGqc] Downloaded {debs[0]}",
+            file=sys.stderr,
+        )
+
+        extract_dir = os.path.join(tmp, "extracted")
+        print(
+            f"[MEGqc] Extracting {_XCB_SO_NAME} into {dest_dir}",
+            file=sys.stderr,
+        )
+        subprocess.run(
+            ["dpkg-deb", "-x", deb_path, extract_dir],
+            check=True,
+            stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
+        )
+
+        # Walk the extraction tree looking for the .so (resolve symlinks)
+        for root, _dirs, files in os.walk(extract_dir):
+            for fname in files:
+                if "libxcb-cursor" in fname:
+                    src = os.path.realpath(os.path.join(root, fname))
+                    if os.path.isfile(src):
+                        shutil.copy2(
+                            src,
+                            os.path.join(dest_dir, _XCB_SO_NAME),
+                        )
+                        return
+
+        raise RuntimeError(f"{_XCB_SO_NAME} not found inside the .deb")
+
+
+# ── Linux WebEngine GPU fix ───────────────────────────────────────────────
+# On some Linux systems (especially hybrid-GPU laptops like NVIDIA Optimus),
+# QtWebEngine's Chromium backend fails to composite via DMA-BUF / Vulkan,
+# resulting in blank WebEngine views and floods of
+#   "Failed to get native pixmap due to dma_buf acquisition failure"
+#   "Backend texture is not a Vulkan texture"
+#   "Compositor returned null texture"
+#
+# Two targeted flags fix this without killing *all* GPU acceleration:
+#   --in-process-gpu        keep GPU ops in the main process so DMA-BUF
+#                           buffer-sharing between processes is not needed.
+#   --disable-gpu-compositing   fall back to a software compositor while
+#                               GPU rasterisation stays active.
+#
+# Together they fix the blank-page bug while still letting Chromium use
+# the GPU for rasterisation (faster Plotly / heavy-SVG reports).
+# ``setdefault`` ensures a user-supplied value always takes precedence.
+if sys.platform == "linux":
+    os.environ.setdefault(
+        "QTWEBENGINE_CHROMIUM_FLAGS",
+        "--in-process-gpu --disable-gpu-compositing",
+    )
+
+# ── WebEngine early init ──────────────────────────────────────────────────
+# AA_ShareOpenGLContexts must be set *before* any WebEngine import or
+# QApplication creation.  On Qt6 the attribute may already be implicit but
+# setting it explicitly ensures Chromium's GPU process can share the GL
+# context (critical for macOS hardware-accelerated rendering of large HTML).
+from PyQt6.QtCore import QCoreApplication as _QCA, Qt as _Qt
+try:
+    _QCA.setAttribute(_Qt.ApplicationAttribute.AA_ShareOpenGLContexts)
+except Exception:
+    pass  # not fatal on Qt6 — context sharing is on by default
+
+# ── WebEngine import ──────────────────────────────────────────────────────
+# Importing here (before QApplication) is required on macOS for Chromium to
+# initialise correctly.  The broad except catches any crash on platforms
+# where the binary is missing or incompatible; in that case HTML files fall
+# back to the system browser.
+try:
+    from PyQt6.QtWebEngineWidgets import QWebEngineView
+    HAS_WEBENGINE = True
+except Exception as _webengine_exc:
+    import sys as _sys
+    print(f"[MEGqc] WebEngine unavailable: {_webengine_exc}", file=_sys.stderr)
+    QWebEngineView = None  # type: ignore[assignment,misc]
+    HAS_WEBENGINE = False
 from urllib.request import Request, urlopen
 from urllib.error import URLError, HTTPError
 from pathlib import Path
@@ -62,15 +259,9 @@ from meg_qc.test import (
 )
 from meg_qc.calculation.meg_qc_pipeline import list_analysis_profiles
 from meg_qc import __version__ as MEGQC_VERSION
-try:
-    from PyQt6.QtWebEngineWidgets import QWebEngineView
-    from PyQt6.QtWebEngineCore import QWebEngineSettings
-    HAS_WEBENGINE = True
-except ImportError:
-    HAS_WEBENGINE = False
 # Output monitoring: live terminal streaming + CLI launcher
 from .output_monitoring import LiveTerminalDialog, open_cli_terminal
-# Use Qt5 widget integration and not the OS integrations (This will prevent incompatibilities)
+# Use Qt built-in dialogs (consistent cross-platform behaviour)
 QCoreApplication.setAttribute(Qt.ApplicationAttribute.AA_DontUseNativeDialogs)
 
 # Locate bundled settings and logo files within the package
@@ -3077,6 +3268,7 @@ class MainWindow(QMainWindow):
 
 def run_megqc_gui():
     """Entry point called by the ``megqc`` console script."""
+    _ensure_xcb_cursor()  # no-op on non-Linux; auto-fixes missing libxcb-cursor0
     from PyQt6.QtWidgets import QApplication
     app = QApplication.instance() or QApplication(sys.argv)
     # Fusion style is mandatory: it is the only Qt built-in style that fully

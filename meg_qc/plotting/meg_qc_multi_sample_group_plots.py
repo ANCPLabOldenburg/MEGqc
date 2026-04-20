@@ -2042,12 +2042,14 @@ def _build_multi_sample_report_html(
       function applySummaryDisplacement(plotEl, level) {{
         const shift = Number(summaryDispMap[level] ?? 0.0);
         if (!plotEl.__summaryBaseX) plotEl.__summaryBaseX = {{}};
+        if (!plotEl.__summaryEverDisplaced) plotEl.__summaryEverDisplaced = false;
         const idxs = _summaryScatterIdx(plotEl);
         const xUpdate = [];
         const traceIdx = [];
         idxs.forEach((i) => {{
           if (!plotEl.__summaryBaseX.hasOwnProperty(i)) {{
-            const base = Array.isArray(plotEl.data[i].x) ? plotEl.data[i].x.slice() : [];
+            const rawX = plotEl.data[i] && plotEl.data[i].x;
+            const base = (rawX != null) ? Array.from(rawX) : [];
             plotEl.__summaryBaseX[i] = base;
           }}
           const base = plotEl.__summaryBaseX[i] || [];
@@ -2055,6 +2057,8 @@ def _build_multi_sample_report_html(
           traceIdx.push(i);
         }});
         if (traceIdx.length === 0) return;
+        if (shift === 0.0 && !plotEl.__summaryEverDisplaced) return;
+        plotEl.__summaryEverDisplaced = true;
         try {{
           Plotly.restyle(plotEl, {{'x': xUpdate}}, traceIdx);
         }} catch (err) {{}}

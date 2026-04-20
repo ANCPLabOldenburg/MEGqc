@@ -101,7 +101,6 @@ def make_metric_section(fig_derivs_metric: List, section_name: str, report_strin
         'STD': ['Standard deviation of the data', f"<p>{report_strings['STD']}</p>"],
         'PSD': ['Frequency spectrum', f"<p>{report_strings['PSD']}</p>"],
         'PTP_MANUAL': ['Peak-to-Peak manual', f"<p>{report_strings['PTP_MANUAL']}</p>"],
-        'PTP_AUTO': ['Peak-to-Peak auto from MNE', f"<p>{report_strings['PTP_AUTO']}</p>"],
         'SENSORS': ['Sensors locations', "<p></p>"],
         'STIMULUS': ['Stimulus channels', f"<p>{report_strings['STIMULUS']}</p>"]
     }

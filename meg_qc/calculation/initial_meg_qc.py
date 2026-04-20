@@ -60,7 +60,6 @@ def get_all_config_params(config_file_path: str):
     run_STD = default_section.getboolean('STD')
     run_PSD = default_section.getboolean('PSD')
     run_PTP_manual = default_section.getboolean('PTP_manual')
-    run_PTP_auto_mne = default_section.getboolean('PTP_auto_mne')
     run_ECG = default_section.getboolean('ECG')
     run_EOG = default_section.getboolean('EOG')
     run_Head = default_section.getboolean('Head')
@@ -83,7 +82,6 @@ def get_all_config_params(config_file_path: str):
             'run_STD': run_STD,
             'run_PSD': run_PSD,
             'run_PTP_manual': run_PTP_manual,
-            'run_PTP_auto_mne': run_PTP_auto_mne,
             'run_ECG': run_ECG,
             'run_EOG': run_EOG,
             'run_Head': run_Head,
@@ -188,16 +186,6 @@ def get_all_config_params(config_file_path: str):
             'noisy_channel_multiplier': ptp_manual_section.getfloat('noisy_channel_multiplier'),
             'flat_multiplier': ptp_manual_section.getfloat('flat_multiplier')})
 
-        ptp_mne_section = config['PTP_auto']
-        all_qc_params['PTP_auto'] = dict({
-            'peak_m': ptp_mne_section.getfloat('peak_m'),
-            'flat_m': ptp_mne_section.getfloat('flat_m'),
-            'peak_g': ptp_mne_section.getfloat('peak_g'),
-            'flat_g': ptp_mne_section.getfloat('flat_g'),
-            'peak_eeg': ptp_mne_section.getfloat('peak_eeg', fallback=200e-6),
-            'flat_eeg': ptp_mne_section.getfloat('flat_eeg', fallback=1e-6),
-            'bad_percent': ptp_mne_section.getint('bad_percent'),
-            'min_duration': ptp_mne_section.getfloat('min_duration')})
 
         ecg_section = config['ECG']
         ecg_fixed_ch = ecg_section.get('fixed_channel_names', '')

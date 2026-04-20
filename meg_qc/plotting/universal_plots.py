@@ -2007,8 +2007,10 @@ def plot_3d_topomap_std_ptp_csv(sensors_csv_path: str, ch_type: str, what_data: 
             color=mean_metric_values,  # Use the mean metric values for the color scale
             colorscale='Turbo',
             colorbar=dict(
-                title=f'{metric}, {unit}',
-                titleside='right',
+                title=dict(
+                    text=f'{metric}, {unit}',
+                    side='right'
+                ),
                 tickmode='array',
                 tickvals=[np.min(mean_metric_values), np.max(mean_metric_values)],
                 ticktext=[f'{np.min(mean_metric_values):.2e}', f'{np.max(mean_metric_values):.2e}'],
@@ -2232,12 +2234,12 @@ def add_log_buttons(fig: go.Figure):
     ----------
     fig : go.Figure
         The figure to be modified withot buttons
-        
+
     Returns
     -------
     fig : go.Figure
         The modified figure with the buttons
-        
+
     """
 
     updatemenus = [
@@ -2303,9 +2305,9 @@ def figure_x_axis(df, metric):
         Array of frequencies for the PSD data.
     time_vec : np.array
         Array of time values for the EOG, ECG, muscle, or head data.
-    
+
     """
-     
+
     metric_lower = metric.lower()
 
     if metric_lower == 'psd':
@@ -2352,11 +2354,11 @@ def Plot_psd_csv(m_or_g:str, f_path: str, method: str):
     -------
     QC_derivative
         QC_derivative object with plotly figure as content
-        
+
     """
 
     # First, get the epochs from csv and convert back into object.
-    df = pd.read_csv(f_path, sep='\t') 
+    df = pd.read_csv(f_path, sep='\t')
 
     if 'Name' not in df.columns:
         return []
@@ -2394,7 +2396,7 @@ def Plot_psd_csv(m_or_g:str, f_path: str, method: str):
 
     #Add buttons to switch scale between log and linear:
     fig = add_log_buttons(fig)
-    
+
     fig_name='PSD_all_data_'+tit
 
     qc_derivative = [QC_derivative(content=fig, name=fig_name, content_type='plotly')]
@@ -2427,10 +2429,10 @@ def edit_legend_pie_SNR(noisy_freqs: List, noise_ampl: List, total_amplitude: fl
     noise_ampl_relative_to_signal:
         list of relative noise freqs + amplitude of clean signal
     bands_names:
-        names of freq bands 
-    
+        names of freq bands
+
     """
-    
+
 
     #Legend for the pie chart:
 
@@ -2443,7 +2445,7 @@ def edit_legend_pie_SNR(noisy_freqs: List, noise_ampl: List, total_amplitude: fl
             bands_names.append(str(round(fr,1))+' Hz noise')
 
     bands_names.append('Main signal')
-    
+
     noise_and_signal_ampl = noise_ampl.copy()
     noise_and_signal_ampl.append(total_amplitude-sum(noise_ampl)) #adding main signal ampl in the list
 
@@ -2453,9 +2455,9 @@ def edit_legend_pie_SNR(noisy_freqs: List, noise_ampl: List, total_amplitude: fl
 
 
 def plot_pie_chart_freq_csv(tsv_pie_path: str, m_or_g: str, noise_or_waves: str):
-    
+
     """
-    Plot pie chart representation of relative amplitude of each frequency band over the entire 
+    Plot pie chart representation of relative amplitude of each frequency band over the entire
     times series of mags or grads, not separated by individual channels.
 
     Parameters
@@ -2466,7 +2468,7 @@ def plot_pie_chart_freq_csv(tsv_pie_path: str, m_or_g: str, noise_or_waves: str)
         'mag' or 'grad'
     noise_or_waves: str
         do we plot SNR or brain waves percentage (alpha, beta, etc)
-    
+
     Returns
     -------
     QC_derivative
@@ -2476,17 +2478,17 @@ def plot_pie_chart_freq_csv(tsv_pie_path: str, m_or_g: str, noise_or_waves: str)
 
     #if it s not the right ch kind in the file
     base_name = os.path.basename(tsv_pie_path) #name of the final file
-    
+
     if m_or_g not in base_name.lower():
         return []
-    
+
     # Read the data from the TSV file into a DataFrame
     df = pd.read_csv(tsv_pie_path, sep='\t')
 
     if noise_or_waves == 'noise' and 'PSDnoise' in base_name:
         #check that we input tsv file with the right data
 
-        fig_tit = "Ratio of signal and noise in the data: " 
+        fig_tit = "Ratio of signal and noise in the data: "
         fig_name = 'PSD_SNR_all_channels_'
 
         # Extract the data
@@ -2500,7 +2502,7 @@ def plot_pie_chart_freq_csv(tsv_pie_path: str, m_or_g: str, noise_or_waves: str)
 
     elif noise_or_waves == 'waves' and 'PSDwaves' in base_name:
 
-        fig_tit = "Relative area under the amplitude spectrum: " 
+        fig_tit = "Relative area under the amplitude spectrum: "
         fig_name = 'PSD_Relative_band_amplitude_all_channels_'
 
 
@@ -2523,8 +2525,8 @@ def plot_pie_chart_freq_csv(tsv_pie_path: str, m_or_g: str, noise_or_waves: str)
     else:
         return []
 
-    all_bands_names=bands_names.copy() 
-    #the lists change in this function and this change is tranfered outside the fuction even when these lists are not returned explicitly. 
+    all_bands_names=bands_names.copy()
+    #the lists change in this function and this change is tranfered outside the fuction even when these lists are not returned explicitly.
     #To keep them in original state outside the function, they are copied here.
     all_mean_abs_values=amplitudes_abs.copy()
     ch_type_tit, unit = get_tit_and_unit(m_or_g, psd=True)
@@ -2541,7 +2543,7 @@ def plot_pie_chart_freq_csv(tsv_pie_path: str, m_or_g: str, noise_or_waves: str)
 
     if not all_mean_relative_values:
         return []
-    
+
     labels=[None]*len(all_bands_names)
     for n, name in enumerate(all_bands_names):
         labels[n]=name + ': ' + str("%.2e" % all_mean_abs_values[n]) + ' ' + unit # "%.2e" % removes too many digits after coma
@@ -2567,9 +2569,9 @@ def plot_pie_chart_freq_csv(tsv_pie_path: str, m_or_g: str, noise_or_waves: str)
 def assign_epoched_std_ptp_to_channels(what_data, chs_by_lobe, df_std_ptp):
 
     """
-    Assign std or ptp values of each epoch as list to each channel. 
+    Assign std or ptp values of each epoch as list to each channel.
     This is done for easier plotting when need to plot epochs per channel and also color coded by lobes.
-    
+
     Parameters
     ----------
     what_data : str
@@ -2578,8 +2580,8 @@ def assign_epoched_std_ptp_to_channels(what_data, chs_by_lobe, df_std_ptp):
         dictionary with channel objects sorted by lobe.
     df_std_ptp : pd.DataFrame
         Data Frame containing std or ptp value for each chnnel and each epoch
-    
-        
+
+
     Returns
     -------
     chs_by_lobe : dict
@@ -2606,11 +2608,11 @@ def boxplot_epoched_xaxis_epochs_csv(std_csv_path: str, ch_type: str, what_data:
     """
     Represent std of epochs for each channel as box plots, where each box on x axis is 1 epoch. Dots inside the box are channels.
     On base of the data from tsv file
-    
-    Process: 
+
+    Process:
     Each box need to be plotted as a separate trace first.
     Each channels inside each box has to be plottted as separate trace to allow diffrenet color coding
-    
+
     For each box_representing_epoch:
         box trace
         For each color coded lobe:
@@ -2704,7 +2706,7 @@ def boxplot_all_time_csv(std_csv_path: str, ch_type: str, what_data: str):
 
     """
     Create representation of calculated std data as a boxplot over the whoe time series, not epoched.
-    (box contains magnetometers or gradiomneters, not together): 
+    (box contains magnetometers or gradiomneters, not together):
     each dot represents 1 channel (std value over whole data of this channel). Too high/low stds are outliers.
 
     On base of the data from tsv file.
@@ -2752,7 +2754,7 @@ def boxplot_all_time_csv(std_csv_path: str, ch_type: str, what_data: str):
     # For this plot have to separately create a box (no data points plotted) as 1 trace
     # Then separately create for each cannel (dot) a separate trace. It s the only way to make them all different lobe colors.
     # Additionally, the dots are scattered along the y axis, this is done for visualisation only, y position does not hold information.
-    
+
     # Put all data dots in a list of traces groupped by lobe:
     values_all=[]
     traces = []
@@ -2792,18 +2794,18 @@ def boxplot_all_time_csv(std_csv_path: str, ch_type: str, what_data: str):
 
     # create box plot trace
     box_trace = go.Box(x=values_all, y0=0, orientation='h', name='box', line_width=1, opacity=0.7, boxpoints=False, width=boxwidth, showlegend=False)
-    
+
     #Colllect all traces and add them to the figure:
     all_traces = [box_trace]+traces
 
     if not traces:
         return []
-    
+
     fig = go.Figure(data=all_traces)
 
     #Add hover text to the dots, remove too many digits after coma.
     fig.update_traces(hovertemplate=hover_tit+': %{x: .2e}')
-        
+
     #more settings:
     fig.update_layout(
         yaxis_range=[-0.5,0.5],
@@ -2832,13 +2834,13 @@ def plot_muscle_csv(f_path: str):
     """
     Plot the muscle events with the z-scores and the threshold.
     On base of the data from tsv file.
-    
+
     Parameters
     ----------
     f_path: str
         Path to tsv file with data.
-    
-        
+
+
     Returns
     -------
     fig_derivs : List
@@ -2846,11 +2848,11 @@ def plot_muscle_csv(f_path: str):
 
     """
 
-    df = pd.read_csv(f_path, sep='\t')  
+    df = pd.read_csv(f_path, sep='\t')
 
     if df['scores_muscle'].empty or df['scores_muscle'].isna().all():
         return []
-    
+
     m_or_g = df['ch_type'][0]
 
     fig_derivs = []
@@ -2859,10 +2861,10 @@ def plot_muscle_csv(f_path: str):
     tit, _ = get_tit_and_unit(m_or_g)
     # fig.add_trace(go.Scatter(x=raw.times, y=scores_muscle, mode='lines', name='high freq (muscle scores)'))
     # fig.add_trace(go.Scatter(x=muscle_times, y=high_scores_muscle, mode='markers', name='high freq (muscle) events'))
-    
+
     fig.add_trace(go.Scatter(x=df['data_times'], y=df['scores_muscle'], mode='lines', name='high freq (muscle scores)'))
     fig.add_trace(go.Scatter(x=df['high_scores_muscle_times'], y=df['high_scores_muscle'], mode='markers', name='high freq (muscle) events'))
-    
+
     # #removed threshold, so this one is not plotted now:
     #fig.add_trace(go.Scatter(x=raw.times, y=[threshold_muscle]*len(raw.times), mode='lines', name='z score threshold: '+str(threshold_muscle)))
     fig.update_layout(xaxis_title='time, (s)', yaxis_title='zscore', title={
@@ -2873,7 +2875,7 @@ def plot_muscle_csv(f_path: str):
     'yanchor': 'top'})
 
     fig_derivs += [QC_derivative(fig, 'muscle_z_scores_over_time_based_on_'+tit, 'plotly', 'Calculation is done using MNE function annotate_muscle_zscore(). It requires a z-score threshold, which can be changed in the settings file. (by defaults 5). Values over this threshold are marked in red.')]
-    
+
     return fig_derivs
 
 
@@ -2895,36 +2897,39 @@ def plot_muscle_annotations_mne(raw: mne.io.Raw, m_or_g: str, annot_muscle: mne.
         #Change settings to show all channels!
 
         # No suppressing of plots should be done here. This one is matplotlib interactive plot, so it ll only work with %matplotlib qt.
-        # Makes no sense to suppress it. Also, adding to QC_derivative is just formal, cos whe extracting to html it s not interactive any more. 
+        # Makes no sense to suppress it. Also, adding to QC_derivative is just formal, cos whe extracting to html it s not interactive any more.
         # Should not be added to report. Kept here in case mne will allow to extract interactive later.
 
         fig_derivs += [QC_derivative(fig2, 'muscle_annotations_'+tit, 'matplotlib')]
-    
+
     return fig_derivs
 
-    
+
 def plot_head_pos_csv(f_path: str):
 
-    """ 
+    """
     Plot positions and rotations of the head. On base of data from tsv file.
-    
+
     Parameters
     ----------
     f_path: str
         Path to a file with data.
-        
+
     Returns
     -------
-    head_derivs : List 
+    head_derivs : List
         List of QC_derivative objects containing figures with head positions and rotations.
     head_pos_baselined : np.ndarray
         Head positions and rotations starting from 0 instead of the mne detected starting point. Can be used for plotting.
     """
 
-    head_pos = pd.read_csv(f_path, sep='\t') 
+    head_pos = pd.read_csv(f_path, sep='\t')
 
-    #drop first column. cos index is being created as an extra column when transforming from csv back to df:
-    head_pos.drop(columns=head_pos.columns[0], axis=1, inplace=True)
+    # Drop a spurious index column if one was written when the TSV was saved.
+    # Only drop if the first column looks like an unnamed pandas index.
+    first_col = head_pos.columns[0]
+    if str(first_col).startswith("Unnamed") or str(first_col).isdigit():
+        head_pos.drop(columns=first_col, inplace=True)
 
     # Check if all specified columns are empty or contain only NaN values
     columns_to_check = ['x', 'y', 'z', 'q1', 'q2', 'q3']
@@ -2966,7 +2971,7 @@ def plot_head_pos_csv(f_path: str):
 def make_head_pos_plot_mne(raw: mne.io.Raw, head_pos: np.ndarray):
 
     """
-    Currently not used if we wanna plot solely from csv. 
+    Currently not used if we wanna plot solely from csv.
     This function requires also raw as input and cant be only from csv.
 
     TODO: but we can calculate these inputs earlier and add them to csv as well.
@@ -2977,7 +2982,7 @@ def make_head_pos_plot_mne(raw: mne.io.Raw, head_pos: np.ndarray):
         raw.info['dev_head_t'])
     average_head_dev_t = mne.transforms.invert_transform(
         compute_average_dev_head_t(raw, head_pos))
-    
+
     matplotlib.use('Agg') #this command will suppress showing matplotlib figures produced by mne. They will still be saved for use in report but not shown when running the pipeline
 
     #plot using MNE:
@@ -3002,19 +3007,19 @@ def make_head_annots_plot(raw: mne.io.Raw, head_pos: np.ndarray):
     """
     Plot raw data with annotated head movement. Currently not used.
 
-    
+
     Parameters
     ----------
     raw : mne.io.Raw
         Raw data.
     head_pos : np.ndarray
         Head positions and rotations.
-        
+
     Returns
     -------
     head_derivs : List
         List of QC derivatives with annotated figures.
-        
+
     """
 
     head_derivs = []
@@ -3048,17 +3053,17 @@ def plot_ECG_EOG_channel_csv(f_path):
     ----------
     f_path : str
         Path to the tsv file with the derivs to plot
-        
+
     Returns
     -------
     ch_deriv : List
         List of QC_derivative objects with plotly figures of the ECG/EOG channels
-        
+
     """
 
     #if its not the right file, skip:
     base_name = os.path.basename(f_path) #name of the fimal file
-    
+
     if 'ecgchannel' not in base_name.lower() and 'eogchannel' not in base_name.lower():
         return []
 
@@ -3755,7 +3760,7 @@ def build_metric_derivatives_from_tsv(metric: str, tsv_paths: List[str], m_or_g_
     ``universal_plots.py`` so orchestration modules can stay lean and focused on
     I/O and report assembly.
     """
-    time_series_derivs, sensors_derivs, ptp_manual_derivs, pp_auto_derivs, ecg_derivs, eog_derivs, std_derivs, psd_derivs, muscle_derivs, head_derivs = [], [], [], [], [], [], [], [], [], []
+    time_series_derivs, sensors_derivs, ptp_manual_derivs, ecg_derivs, eog_derivs, std_derivs, psd_derivs, muscle_derivs, head_derivs = [], [], [], [], [], [], [], [], []
     stim_derivs = []
 
     for tsv_path in tsv_paths:
@@ -3841,7 +3846,6 @@ def build_metric_derivatives_from_tsv(metric: str, tsv_paths: List[str], m_or_g_
         'STD': std_derivs,
         'PSD': psd_derivs,
         'PTP_MANUAL': ptp_manual_derivs,
-        'PTP_AUTO': pp_auto_derivs,
         'ECG': ecg_derivs,
         'EOG': eog_derivs,
         'HEAD': head_derivs,

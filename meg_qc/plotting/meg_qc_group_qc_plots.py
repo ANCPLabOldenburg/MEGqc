@@ -1592,16 +1592,20 @@ def _plot_summary_distribution_recordings_qc(
     rng = np.random.default_rng(23)
     xj = x0 + rng.uniform(-0.10, 0.10, size=vals.size)
     subj_keys = (
-        data.get("dataset", pd.Series(["dataset"] * len(data))).astype(str)
+        data["dataset"].astype(str)
         + "::"
-        + data.get("subject", pd.Series(["n/a"] * len(data))).astype(str)
+        + data["subject"].astype(str)
     )
     subj_codes = pd.Categorical(subj_keys).codes.astype(float)
+    _c_min = float(subj_codes.min()) if subj_codes.size > 0 else 0.0
+    _c_max = float(subj_codes.max()) if subj_codes.size > 0 else 1.0
+    if _c_min == _c_max:
+        _c_max = _c_min + 1.0  # prevent degenerate colorscale (cmin==cmax → NaN in WebGL)
     hover = (
-        "dataset=" + data.get("dataset", pd.Series(["dataset"] * len(data))).astype(str)
-        + "<br>subject=" + data.get("subject", pd.Series(["n/a"] * len(data))).astype(str)
-        + "<br>task=" + data.get("task", pd.Series(["unknown"] * len(data))).astype(str)
-        + "<br>recording=" + data.get("recording_label", pd.Series(["n/a"] * len(data))).astype(str)
+        "dataset=" + data["dataset"].astype(str)
+        + "<br>subject=" + data["subject"].astype(str)
+        + "<br>task=" + data["task"].astype(str)
+        + "<br>recording=" + data["recording_label"].astype(str)
         + "<br>value=" + pd.to_numeric(data["value"], errors="coerce").map(lambda v: f"{float(v):.3g}" if np.isfinite(v) else "n/a")
     ).to_numpy()
 
@@ -1646,6 +1650,8 @@ def _plot_summary_distribution_recordings_qc(
                 "size": 8.0,
                 "color": subj_codes,
                 "colorscale": "Turbo",
+                "cmin": _c_min,
+                "cmax": _c_max,
                 "opacity": 0.76,
                 "line": {"width": 0.35, "color": "rgba(20,20,20,0.5)"},
                 "showscale": False,
@@ -3165,12 +3171,14 @@ def _build_report_html(
       function applySummaryDisplacement(plotEl, level) {{
         const shift = Number(summaryDispMap[level] ?? 0.0);
         if (!plotEl.__summaryBaseX) plotEl.__summaryBaseX = {{}};
+        if (!plotEl.__summaryEverDisplaced) plotEl.__summaryEverDisplaced = false;
         const idxs = _summaryScatterIdx(plotEl);
         const xUpdate = [];
         const traceIdx = [];
         idxs.forEach((i) => {{
           if (!plotEl.__summaryBaseX.hasOwnProperty(i)) {{
-            const base = Array.isArray(plotEl.data[i].x) ? plotEl.data[i].x.slice() : [];
+            const rawX = plotEl.data[i] && plotEl.data[i].x;
+            const base = (rawX != null) ? Array.from(rawX) : [];
             plotEl.__summaryBaseX[i] = base;
           }}
           const base = plotEl.__summaryBaseX[i] || [];
@@ -3178,6 +3186,8 @@ def _build_report_html(
           traceIdx.push(i);
         }});
         if (traceIdx.length === 0) return;
+        if (shift === 0.0 && !plotEl.__summaryEverDisplaced) return;
+        plotEl.__summaryEverDisplaced = true;
         try {{
           Plotly.restyle(plotEl, {{'x': xUpdate}}, traceIdx);
         }} catch (err) {{}}
