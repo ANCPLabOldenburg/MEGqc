@@ -145,6 +145,41 @@ derivatives/MEEGqc/
   summary_reports/    GQI artefacts (TSV + JSON), versioned via attempt files
 ```
 
+An external output keeps the same BIDS-style structure by default:
+
+```bash
+run-meegqc --inputdata /path/to/dataset \
+  --derivatives_output /path/to/output
+# /path/to/output/dataset/derivatives/MEEGqc/
+```
+
+Use the opt-in literal layout when the selected folder should contain
+`MEEGqc` directly:
+
+```bash
+run-meegqc --inputdata /path/to/dataset \
+  --derivatives_output /path/to/output \
+  --output_layout literal
+# /path/to/output/MEEGqc/
+```
+
+For multiple input datasets, literal layout adds one dataset-named folder to
+keep their outputs separate: `/path/to/output/<dataset>/MEEGqc/`.
+
+The Python API uses the same option:
+
+```python
+from meg_qc.calculation.meg_qc_pipeline import make_derivative_meg_qc
+
+make_derivative_meg_qc(
+    default_config_file_path="/path/to/settings.ini",
+    internal_config_file_path="/path/to/settings_internal.ini",
+    ds_paths="/path/to/dataset",
+    derivatives_base="/path/to/output",
+    output_layout="literal",
+)
+```
+
 The GQI is written per-modality:
 `group_metrics/meg/Global_Quality_Index_attempt_<n>_meg.tsv` and
 `group_metrics/eeg/Global_Quality_Index_attempt_<n>_eeg.tsv`.

@@ -26,6 +26,11 @@ from plotly.utils import PlotlyJSONEncoder
 from plotly.offline import get_plotlyjs
 import mne
 from meg_qc.calculation.meg_qc_pipeline import resolve_analysis_root
+from meg_qc.output_paths import (
+    derivative_scope,
+    normalize_output_layout,
+    resolve_output_roots as _resolve_output_roots,
+)
 
 # Get the absolute path of the parent directory of the current script
 parent_dir = os.path.dirname(os.getcwd())
@@ -79,6 +84,7 @@ _load_plotting_backend()
 def resolve_output_roots(
     dataset_path: str,
     external_derivatives_root: Optional[str],
+    output_layout: str = "bids",
 ) -> Tuple[str, str, str]:
     """Return output root plus read/write derivatives roots.
 
@@ -87,17 +93,12 @@ def resolve_output_roots(
     be written (dataset root by default, external root when provided).
     """
 
-    ds_name = os.path.basename(os.path.normpath(dataset_path))
-    output_root = dataset_path if external_derivatives_root is None else os.path.join(external_derivatives_root, ds_name)
+    output_root, output_derivatives_root = _resolve_output_roots(
+        dataset_path,
+        external_derivatives_root,
+        output_layout=output_layout,
+    )
     dataset_derivatives_root = os.path.join(dataset_path, 'derivatives')
-    output_derivatives_root = os.path.join(output_root, 'derivatives')
-    os.makedirs(output_derivatives_root, exist_ok=True)
-
-    # When output is external, ensure output_root has a dataset_description.json
-    # so that ancpbids.load_dataset(output_root) works reliably in the plotting
-    # step (no symlink overlay required).
-    if external_derivatives_root is not None:
-        _ensure_output_root_bids_description(output_root, dataset_path)
 
     return output_root, dataset_derivatives_root, output_derivatives_root
 
@@ -3608,10 +3609,14 @@ def make_plots_meg_qc(
     derivatives_base: Optional[str] = None,
     analysis_mode: str = "legacy",
     analysis_id: Optional[str] = None,
+    output_layout: str = "bids",
 ):
     """
     Create plots for the MEG QC pipeline, but WITHOUT the interactive selector.
     Instead, we assume 'all' for every entity (subject, task, session, run, metric).
+
+    ``output_layout='literal'`` reads and writes ``MEEGqc`` directly below
+    ``derivatives_base``. The default keeps the existing BIDS-style tree.
     """
 
     # Ensure plotting backend and report helpers are available
@@ -3628,21 +3633,22 @@ def make_plots_meg_qc(
               'No data found in the given directory path! \nCheck directory path in config file and presence of data.')
         return
 
+    output_layout = normalize_output_layout(output_layout)
     (
         output_root,
-        _derivatives_root,
+        output_derivatives_root,
         _megqc_root,
         _resolved_analysis_id,
         analysis_segments,
     ) = resolve_analysis_root(
         dataset_path=dataset_path,
         external_derivatives_root=derivatives_base,
+        output_layout=output_layout,
         analysis_mode=analysis_mode,
         analysis_id=analysis_id,
         create_if_missing=True,
     )
     dataset_derivatives_root = os.path.join(dataset_path, "derivatives")
-    output_derivatives_root = os.path.join(output_root, "derivatives")
 
     # Query derivatives source:
     # - Prefer external derivatives tree when it already contains MEEGqc
@@ -3668,16 +3674,24 @@ def make_plots_meg_qc(
     #   • No os.symlink() calls  →  no WinError 1314 on locked-down Windows
     #   • No temp directory or cleanup required
     #   • Simpler code path, same result
-    if os.path.abspath(source_derivatives_root) != os.path.abspath(dataset_derivatives_root):
-        # dataset_description.json at output_root is guaranteed by resolve_output_roots
-        # (called earlier) but we double-check here in case plotting runs standalone.
-        _ensure_output_root_bids_description(output_root, dataset_path)
+    using_external_derivatives = (
+        os.path.abspath(source_derivatives_root)
+        != os.path.abspath(dataset_derivatives_root)
+    )
+    if using_external_derivatives:
+        # BIDS-style external roots need dataset metadata. Literal roots are
+        # intentionally plain output folders.
+        if output_layout == "bids":
+            _ensure_output_root_bids_description(output_root, dataset_path)
         query_base = output_root
         query_dataset = ancpbids.load_dataset(output_root, DatasetOptions(lazy_loading=True))
         print(f"___MEGqc___: External output detected. Loading ANCPBIDS from output_root: {output_root}")
 
-    calculated_derivs_folder = os.path.join(
-        'derivatives', 'MEEGqc', *analysis_segments, 'calculation'
+    source_layout = output_layout if using_external_derivatives else "bids"
+    calculated_derivs_folder = derivative_scope(
+        source_layout,
+        *analysis_segments,
+        "calculation",
     )
 
     # Create output derivative folders once before subject-parallel processing.

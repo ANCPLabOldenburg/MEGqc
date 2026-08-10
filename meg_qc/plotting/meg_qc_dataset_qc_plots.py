@@ -39,6 +39,7 @@ from meg_qc.plotting.meg_qc_plots import (
 
 import meg_qc
 from meg_qc.calculation.meg_qc_pipeline import resolve_analysis_root
+from meg_qc.output_paths import dataset_derivatives_output
 
 
 METRIC_ORDER = ("GQI", "STD", "PtP", "PSD", "ECG", "EOG", "Muscle")
@@ -285,6 +286,7 @@ def _resolve_input_paths(
     derivatives_base: Optional[str],
     input_tsv: Optional[str],
     attempt: Optional[int],
+    output_layout: str = "bids",
     analysis_mode: str = "legacy",
     analysis_id: Optional[str] = None,
 ) -> Tuple[str, str, Path, Optional[Path], Optional[int], Path]:
@@ -298,6 +300,7 @@ def _resolve_input_paths(
     ) = resolve_analysis_root(
         dataset_path=dataset_path,
         external_derivatives_root=derivatives_base,
+        output_layout=output_layout,
         analysis_mode=analysis_mode,
         analysis_id=analysis_id,
         create_if_missing=True,
@@ -365,6 +368,7 @@ def _load_one_dataset_bundle(
     derivatives_base: Optional[str],
     input_tsv: Optional[str],
     attempt: Optional[int],
+    output_layout: str = "bids",
     analysis_mode: str = "legacy",
     analysis_id: Optional[str] = None,
 ) -> QCDatasetBundle:
@@ -380,6 +384,7 @@ def _load_one_dataset_bundle(
         derivatives_base=derivatives_base,
         input_tsv=input_tsv,
         attempt=attempt,
+        output_layout=output_layout,
         analysis_mode=analysis_mode,
         analysis_id=analysis_id,
     )
@@ -3379,6 +3384,7 @@ def make_dataset_qc_plots_meg_qc(
     derivatives_base: Optional[str] = None,
     analysis_mode: str = "legacy",
     analysis_id: Optional[str] = None,
+    output_layout: str = "bids",
 ) -> Optional[Path]:
     """Build one dataset-level QC HTML report from GQI summary TSV.
 
@@ -3398,6 +3404,9 @@ def make_dataset_qc_plots_meg_qc(
         Analysis root selection mode (``legacy``, ``new``, ``reuse``, ``latest``).
     analysis_id
         Profile ID used with ``analysis_mode='reuse'``.
+    output_layout
+        ``"bids"`` preserves the existing external tree. ``"literal"`` uses
+        ``derivatives_base`` as the folder containing ``MEEGqc``.
 
     Returns
     -------
@@ -3410,6 +3419,7 @@ def make_dataset_qc_plots_meg_qc(
             derivatives_base=derivatives_base,
             input_tsv=input_tsv,
             attempt=attempt,
+            output_layout=output_layout,
             analysis_mode=analysis_mode,
             analysis_id=analysis_id,
         )
@@ -3512,6 +3522,7 @@ def make_dataset_qc_plots_multi_meg_qc(
     derivatives_base: Optional[str] = None,
     analysis_mode: str = "legacy",
     analysis_id: Optional[str] = None,
+    output_layout: str = "bids",
 ) -> Optional[Path]:
     """Build one multi-dataset QC HTML report from multiple GQI summary TSVs."""
     if not dataset_paths:
@@ -3520,12 +3531,19 @@ def make_dataset_qc_plots_multi_meg_qc(
 
     bundles: List[QCDatasetBundle] = []
     for ds in dataset_paths:
+        dataset_base = dataset_derivatives_output(
+            derivatives_base,
+            ds,
+            output_layout,
+            multiple_datasets=len(dataset_paths) > 1,
+        )
         try:
             bundle = _load_one_dataset_bundle(
                 dataset_path=ds,
-                derivatives_base=derivatives_base,
+                derivatives_base=dataset_base,
                 input_tsv=None,
                 attempt=attempt,
+                output_layout=output_layout,
                 analysis_mode=analysis_mode,
                 analysis_id=analysis_id,
             )
