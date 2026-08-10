@@ -133,6 +133,7 @@ def _collect_sample_bundle(
     dataset_path: str,
     derivatives_base: Optional[str] = None,
     n_jobs: int = 1,
+    output_layout: str = "bids",
     analysis_mode: str = "legacy",
     analysis_id: Optional[str] = None,
 ) -> Optional[SampleBundle]:
@@ -146,6 +147,7 @@ def _collect_sample_bundle(
     ) = resolve_analysis_root(
         dataset_path=dataset_path,
         external_derivatives_root=derivatives_base,
+        output_layout=output_layout,
         analysis_mode=analysis_mode,
         analysis_id=analysis_id,
         create_if_missing=True,
@@ -2410,6 +2412,7 @@ def make_multi_dataset_plots_meg_qc(
     n_jobs: int = 1,
     analysis_mode: str = "legacy",
     analysis_id: Optional[str] = None,
+    output_layout: str = "bids",
 ) -> Dict[str, Path]:
     """Build one HTML report comparing multiple MEGqc datasets.
 
@@ -2429,6 +2432,9 @@ def make_multi_dataset_plots_meg_qc(
         Analysis root selection mode (``legacy``, ``new``, ``reuse``, ``latest``).
     analysis_id
         Profile ID used with ``analysis_mode='reuse'``.
+    output_layout
+        External output layout used to resolve every entry in
+        ``derivatives_bases``.
 
     Returns
     -------
@@ -2453,6 +2459,7 @@ def make_multi_dataset_plots_meg_qc(
             ds_path,
             der_base,
             n_jobs=n_jobs,
+            output_layout=output_layout,
             analysis_mode=analysis_mode,
             analysis_id=analysis_id,
         )

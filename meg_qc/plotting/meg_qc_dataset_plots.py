@@ -37,6 +37,7 @@ except Exception:
 
 import meg_qc
 from meg_qc.calculation.meg_qc_pipeline import resolve_analysis_root
+from meg_qc.output_paths import resolve_output_roots as _resolve_output_roots
 from meg_qc.plotting.topomap_2d import make_flat_topomap_figure, BLUE_RED_COLORSCALE
 from meg_qc.plotting.universal_plots import amplitude_scale_unit, _add_colormap_menu_3d
 # Shared "Plot settings" panel (issue #136): one source of truth for the panel
@@ -218,17 +219,17 @@ class ChTypeAccumulator:
     source_paths: set = field(default_factory=set)
 
 
-def resolve_output_roots(dataset_path: str, external_derivatives_root: Optional[str]) -> Tuple[str, str]:
+def resolve_output_roots(
+    dataset_path: str,
+    external_derivatives_root: Optional[str],
+    output_layout: str = "bids",
+) -> Tuple[str, str]:
     """Return output root and derivatives root respecting optional override."""
-    ds_name = os.path.basename(os.path.normpath(dataset_path))
-    output_root = (
-        dataset_path
-        if external_derivatives_root is None
-        else os.path.join(external_derivatives_root, ds_name)
+    return _resolve_output_roots(
+        dataset_path,
+        external_derivatives_root,
+        output_layout=output_layout,
     )
-    derivatives_root = os.path.join(output_root, "derivatives")
-    os.makedirs(derivatives_root, exist_ok=True)
-    return output_root, derivatives_root
 
 
 def _parse_entities_from_run_key(run_key: str) -> RunMeta:
@@ -7952,6 +7953,7 @@ def make_dataset_plots_meg_qc(
     n_jobs: int = 1,
     analysis_mode: str = "legacy",
     analysis_id: Optional[str] = None,
+    output_layout: str = "bids",
 ) -> Dict[str, Path]:
     """Build dataset-level QA reports from saved per-run derivatives.
 
@@ -7970,6 +7972,9 @@ def make_dataset_plots_meg_qc(
         Plotting typically uses ``legacy`` or ``reuse``/``latest``.
     analysis_id : str, optional
         Profile ID used with ``analysis_mode='reuse'``.
+    output_layout : str
+        ``"bids"`` preserves the existing external tree. ``"literal"`` uses
+        ``derivatives_base`` as the folder containing ``MEEGqc``.
 
     Returns
     -------
@@ -7986,6 +7991,7 @@ def make_dataset_plots_meg_qc(
     ) = resolve_analysis_root(
         dataset_path=dataset_path,
         external_derivatives_root=derivatives_base,
+        output_layout=output_layout,
         analysis_mode=analysis_mode,
         analysis_id=analysis_id,
         create_if_missing=True,

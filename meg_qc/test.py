@@ -6,6 +6,11 @@ import time
 import datetime as dt
 from typing import Callable, Dict, List, Optional, Sequence, Union
 
+from meg_qc.output_paths import (
+    dataset_derivatives_output,
+    normalize_output_layout,
+)
+
 
 def _invocation_name(fallback: str) -> str:
     """Return the command name the user actually typed.
@@ -204,6 +209,7 @@ def run_calculation_dispatch(
     interactive_prompts: bool = False,
     keep_temp_on_error: bool = False,
     logger: Callable[[str], None] = print,
+    output_layout: str = "bids",
 ) -> None:
     """
     Shared MEGqc calculation dispatcher used by CLI and GUI.
@@ -216,6 +222,7 @@ def run_calculation_dispatch(
     ds_list = _normalize_dataset_paths(dataset_paths)
     if not ds_list:
         raise ValueError("No dataset paths provided for calculation.")
+    output_layout = normalize_output_layout(output_layout)
     analysis_mode = str(analysis_mode or "non-profile").strip().lower()
     if analysis_mode == "non-profile":
         logger(
@@ -232,6 +239,12 @@ def run_calculation_dispatch(
 
     total_start = time.time()
     for idx, dataset_path in enumerate(ds_list, start=1):
+        dataset_output = dataset_derivatives_output(
+            derivatives_output,
+            dataset_path,
+            output_layout,
+            multiple_datasets=len(ds_list) > 1,
+        )
         used_njobs = _resolve_dataset_njobs(dataset_path, n_jobs, dataset_njobs)
         used_subs = _resolve_dataset_sub_list(dataset_path, sub_list, dataset_subs)
         used_config = _resolve_dataset_config_path(
@@ -252,13 +265,14 @@ def run_calculation_dispatch(
             ds_paths=dataset_path,
             sub_list=used_subs,
             n_jobs=used_njobs,
-            derivatives_base=derivatives_output,
+            derivatives_base=dataset_output,
             analysis_mode=analysis_mode,
             analysis_id=calc_analysis_id,
             existing_config_policy=existing_config_policy,
             processed_subjects_policy=processed_subjects_policy,
             interactive_prompts=interactive_prompts,
             keep_temp_on_error=keep_temp_on_error,
+            output_layout=output_layout,
         )
         ds_elapsed = time.time() - ds_start
         logger(
@@ -368,6 +382,7 @@ def run_plotting_dispatch(
     analysis_mode: str = "non-profile",
     analysis_id: Optional[str] = None,
     logger: Callable[[str], None] = print,
+    output_layout: str = "bids",
 ) -> Dict[str, bool]:
     """
     Shared plotting dispatcher used by CLI and GUI.
@@ -388,10 +403,28 @@ def run_plotting_dispatch(
     )
 
     ds_list = _normalize_dataset_paths(dataset_paths)
+    output_layout = normalize_output_layout(output_layout)
+    dataset_outputs = {
+        ds: dataset_derivatives_output(
+            derivatives_output,
+            ds,
+            output_layout,
+            multiple_datasets=len(ds_list) > 1,
+        )
+        for ds in ds_list
+    }
 
     # Refuse to build reports from derivatives produced by an older MEEGqc
     # version (old 'Meg_QC' folder / non-BIDS names): they are incompatible.
-    legacy_only = [d for d in ds_list if has_only_legacy_derivatives(d, derivatives_output)]
+    legacy_only = [
+        d
+        for d in ds_list
+        if has_only_legacy_derivatives(
+            d,
+            dataset_outputs[d],
+            output_layout=output_layout,
+        )
+    ]
     if legacy_only:
         logger("___MEGqc___: " + LEGACY_DERIVATIVES_HINT)
         for d in legacy_only:
@@ -452,7 +485,8 @@ def run_plotting_dispatch(
     for ds in ds_list:
         _, derivatives_root, megqc_root, resolved_analysis_id, _segments = resolve_analysis_root(
             dataset_path=ds,
-            external_derivatives_root=derivatives_output,
+            external_derivatives_root=dataset_outputs[ds],
+            output_layout=output_layout,
             analysis_mode=effective_mode,
             analysis_id=effective_id,
             create_if_missing=True,
@@ -469,9 +503,10 @@ def run_plotting_dispatch(
             make_plots_meg_qc(
                 ds,
                 n_jobs=njobs,
-                derivatives_base=derivatives_output,
+                derivatives_base=dataset_outputs[ds],
                 analysis_mode=effective_mode,
                 analysis_id=effective_id,
+                output_layout=output_layout,
             )
 
     if modes["qa_dataset"]:
@@ -479,15 +514,16 @@ def run_plotting_dispatch(
             logger(f"Running QA plotting for dataset: {ds}")
             make_dataset_plots_meg_qc(
                 ds,
-                derivatives_base=derivatives_output,
+                derivatives_base=dataset_outputs[ds],
                 n_jobs=njobs,
                 analysis_mode=effective_mode,
                 analysis_id=effective_id,
+                output_layout=output_layout,
             )
 
     if modes["qa_multi_dataset"]:
         logger("Running QA multi-dataset plotting...")
-        derivatives_bases = [derivatives_output] * len(ds_list) if derivatives_output else None
+        derivatives_bases = [dataset_outputs[ds] for ds in ds_list]
         make_multi_dataset_plots_meg_qc(
             dataset_paths=ds_list,
             derivatives_bases=derivatives_bases,
@@ -495,6 +531,7 @@ def run_plotting_dispatch(
             n_jobs=njobs,
             analysis_mode=effective_mode,
             analysis_id=effective_id,
+            output_layout=output_layout,
         )
 
     if modes["qc_dataset"]:
@@ -505,9 +542,10 @@ def run_plotting_dispatch(
                 input_tsv=input_tsv,
                 output_html=output_report,
                 attempt=attempt,
-                derivatives_base=derivatives_output,
+                derivatives_base=dataset_outputs[ds_list[0]],
                 analysis_mode=effective_mode,
                 analysis_id=effective_id,
+                output_layout=output_layout,
             )
         else:
             if input_tsv:
@@ -521,9 +559,10 @@ def run_plotting_dispatch(
                     input_tsv=None,
                     output_html=None,
                     attempt=attempt,
-                    derivatives_base=derivatives_output,
+                    derivatives_base=dataset_outputs[ds],
                     analysis_mode=effective_mode,
                     analysis_id=effective_id,
+                    output_layout=output_layout,
                 )
 
     if modes["qc_multi_dataset"]:
@@ -535,6 +574,7 @@ def run_plotting_dispatch(
             derivatives_base=derivatives_output,
             analysis_mode=effective_mode,
             analysis_id=effective_id,
+            output_layout=output_layout,
         )
 
     return modes
@@ -647,6 +687,16 @@ def run_megqc():
         help=(
             "Optional external parent folder for derivatives. "
             "Per-dataset subfolders are created automatically."
+        ),
+    )
+    dataset_path_parser.add_argument(
+        "--output_layout",
+        choices=["bids", "literal"],
+        default="bids",
+        help=(
+            "External output layout. 'bids' (default) writes to "
+            "<output>/<dataset>/derivatives/MEEGqc. 'literal' writes to "
+            "<output>/MEEGqc; multi-dataset runs add one dataset folder."
         ),
     )
     dataset_path_parser.add_argument(
@@ -774,6 +824,7 @@ def run_megqc():
             calc_n_jobs=args.n_jobs,
             plot_njobs=args.n_jobs,
             derivatives_output=args.derivatives_output,
+            output_layout=args.output_layout,
             dataset_subs=subs_per_dataset,
             global_config_file_path=global_config_file_path,
             config_per_dataset=config_per_dataset,
@@ -803,6 +854,7 @@ def run_megqc():
         sub_list=sub_list,
         n_jobs=args.n_jobs,
         derivatives_output=args.derivatives_output,
+        output_layout=args.output_layout,
         dataset_subs=subs_per_dataset,
         global_config_file_path=global_config_file_path,
         config_per_dataset=config_per_dataset,
@@ -815,8 +867,25 @@ def run_megqc():
         logger=print,
     )
 
-    for dataset_path in _normalize_dataset_paths(args.inputdata):
-        print(f"Results are available under: {dataset_path}/derivatives/MEEGqc/calculation")
+    from meg_qc.output_paths import resolve_output_roots
+
+    dataset_paths = _normalize_dataset_paths(args.inputdata)
+    for dataset_path in dataset_paths:
+        dataset_output = dataset_derivatives_output(
+            args.derivatives_output,
+            dataset_path,
+            args.output_layout,
+            multiple_datasets=len(dataset_paths) > 1,
+        )
+        _, derivatives_root = resolve_output_roots(
+            dataset_path,
+            dataset_output,
+            output_layout=args.output_layout,
+        )
+        print(
+            "Results are available under: "
+            f"{os.path.join(derivatives_root, 'MEEGqc', 'calculation')}"
+        )
 
 
 def get_config():
@@ -902,6 +971,15 @@ def get_plots():
         help=(
             "Optional external derivatives parent folder. For single-dataset "
             "modes, dataset-specific derivatives are resolved from this root."
+        ),
+    )
+    dataset_path_parser.add_argument(
+        "--output_layout",
+        choices=["bids", "literal"],
+        default="bids",
+        help=(
+            "External output layout. 'bids' (default) keeps a BIDS root; "
+            "'literal' reads and writes MEEGqc directly below the supplied path."
         ),
     )
     dataset_path_parser.add_argument(
@@ -1003,6 +1081,7 @@ def get_plots():
         run_plotting_dispatch(
             dataset_paths=args.inputdata,
             derivatives_output=args.derivatives_output,
+            output_layout=args.output_layout,
             output_report=args.output_report,
             attempt=args.attempt,
             input_tsv=args.input_tsv,
@@ -1032,6 +1111,7 @@ def run_gqi_dispatch(
     analysis_mode: str = "non-profile",
     analysis_id: Optional[str] = None,
     logger: Callable[[str], None] = print,
+    output_layout: str = "bids",
 ) -> None:
     """Shared dispatcher for GQI regeneration over one or multiple datasets."""
     from meg_qc.calculation.metrics.summary_report_GQI import generate_gqi_summary
@@ -1044,8 +1124,26 @@ def run_gqi_dispatch(
     ds_list = _normalize_dataset_paths(dataset_paths)
     if not ds_list:
         raise ValueError("No dataset paths provided for GQI.")
+    output_layout = normalize_output_layout(output_layout)
+    dataset_outputs = {
+        ds: dataset_derivatives_output(
+            derivatives_output,
+            ds,
+            output_layout,
+            multiple_datasets=len(ds_list) > 1,
+        )
+        for ds in ds_list
+    }
 
-    legacy_only = [d for d in ds_list if has_only_legacy_derivatives(d, derivatives_output)]
+    legacy_only = [
+        d
+        for d in ds_list
+        if has_only_legacy_derivatives(
+            d,
+            dataset_outputs[d],
+            output_layout=output_layout,
+        )
+    ]
     if legacy_only:
         logger("___MEGqc___: " + LEGACY_DERIVATIVES_HINT)
         for d in legacy_only:
@@ -1074,7 +1172,8 @@ def run_gqi_dispatch(
         )
         _, _derivatives_root, megqc_root, resolved_analysis_id, _segments = resolve_analysis_root(
             dataset_path=dataset_path,
-            external_derivatives_root=derivatives_output,
+            external_derivatives_root=dataset_outputs[dataset_path],
+            output_layout=output_layout,
             analysis_mode=effective_mode,
             analysis_id=effective_id,
             create_if_missing=True,
@@ -1121,6 +1220,7 @@ def run_all_dispatch(
     qc_all: bool = False,
     all_modes: bool = True,
     logger: Callable[[str], None] = print,
+    output_layout: str = "bids",
 ) -> None:
     """Run MEGqc calculation (incl. GQI) and then all QA/QC plotting modes.
 
@@ -1142,6 +1242,7 @@ def run_all_dispatch(
         sub_list=sub_list,
         n_jobs=calc_n_jobs,
         derivatives_output=derivatives_output,
+        output_layout=output_layout,
         dataset_njobs=dataset_njobs,
         dataset_subs=dataset_subs,
         global_config_file_path=global_config_file_path,
@@ -1157,6 +1258,7 @@ def run_all_dispatch(
     run_plotting_dispatch(
         dataset_paths=dataset_paths,
         derivatives_output=derivatives_output,
+        output_layout=output_layout,
         njobs=plot_njobs,
         qa_subject=qa_subject,
         qa_dataset=qa_dataset,
@@ -1207,6 +1309,15 @@ def run_gqi():
         help="Optional folder to store derivatives outside the BIDS dataset",
     )
     parser.add_argument(
+        "--output_layout",
+        choices=["bids", "literal"],
+        default="bids",
+        help=(
+            "External output layout. 'bids' (default) writes a BIDS derivatives "
+            "tree; 'literal' uses the supplied path directly."
+        ),
+    )
+    parser.add_argument(
         "--analysis_mode",
         type=str,
         choices=["non-profile", "new-profile", "reuse-profile", "latest-profile"],
@@ -1236,6 +1347,7 @@ def run_gqi():
         dataset_paths=args.inputdata,
         default_config_file_path=default_config,
         derivatives_output=args.derivatives_output,
+        output_layout=args.output_layout,
         global_config_file_path=args.config,
         config_per_dataset=config_per_dataset,
         analysis_mode=args.analysis_mode,
