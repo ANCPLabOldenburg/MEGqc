@@ -324,10 +324,17 @@ def make_dict_local_std_ptp(std_ptp_params: dict, noisy_epochs_df: pd.DataFrame,
         epochs_details += [{'epoch': ep, 'onset_time_s': onset_s, 'number_of_noisy_ch': int(noisy_epochs_df.loc['number noisy channels',ep]), 'perc_of_noisy_ch': float(noisy_epochs_df.loc['% noisy channels',ep]), 'epoch_too_noisy': noisy_epochs_df.loc['noisy < %s perc' % percent_noisy_flat_allowed, ep], 'number_of_flat_ch': int(flat_epochs_df.loc['number flat channels', ep]), 'perc_of_flat_ch': float(flat_epochs_df.loc['% flat channels', ep]), 'epoch_too_flat': flat_epochs_df.loc['flat < %s perc' % percent_noisy_flat_allowed,ep]}]
 
     total_num_noisy_ep=len([ep for ep in epochs_details if ep['epoch_too_noisy'] is True])
-    total_perc_noisy_ep=round(total_num_noisy_ep/len(epochs)*100)
-
     total_num_flat_ep=len([ep for ep in epochs_details if ep['epoch_too_flat'] is True])
-    total_perc_flat_ep=round(total_num_flat_ep/len(epochs)*100)
+
+    # A recording can yield no epochs at all (too short for the epoch length,
+    # or no usable events). Report the percentages as None rather than dividing
+    # by zero and losing the entire STD/PTP metric.
+    if len(epochs) > 0:
+        total_perc_noisy_ep=round(total_num_noisy_ep/len(epochs)*100)
+        total_perc_flat_ep=round(total_num_flat_ep/len(epochs)*100)
+    else:
+        total_perc_noisy_ep=None
+        total_perc_flat_ep=None
 
     metric_local_content={
         'allow_percent_noisy_flat_epochs': std_ptp_params['allow_percent_noisy_flat_epochs'],

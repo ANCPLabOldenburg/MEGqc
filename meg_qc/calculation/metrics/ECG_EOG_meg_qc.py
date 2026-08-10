@@ -3047,7 +3047,22 @@ def EOG_meg_qc(
     bad_avg_str = {}
     avg_objects_eog=[]
     best_affected_channels={}
-    
+
+    # create_eog_epochs() raises if the recording has no EOG channel at all.
+    # Many BIDS datasets simply do not record EOG; that is not an error, so
+    # report it the same way the reconstruction branch above does instead of
+    # letting the whole metric fail.
+    if mne.pick_types(raw.info, meg=False, eeg=False, eog=True).size == 0:
+        eog_str += ('<br><br>No EOG channels found in this data set - '
+                    'EOG artifacts on the channels can not be detected.')
+        print('___MEGqc___: No EOG channel present - skipping EOG artifact detection.')
+        simple_metric_EOG = {
+            'description': eog_str,
+            'n_events': n_events,
+            'events_rate_per_min': events_rate_per_min,
+        }
+        return eog_derivs, simple_metric_EOG, eog_str, []
+
     for m_or_g  in m_or_g_chosen:
 
         eog_epochs = mne.preprocessing.create_eog_epochs(raw, picks=channels[m_or_g], tmin=tmin, tmax=tmax)

@@ -1048,7 +1048,18 @@ def load_data(file_path):
             modality = 'meg'
 
         print("___MEGqc___: ", "Loading CTF data...")
-        raw = mne.io.read_raw_ctf(file_path, preload=True, verbose='ERROR')
+        try:
+            raw = mne.io.read_raw_ctf(file_path, preload=True, verbose='ERROR')
+        except (OSError, RuntimeError) as ctf_exc:
+            # MNE walks the CTF system-clock channel to decide how many samples
+            # are valid and gives up on the whole recording if that channel is
+            # zero from the first sample, even when the .meg4 exactly matches
+            # the geometry declared in the .res4. Retry ignoring the clock -
+            # this mirrors the MaxShield retry the FIF branch already does.
+            print(f"___MEGqc___: CTF read failed ({ctf_exc}); "
+                  f"retrying with system_clock='ignore'...")
+            raw = mne.io.read_raw_ctf(file_path, preload=True,
+                                      system_clock='ignore', verbose='ERROR')
         print(f"___MEGqc___: Recording duration: {raw.times[-1] / 60:.2f} min")
 
         # ── Safeguard: reclassify CTF .ds with BIDS suffix _meg but 0 MEG chs ─

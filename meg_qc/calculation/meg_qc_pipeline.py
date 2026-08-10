@@ -532,16 +532,23 @@ def get_files_list(sid: str, dataset_path: str, dataset, m_or_g_chosen: list = N
 
     for root, dirs, files in os.walk(dataset_path):
         # Exclude the 'derivatives' folder — our own FIF derivatives could
-        # otherwise confuse CTF datasets.
-        dirs[:] = [d for d in dirs if d != 'derivatives']
+        # otherwise confuse CTF datasets.  Hidden folders are excluded too:
+        # a datalad/git-annex clone keeps the raw objects under
+        # .git/annex/objects/ with their original extension, so a pure CTF
+        # dataset would otherwise look like it also contained FIF files.
+        dirs[:] = [d for d in dirs
+                   if d != 'derivatives' and not d.startswith('.')]
         if any(file.endswith('.fif') for file in files):
             has_fif = True
         if any(d.endswith('.ds') for d in dirs):
             has_ctf = True
-        if has_fif and has_ctf:
-            raise ValueError(
-                'Both fif and ctf files found in the dataset. '
-                'Cannot define how to read the ds.')
+    # A dataset may legitimately contain both formats (e.g. one subject
+    # recorded on a Neuromag system and another on a CTF one). load_data()
+    # dispatches per file by extension, so both sets are collected below
+    # instead of refusing the dataset outright.
+    if has_fif and has_ctf:
+        print('___MEGqc___: Dataset contains both FIF and CTF recordings; '
+              'collecting both (each file is read by its own reader).')
 
     # ── 4. Resolve multimodal ambiguity using user preference ────────────
     if has_meg and has_eeg:
@@ -576,8 +583,10 @@ def get_files_list(sid: str, dataset_path: str, dataset, m_or_g_chosen: list = N
             ctf_entities = sorted(ctf_entities, key=lambda k: k['name'])
             list_of_files += ctf_files
             entities_per_file += ctf_entities
-        else:
-            # FIF (or any other non-CTF MEG format)
+        if has_fif or not has_ctf:
+            # FIF (or any other non-CTF MEG format). Also runs alongside the
+            # CTF branch above when a dataset mixes both, so neither set of
+            # recordings is dropped.
             meg_files = sorted(
                 list(dataset.query(suffix='meg', extension='.fif',
                                    return_type='filename', subj=sid, scope='raw')))
@@ -1270,6 +1279,9 @@ def process_one_subject(
     counter = 0
     avg_ecg = []
     avg_eog = []
+    # Files that could not be loaded at all; kept across the whole subject so
+    # they survive the per-file reset of metric_errors and can be reported.
+    skipped_files = []
 
     # LOOP OVER FIF FILES FOR THIS SUBJECT
     for file_ind, data_file in enumerate(list_of_files):  # e.g. [0:1] in your example
@@ -1285,31 +1297,50 @@ def process_one_subject(
         start_time = time.time()
 
         # INITIAL PROCESSING
-        (meg_system,
-         dict_epochs_mg,
-         chs_by_lobe,
-         channels,
-         raw_cropped_filtered,
-         raw_cropped_filtered_resampled,
-         raw_cropped,
-         raw,
-         info_derivs,
-         stim_deriv,
-         event_summary_deriv,
-         shielding_str,
-         epoching_str,
-         sensors_derivs,
-         m_or_g_chosen,
-         m_or_g_skipped_str,
-         lobes_color_coding_str,
-         resample_str) = initial_processing(
-            default_settings=all_qc_params['default'],
-            filtering_settings=all_qc_params['Filtering'],
-            epoching_params=all_qc_params['Epoching'],
-            file_path=data_file,
-            derivatives_root=derivatives_root,
-            eeg_settings=all_qc_params.get('EEG_settings'),
-        )
+        # One unreadable recording must not discard the whole subject: a
+        # subject can mix modalities (e.g. readable MEG .fif plus a broken
+        # EEG .set) and everything already computed for the earlier files
+        # would otherwise be thrown away. Record the file and move on.
+        try:
+            (meg_system,
+             dict_epochs_mg,
+             chs_by_lobe,
+             channels,
+             raw_cropped_filtered,
+             raw_cropped_filtered_resampled,
+             raw_cropped,
+             raw,
+             info_derivs,
+             stim_deriv,
+             event_summary_deriv,
+             shielding_str,
+             epoching_str,
+             sensors_derivs,
+             m_or_g_chosen,
+             m_or_g_skipped_str,
+             lobes_color_coding_str,
+             resample_str) = initial_processing(
+                default_settings=all_qc_params['default'],
+                filtering_settings=all_qc_params['Filtering'],
+                epoching_params=all_qc_params['Epoching'],
+                file_path=data_file,
+                derivatives_root=derivatives_root,
+                eeg_settings=all_qc_params.get('EEG_settings'),
+            )
+        except Exception as load_exc:
+            import traceback as _tb
+            print(f'___MEGqc___: SKIPPING file (could not be loaded): '
+                  f'{os.path.basename(data_file)} -- '
+                  f'{type(load_exc).__name__}: {load_exc}')
+            skipped_files.append({
+                'metric': 'initial_processing',
+                'file': os.path.basename(data_file),
+                'error_type': type(load_exc).__name__,
+                'error_message': str(load_exc),
+                'traceback': _tb.format_exc(),
+                'timestamp': dt.datetime.now().isoformat(timespec="seconds"),
+            })
+            continue
 
         print('___MEGqc___: ',
               "Finished initial processing. --- Execution %s seconds ---"
@@ -1712,6 +1743,19 @@ def process_one_subject(
         pass
     del derivative
     gc.collect()
+
+    # Files skipped because they could not be loaded are reported alongside the
+    # per-metric errors, so a subject that partly succeeded still says which
+    # recordings were dropped and why.
+    try:
+        metric_errors = list(metric_errors) + skipped_files
+    except NameError:
+        metric_errors = list(skipped_files)
+
+    if skipped_files:
+        print('___MEGqc___: %d file(s) skipped for subject %s: %s'
+              % (len(skipped_files), sub,
+                 ', '.join(f['file'] for f in skipped_files)))
 
     # Check if raw is None => means we never processed a file
     try:

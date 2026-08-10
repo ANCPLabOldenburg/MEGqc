@@ -938,13 +938,22 @@ def get_nfft_nperseg(raw: mne.io.Raw, psd_step_size: float):
     return nfft, nperseg
 
 
-def assign_psds_to_channels(chs_by_lobe: dict, freqs: List, psds: List):
+def assign_psds_to_channels(chs_by_lobe: dict, freqs: List, psds: List, ch_order: List = None):
 
     """
 
-    Assign std or ptp values of each epoch as list to each channel. 
-    This is done for extraction into TSV later and plotting. 
-    
+    Assign psd values to each channel.
+    This is done for extraction into TSV later and plotting.
+
+    ``psds`` rows follow the order of the channels that were passed to
+    ``compute_psd`` as ``picks`` (``ch_order``), which is *not* the order in
+    which channels appear once they are grouped by lobe.  The row for each
+    channel is therefore looked up by name, the same way STD and PTP do it
+    (see ``STD_meg_qc.assign_std_ptp_to_channels``).  Indexing by a counter
+    that restarts inside every lobe silently gives channels outside the first
+    lobe the spectrum of a different sensor, and raises IndexError whenever a
+    lobe holds more channels than were picked.
+
     Parameters
     ----------
     chs_by_lobe : dict
@@ -952,7 +961,10 @@ def assign_psds_to_channels(chs_by_lobe: dict, freqs: List, psds: List):
     freqs : List
         list of frequencies
     psds : List
-        list of psd values for each channel
+        psd values, one row per channel of ``ch_order``
+    ch_order : List, optional
+        channel names in the same order as the rows of ``psds``. If omitted,
+        the legacy positional behaviour is kept for backwards compatibility.
 
     Returns
     -------
@@ -961,8 +973,23 @@ def assign_psds_to_channels(chs_by_lobe: dict, freqs: List, psds: List):
 
     """
 
+    if ch_order is not None:
+        row_of = {name: i for i, name in enumerate(ch_order)}
+        for lobe in chs_by_lobe:
+            for ch in chs_by_lobe[lobe]:
+                row = row_of.get(ch.name)
+                if row is None or row >= len(psds):
+                    # channel was not part of the PSD picks - leave it unset
+                    # instead of raising IndexError and losing the whole metric
+                    continue
+                ch.psd = psds[row]
+                ch.freq = freqs
+        return chs_by_lobe
+
     for lobe in chs_by_lobe:
         for ch_n, ch in enumerate(chs_by_lobe[lobe]):
+            if ch_n >= len(psds):
+                continue
             ch.psd = psds[ch_n]
             ch.freq = freqs
 
@@ -1061,19 +1088,35 @@ def PSD_meg_qc(psd_params: dict, psd_params_internal: dict, channels:dict, chs_b
 
     for m_or_g in m_or_g_chosen:
 
-        psds[m_or_g], freqs[m_or_g] = raw.compute_psd(method=method, fmin=psd_params['freq_min'], fmax=fmax_safe, picks=channels[m_or_g], n_fft=nfft, n_per_seg=nperseg).get_data(return_freqs=True)
+        spectrum = raw.compute_psd(method=method, fmin=psd_params['freq_min'], fmax=fmax_safe, picks=channels[m_or_g], n_fft=nfft, n_per_seg=nperseg)
+        # compute_psd() can return fewer channels than were requested (e.g. a
+        # name in `channels` is not present in this recording, or is dropped as
+        # bad). Every consumer below indexes the psds array positionally, so
+        # they must all use the channels the spectrum actually contains -
+        # otherwise psds[ch_n] runs off the end and the whole PSD metric is lost.
+        psd_ch_names = list(spectrum.ch_names)
+        # Spectrum.get_data() drops channels marked bad unless picks are given
+        # explicitly, so the array would have fewer rows than ch_names and every
+        # positional lookup below (psds[ch_n]) would run off the end. Ask for the
+        # channels by name so rows and names always line up, and so bad channels
+        # - which a QC tool specifically wants to report on - are not silently
+        # excluded from the PSD.
+        psds[m_or_g], freqs[m_or_g] = spectrum.get_data(picks=psd_ch_names, return_freqs=True)
         psds[m_or_g]=np.sqrt(psds[m_or_g]) # amplitude of the noise in this band. without sqrt it is power.
+        if len(psd_ch_names) != len(psds[m_or_g]):
+            print(f'___MEGqc___: PSD row/name mismatch for {m_or_g}: '
+                  f'{len(psds[m_or_g])} rows vs {len(psd_ch_names)} names.')
 
         # Add psds and freqs into chs_by_lobe dict:
-        chs_by_lobe_psd[m_or_g] = assign_psds_to_channels(chs_by_lobe_psd[m_or_g], freqs[m_or_g], psds[m_or_g])
+        chs_by_lobe_psd[m_or_g] = assign_psds_to_channels(chs_by_lobe_psd[m_or_g], freqs[m_or_g], psds[m_or_g], psd_ch_names)
 
         avg_psd=np.mean(psds[m_or_g],axis=0) # average psd over all channels
-        
+
         #Calculate the amplitude of alpha, beta, etc bands for each channel + average over all channels:
-        bands_pie_df_deriv, dfs_wave_bands_ampl, mean_brain_waves_dict[m_or_g] = get_ampl_of_brain_waves(channels=channels[m_or_g], m_or_g = m_or_g, freqs = freqs[m_or_g], psds = psds[m_or_g], avg_psd=avg_psd)
+        bands_pie_df_deriv, dfs_wave_bands_ampl, mean_brain_waves_dict[m_or_g] = get_ampl_of_brain_waves(channels=psd_ch_names, m_or_g = m_or_g, freqs = freqs[m_or_g], psds = psds[m_or_g], avg_psd=avg_psd)
 
         # #Calculate noise freqs for each channel + on the average psd curve over all channels together:
-        noise_pie_derivative, noise_ampl_global[m_or_g], noise_ampl_relative_to_all_signal_global[m_or_g], noisy_freqs_global[m_or_g], noise_ampl_local[m_or_g], noise_ampl_relative_to_all_signal_local[m_or_g], noisy_freqs_local[m_or_g] = get_ampl_of_noisy_freqs(channels[m_or_g], freqs[m_or_g], avg_psd, psds[m_or_g], m_or_g, helper_plots=helper_plots, cut_noise_from_psd=False, prominence_lvl_pos_avg=prominence_lvl_pos_avg, prominence_lvl_pos_channels=prominence_lvl_pos_channels, simple_or_complex='simple')
+        noise_pie_derivative, noise_ampl_global[m_or_g], noise_ampl_relative_to_all_signal_global[m_or_g], noisy_freqs_global[m_or_g], noise_ampl_local[m_or_g], noise_ampl_relative_to_all_signal_local[m_or_g], noisy_freqs_local[m_or_g] = get_ampl_of_noisy_freqs(psd_ch_names, freqs[m_or_g], avg_psd, psds[m_or_g], m_or_g, helper_plots=helper_plots, cut_noise_from_psd=False, prominence_lvl_pos_avg=prominence_lvl_pos_avg, prominence_lvl_pos_channels=prominence_lvl_pos_channels, simple_or_complex='simple')
         
         derivs_psd += dfs_wave_bands_ampl +[noise_pie_derivative] + bands_pie_df_deriv
 
