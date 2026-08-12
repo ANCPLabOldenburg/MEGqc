@@ -145,6 +145,14 @@ class RunMetricRow:
     muscle_mean: float = np.nan
     muscle_median: float = np.nan
     muscle_p95: float = np.nan
+    # Where the ECG/EOG reference signal came from for this recording:
+    # "recorded" (a real ECG/EOG channel), "mne_reconstructed" (rebuilt by MNE
+    # from the MEG channels) or "megnet" (a synthetic component picked by
+    # MEGnet). Written per recording by the calculation module; surfaced here so
+    # dataset- and multi-dataset-level reports can show how much of their
+    # physiological QC rests on synthetic signals.
+    ecg_signal_source: str = "n/a"
+    eog_signal_source: str = "n/a"
 
 
 @dataclass
@@ -2638,6 +2646,99 @@ def _pooled_topomap_payload(
     return TopomapPayload(
         layout=SensorLayout(x=x_out, y=y_out, names=list(keep), z=z_out),
         values=vals_out,
+    )
+
+
+_SIGNAL_SOURCE_CACHE: Dict[str, str] = {}
+
+
+def _read_signal_source(tsv_path) -> str:
+    """Read the ECG/EOG provenance label from a desc-*channel TSV.
+
+    The calculation module writes ``signal_source`` on the first data row of
+    ``desc-ECGchannel``/``desc-EOGchannel`` ("recorded", "mne_reconstructed" or
+    "megnet"). Only that first row carries it, so the whole file is not needed.
+    Returns "n/a" when the file is missing or does not carry the column, which
+    is the case for outputs produced before provenance was recorded.
+    """
+    if tsv_path is None:
+        return "n/a"
+    key = str(tsv_path)
+    cached = _SIGNAL_SOURCE_CACHE.get(key)
+    if cached is not None:
+        return cached
+    value = "n/a"
+    try:
+        with open(key, "r", encoding="utf-8", errors="replace") as fh:
+            header = fh.readline().rstrip("\n").split("\t")
+            first = fh.readline().rstrip("\n").split("\t")
+        for col in ("signal_source", "recorded_or_reconstructed"):
+            if col in header:
+                idx = header.index(col)
+                if idx < len(first) and first[idx].strip():
+                    value = first[idx].strip()
+                    break
+    except Exception:
+        value = "n/a"
+    _SIGNAL_SOURCE_CACHE[key] = value
+    return value
+
+
+def megnet_provenance_summary(df: pd.DataFrame) -> Dict[str, Dict[str, int]]:
+    """Count recordings by ECG/EOG signal provenance.
+
+    Returns ``{"ECG": {source: n_recordings}, "EOG": {...}}`` counting each
+    recording once (a recording contributes one row per channel type, so rows
+    are de-duplicated on run_key first).
+    """
+    out: Dict[str, Dict[str, int]] = {"ECG": {}, "EOG": {}}
+    if df is None or df.empty:
+        return out
+    base = df.drop_duplicates(subset=["run_key"]) if "run_key" in df.columns else df
+    for label, col in (("ECG", "ecg_signal_source"), ("EOG", "eog_signal_source")):
+        if col not in base.columns:
+            continue
+        counts = base[col].astype(str).replace({"": "n/a", "None": "n/a"}).value_counts()
+        out[label] = {str(k): int(v) for k, v in counts.items() if str(k) != "n/a"}
+    return out
+
+
+def _megnet_provenance_html(df: pd.DataFrame, *, scope_label: str = "") -> str:
+    """Render the ECG/EOG provenance breakdown as a small table."""
+    summary = megnet_provenance_summary(df)
+    if not summary["ECG"] and not summary["EOG"]:
+        return ""
+    nice = {
+        "recorded": "recorded channel",
+        "mne_reconstructed": "reconstructed by MNE",
+        "megnet": "MEGnet synthetic component",
+        "correlation_megnet": "MEGnet synthetic component",
+    }
+    rows = []
+    for label in ("ECG", "EOG"):
+        counts = summary.get(label) or {}
+        if not counts:
+            continue
+        total = sum(counts.values())
+        parts = []
+        for src, n in sorted(counts.items(), key=lambda kv: -kv[1]):
+            pct = 100.0 * n / total if total else 0.0
+            parts.append(f"{nice.get(src, src)}: <strong>{n}</strong> ({pct:.0f}%)")
+        rows.append(f"<tr><td>{label}</td><td>{' &nbsp;·&nbsp; '.join(parts)}</td>"
+                    f"<td>{total}</td></tr>")
+    if not rows:
+        return ""
+    return (
+        "<section><h2>ECG/EOG signal provenance" + (f" - {scope_label}" if scope_label else "") + "</h2>"
+        "<table class='meta-table'><thead><tr><th>Metric</th>"
+        "<th>Where the reference signal came from</th><th>Recordings</th></tr></thead>"
+        "<tbody>" + "".join(rows) + "</tbody></table>"
+        "<p class='summary-shared-note'><strong>How to read this:</strong> ECG and EOG quality "
+        "metrics are computed against a reference signal. That signal is ideally a recorded "
+        "channel; when none exists MEEGqc reconstructs one from the MEG sensors, and MEGnet can "
+        "supply a synthetic component instead. Values derived from reconstructed or synthetic "
+        "references are not directly comparable with values from a recorded channel, so a dataset "
+        "dominated by one provenance should be interpreted accordingly.</p></section>"
     )
 
 
@@ -6276,6 +6377,18 @@ def _build_tab_content(tab_name: str, acc: ChTypeAccumulator, is_combined: bool)
         ("QA metrics details", _build_metric_details_section(acc, amplitude_unit=amplitude_unit, is_combined=is_combined)),
         ("Cummulative distributions", _build_statistical_appendix_section(acc, amplitude_unit=amplitude_unit, is_combined=is_combined)),
     ]
+
+    # ECG/EOG provenance for this dataset: how many recordings used a real
+    # channel, an MNE reconstruction, or a MEGnet synthetic component. The
+    # calculation module records this per recording; without surfacing it here
+    # MEGnet's contribution is invisible above the single-recording report.
+    try:
+        _prov_html = _megnet_provenance_html(_run_rows_dataframe(acc.run_rows))
+    except Exception:
+        _prov_html = ""
+    if _prov_html:
+        sections.append(("ECG/EOG signal provenance", _prov_html))
+
     group_id = f"main-{re.sub(r'[^a-z0-9]+', '-', tab_name.lower())}"
     return combined_notice + _build_subtabs_html(group_id, sections, level=1)
 
@@ -7318,6 +7431,8 @@ def _update_accumulator_for_loaded_run(
             recording=record.meta.recording,
             processing=record.meta.processing,
             channel_type=ch_type,
+            ecg_signal_source=_read_signal_source(files.get("ECGchannel")),
+            eog_signal_source=_read_signal_source(files.get("EOGchannel")),
         )
 
         if ch_type in std_data:

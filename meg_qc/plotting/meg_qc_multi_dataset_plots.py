@@ -1365,6 +1365,72 @@ def _summary_distribution_dataset_cards_html(
     )
 
 
+def _build_multi_megnet_provenance_section(
+    bundles: Sequence[SampleBundle],
+    tab_name: str,
+) -> str:
+    """Per-dataset + pooled ECG/EOG provenance for the multi-dataset report."""
+    df_all = _tab_dataframe(bundles, tab_name)
+    if df_all.empty:
+        return ""
+    if not any(c in df_all.columns for c in ("ecg_signal_source", "eog_signal_source")):
+        return ""
+
+    nice = {
+        "recorded": "recorded channel",
+        "mne_reconstructed": "reconstructed by MNE",
+        "megnet": "MEGnet synthetic",
+        "correlation_megnet": "MEGnet synthetic",
+    }
+    sources = sorted(
+        {str(v) for c in ("ecg_signal_source", "eog_signal_source") if c in df_all.columns
+         for v in df_all[c].astype(str).unique() if str(v) not in ("n/a", "", "None")}
+    )
+    if not sources:
+        return ""
+
+    def _row(label: str, dff: pd.DataFrame) -> str:
+        cells = [f"<td>{label}</td>"]
+        base = dff.drop_duplicates(subset=["run_key"]) if "run_key" in dff.columns else dff
+        for metric, col in (("ECG", "ecg_signal_source"), ("EOG", "eog_signal_source")):
+            if col not in base.columns:
+                cells.append("<td>n/a</td>")
+                continue
+            vals = base[col].astype(str)
+            vals = vals[~vals.isin(["n/a", "", "None"])]
+            total = int(vals.shape[0])
+            if total == 0:
+                cells.append("<td>n/a</td>")
+                continue
+            counts = vals.value_counts()
+            parts = [f"{nice.get(str(s), str(s))} {int(n)} ({100.0*int(n)/total:.0f}%)"
+                     for s, n in counts.items()]
+            cells.append("<td>" + " &nbsp;·&nbsp; ".join(parts) + f" <em>[n={total}]</em></td>")
+        return "<tr>" + "".join(cells) + "</tr>"
+
+    rows = [_row("<strong>All datasets</strong>", df_all)]
+    for bundle in bundles:
+        dff = df_all.loc[df_all["sample_id"].astype(str) == bundle.sample_id]
+        if dff.empty:
+            continue
+        rows.append(_row(bundle.sample_id, dff))
+
+    return (
+        "<section><h2>ECG/EOG signal provenance</h2>"
+        "<table class='meta-table'><thead><tr><th>Dataset</th>"
+        "<th>ECG reference</th><th>EOG reference</th></tr></thead><tbody>"
+        + "".join(rows) +
+        "</tbody></table>"
+        "<p class='summary-shared-note'><strong>How to read this:</strong> ECG and EOG metrics are "
+        "computed against a reference signal. Ideally that is a recorded channel; when none exists "
+        "MEEGqc reconstructs one from the MEG sensors, and MEGnet can supply a synthetic component "
+        "instead. Values computed against reconstructed or synthetic references are not directly "
+        "comparable with those from a recorded channel, so when comparing datasets check that they "
+        "share a provenance before reading anything into a difference in their ECG/EOG dots."
+        "</p></section>"
+    )
+
+
 def _build_multi_summary_distributions_section(
     bundles: Sequence[SampleBundle],
     tab_name: str,
@@ -1635,6 +1701,15 @@ def _build_tab_content(
         ("QA metrics details", details_section),
         ("Cummulative distributions", cumulative_section),
     ]
+
+    # ECG/EOG provenance: how many recordings used a real channel, an MNE
+    # reconstruction, or a MEGnet synthetic component - per dataset and pooled.
+    # Without this, MEGnet is invisible above the single-recording report even
+    # though the calculation module records it for every recording.
+    prov_html = _build_multi_megnet_provenance_section(bundles, tab_name)
+    if prov_html:
+        sections.append(("ECG/EOG signal provenance", prov_html))
+
     return _build_subtabs_html(f"multi-main-{tab_token}", sections, level=1)
 
 
