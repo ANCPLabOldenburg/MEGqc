@@ -1445,7 +1445,23 @@ def process_one_subject(
 
         # 4) ECG
         megnet_outputs_for_file = None
-        if all_qc_params['default']['run_ECG'] is True or all_qc_params['default']['run_EOG'] is True:
+        # MEGnet is an expensive extra step (ICA + inference per recording), so
+        # only run it when the ECG/EOG settings actually ask for it. Previously
+        # it ran whenever ECG or EOG was enabled, ignoring megnet_fallback,
+        # megnet_independent and megnet_optional_dependency entirely - which
+        # cost a full ICA per file even when the result was never consumed.
+        _ecg_p = all_qc_params.get('ECG', {})
+        _eog_p = all_qc_params.get('EOG', {})
+        _wants_megnet = bool(
+            (all_qc_params['default']['run_ECG'] is True
+             and (_ecg_p.get('megnet_fallback') or _ecg_p.get('megnet_independent')))
+            or (all_qc_params['default']['run_EOG'] is True
+                and (_eog_p.get('megnet_fallback') or _eog_p.get('megnet_independent')))
+        )
+        if not _wants_megnet:
+            print('___MEGqc___: MEGnet not requested by config '
+                  '(megnet_fallback/megnet_independent are off) - skipping.')
+        if _wants_megnet:
             try:
                 megnet_outputs_for_file = compute_megnet_outputs_for_file(
                     data_path=raw_cropped,

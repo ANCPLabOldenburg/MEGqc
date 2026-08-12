@@ -75,6 +75,75 @@ def _compose_megnet_signal(ica_ts: np.ndarray, comp_idx: np.ndarray, comp_probs:
     return np.sum(selected * w[:, None], axis=0)
 
 
+_MEGNET_NOTCH_PATCHED = False
+_MEGNET_CPU_SET = False
+
+
+def _patch_megnet_notch_filter() -> None:
+    """Work around an upstream MEGnet bug for 50 Hz mains data.
+
+    ``MEGnet.prep_inputs.ICA.raw_preprocess`` builds its notch frequencies as
+    ``np.arange(mains_freq, 250 * 2/3, mains_freq)`` and applies them *before*
+    resampling. For 50 Hz mains that yields 50/100/150 Hz, and 150 Hz is above
+    the Nyquist frequency of any recording sampled at 300 Hz or less, so MNE
+    raises and MEGnet is lost for that file. It happens to be safe for 60 Hz
+    mains (60/120 Hz), which is presumably why it went unnoticed upstream.
+
+    The patch drops notch frequencies at or above the current Nyquist instead
+    of failing; everything else in raw_preprocess is untouched.
+    """
+    global _MEGNET_NOTCH_PATCHED
+    if _MEGNET_NOTCH_PATCHED:
+        return
+    try:
+        from MEGnet.prep_inputs import ICA as _megnet_ica
+    except Exception:
+        return
+    original = getattr(_megnet_ica, 'raw_preprocess', None)
+    if original is None or getattr(original, '_megqc_patched', False):
+        _MEGNET_NOTCH_PATCHED = True
+        return
+
+    def raw_preprocess(raw, mains_freq=None):
+        resample_freq = 250
+        mains = int(mains_freq) if mains_freq else 50
+        notch = np.arange(mains, resample_freq * 2 / 3, mains)
+        nyquist = float(raw.info['sfreq']) / 2.0
+        safe = notch[notch < nyquist]
+        if safe.size < notch.size:
+            print(f'___MEGqc___: MEGnet notch {list(notch)} Hz exceeds Nyquist '
+                  f'{nyquist:.1f} Hz at {raw.info["sfreq"]:.0f} Hz; using {list(safe)} Hz.')
+        if safe.size:
+            raw.notch_filter(safe)
+        raw.resample(resample_freq)
+        raw.filter(1.0, 100)
+        return raw
+
+    raw_preprocess._megqc_patched = True
+    _megnet_ica.raw_preprocess = raw_preprocess
+    _MEGNET_NOTCH_PATCHED = True
+
+
+def _prefer_cpu_for_megnet() -> None:
+    """Run MEGnet inference on CPU unless the user explicitly asks for GPU.
+
+    MEEGqc is routinely run with many datasets in parallel, and each worker that
+    touches the GPU reserves memory for a model of only ~29 MB. In a 28-way run
+    that produced 44 `CUDA error: out of memory` failures. CPU inference on this
+    model is cheap and removes the contention entirely. Set
+    ``MEGQC_MEGNET_GPU=1`` to keep the GPU.
+    """
+    global _MEGNET_CPU_SET
+    if _MEGNET_CPU_SET:
+        return
+    if os.environ.get('MEGQC_MEGNET_GPU', '').strip() not in ('', '0', 'false', 'False'):
+        _MEGNET_CPU_SET = True
+        return
+    os.environ.setdefault('KERAS_BACKEND', 'torch')
+    os.environ['CUDA_VISIBLE_DEVICES'] = ''
+    _MEGNET_CPU_SET = True
+
+
 def compute_megnet_outputs_for_file(
     data_path,
     megnet_params: dict,
@@ -107,6 +176,50 @@ def compute_megnet_outputs_for_file(
         print(f'___MEGqc___: {reason}')
         result['reason'] = reason
         return result
+
+    # MEGnet needs at least one 60 s window at 250 Hz (15000 samples) to form a
+    # single classification chunk; below that its voting step stacks an empty
+    # list and raises. Recordings shorter than that - or cropped with
+    # data_crop_tmax - can never work, so say so instead of failing per file.
+    try:
+        _dur = float(raw.times[-1]) if raw is not None and len(raw.times) else 0.0
+    except Exception:
+        _dur = 0.0
+    if _dur < 60.0:
+        reason = (f'recording is {_dur:.1f} s; MEGnet needs >= 60 s '
+                  f'(15000 samples at 250 Hz) to form one chunk')
+        print(f'___MEGqc___: MEGnet skipped - {reason}')
+        result['status'] = 'skipped'
+        result['reason'] = reason
+        return result
+
+    # MEGnet ships without model weights: `pip install megnet-neuro` does not
+    # include them, they come from HuggingFace via `megnet_init`. The download
+    # lives inside _classify_ica_with_probabilities(), which runs *after*
+    # run_ica_pipeline() below - and that call raises first when the weights are
+    # absent, so the self-heal never fires. Fetch them up front instead.
+    try:
+        import MEGnet
+        from MEGnet.megnet_init import main as _megnet_init
+        _model_path = os.path.join(MEGnet.__path__[0], 'model_v2k3', 'model_v2.keras')
+        if not os.path.exists(_model_path):
+            print('___MEGqc___: MEGnet model weights missing - downloading from HuggingFace...')
+            os.environ.setdefault('KERAS_BACKEND', 'torch')
+            _megnet_init()
+        if not os.path.exists(_model_path):
+            reason = ('MEGnet model weights unavailable after megnet_init; '
+                      'run `megnet_init` manually to download them')
+            print(f'___MEGqc___: {reason}')
+            result['reason'] = reason
+            return result
+    except Exception as exc:
+        reason = f'MEGnet weight check failed: {exc}'
+        print(f'___MEGqc___: {reason}')
+        result['reason'] = reason
+        return result
+
+    _patch_megnet_notch_filter()
+    _prefer_cpu_for_megnet()
 
     print('___MEGqc___: Computing MEGnet outputs for ECG/EOG classification...')
     try:
