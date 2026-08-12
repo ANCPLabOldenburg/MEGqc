@@ -1547,6 +1547,116 @@ def plot_density_by_task(df: pd.DataFrame, title: str, x_label: str) -> Optional
     return fig
 
 
+def _plot_summary_distribution_datasets_qc(
+    df_value: pd.DataFrame,
+    *,
+    title: str,
+    y_label: str,
+    color: str = "#2A6FBB",
+) -> Optional[go.Figure]:
+    """One-panel QC distribution where each dot is one *dataset*.
+
+    The dot sits at the mean of that dataset's recording-level values, so
+    datasets compare on equal footing no matter how many recordings each
+    contributes. Mirrors the QA report's "Dataset means" tab.
+    """
+    if df_value.empty or "value" not in df_value.columns or "dataset" not in df_value.columns:
+        return None
+    work = df_value[["dataset", "value"]].copy()
+    work["value"] = pd.to_numeric(work["value"], errors="coerce")
+    work = work.loc[np.isfinite(work["value"].to_numpy(dtype=float))]
+    if work.empty:
+        return None
+
+    stats = (work.groupby(work["dataset"].astype(str))["value"]
+             .agg(["mean", "std", "count", "min", "max"]).reset_index()
+             .rename(columns={"dataset": "ds"}).sort_values("ds"))
+    vals = stats["mean"].to_numpy(dtype=float)
+    if vals.size == 0:
+        return None
+
+    hover = [
+        f"dataset={r.ds}<br>mean={r.mean:.4g}"
+        + (f"<br>sd={r.std:.4g}" if np.isfinite(r.std) else "")
+        + f"<br>n recordings={int(r.count)}<br>range=[{r.min:.4g}, {r.max:.4g}]"
+        for r in stats.itertuples()
+    ]
+    x0 = np.zeros(vals.size, dtype=float)
+    rng = np.random.default_rng(17)
+    xj = x0 + rng.uniform(-0.10, 0.10, size=vals.size)
+    codes = np.arange(vals.size, dtype=float)
+
+    fig = go.Figure()
+    if vals.size > 1:
+        fig.add_trace(go.Violin(
+            x=x0, y=vals, name=f"all datasets (n={vals.size})", box_visible=False,
+            meanline_visible=False, points=False, line={"width": 2.2, "color": color},
+            fillcolor=_hex_to_rgba(color, 0.22), opacity=0.70, width=0.78,
+            spanmode="hard", showlegend=False))
+        fig.add_trace(go.Box(
+            x=x0, y=vals, name="box", boxpoints=False,
+            line={"width": 2.2, "color": color}, marker={"color": color},
+            fillcolor="rgba(0,0,0,0)", opacity=1.0, whiskerwidth=0.95,
+            width=0.22, showlegend=False))
+    fig.add_trace(go.Scattergl(
+        x=xj, y=vals, mode="markers",
+        marker={"size": 11.0, "color": codes, "colorscale": "Turbo",
+                "cmin": float(codes.min()),
+                "cmax": float(codes.max()) if codes.size > 1 else float(codes.min()) + 1.0,
+                "opacity": 0.85, "line": {"width": 0.6, "color": "rgba(20,20,20,0.6)"},
+                "showscale": False},
+        customdata=np.stack([np.asarray(hover, dtype=object)], axis=-1),
+        hovertemplate="%{customdata[0]}<extra></extra>",
+        name="datasets", showlegend=False))
+    fig.update_layout(
+        title={"text": title, "x": 0.5}, xaxis_title="Datasets", yaxis_title=y_label,
+        template="plotly_white", margin={"l": 50, "r": 12, "t": 72, "b": 48}, height=410)
+    fig.update_xaxes(tickmode="array", tickvals=[0.0], ticktext=["all datasets"], range=[-0.55, 0.55])
+    fig.add_annotation(xref="paper", yref="paper", x=0.98, y=0.98, xanchor="right",
+                       yanchor="top", showarrow=False, text=f"N={vals.size} datasets",
+                       font={"size": 11, "color": "#2f4a68"})
+    return fig
+
+
+def _summary_distribution_dataset_grid_html(
+    df_view: pd.DataFrame,
+    *,
+    view: str,
+    summary_group_id: str,
+) -> str:
+    """Cards for the QC 'Dataset means' tab: one dot per dataset."""
+    metric_colors = {
+        "GQI": "#2A6FBB", "STD": "#2B9348", "PtP": "#E07A00",
+        "PSD": "#C23B22", "ECG": "#7B5CC4", "EOG": "#0B8F8C", "Muscle": "#8D6E63",
+    }
+    cards: List[str] = []
+    for metric_name, y_label, frame in _summary_distribution_components(df_view, view=view):
+        fig = _plot_summary_distribution_datasets_qc(
+            frame, title=metric_name, y_label=y_label,
+            color=metric_colors.get(metric_name, "#2A6FBB"))
+        if fig is None:
+            n_ds, body = 0, "<p>No dataset-level values available for this metric.</p>"
+        else:
+            n_ds = int(frame["dataset"].astype(str).nunique()) if "dataset" in frame.columns else 0
+            body = ("<div class='fig summary-strip-fig'>"
+                    + _figure_to_div(fig, include_axis_size_control=False, include_plot_controls=False)
+                    + "</div>")
+        cards.append("<div class='summary-dist-card'>"
+                     + f"<div class='summary-card-meta'>N datasets={n_ds}</div>"
+                     + body + "</div>")
+    return (
+        f"<div class='summary-dist-grid' data-summary-group='{summary_group_id}'>"
+        + "".join(cards) + "</div>"
+        + "<div class='summary-shared-note'><strong>How to interpret:</strong> "
+        "Each panel is one QC metric and <strong>one dot is one dataset</strong>: the mean over "
+        "all of that dataset's recording-level values. Hover shows the dataset id, its recording "
+        "count, the standard deviation across its recordings and their range. Violin and box "
+        "describe the spread <em>between</em> datasets, so a dot far from the bulk marks a dataset "
+        "that is unusual relative to the rest of the collection rather than to individual recordings."
+        "</div>"
+    )
+
+
 def _plot_summary_distribution_recordings_qc(
     df_value: pd.DataFrame,
     *,
@@ -2499,6 +2609,18 @@ def _build_summary_distributions_section_qc(df: pd.DataFrame, *, view: str, view
                 ),
             )
         ]
+        # One dot per dataset (mean of that dataset's recordings), so the whole
+        # collection can be compared at a glance instead of dataset-by-dataset.
+        tabs.append(
+            (
+                "Dataset means",
+                _summary_distribution_dataset_grid_html(
+                    df,
+                    view=view,
+                    summary_group_id=f"qc-summary-strip-{re.sub(r'[^a-z0-9]+','-',view_label.lower())}-datasetmeans",
+                ),
+            )
+        )
         for ds in sorted(df["dataset"].astype(str).unique()):
             ds_df = df.loc[df["dataset"].astype(str) == ds].copy()
             tabs.append(
@@ -3519,6 +3641,7 @@ def make_dataset_qc_plots_multi_meg_qc(
         return None
 
     bundles: List[QCDatasetBundle] = []
+    skipped: List[str] = []
     for ds in dataset_paths:
         try:
             bundle = _load_one_dataset_bundle(
@@ -3530,9 +3653,25 @@ def make_dataset_qc_plots_multi_meg_qc(
                 analysis_id=analysis_id,
             )
         except Exception as exc:
-            print(f"___MEGqc___: QC multi report: failed to load dataset '{ds}': {exc}")
-            return None
+            # One dataset without QC output (calculation still running, timed
+            # out, or failed) must not discard the whole comparison. Skip it,
+            # record it, and report on the rest.
+            print(f"___MEGqc___: QC multi report: skipping dataset '{ds}': {exc}")
+            skipped.append(f"{os.path.basename(str(ds).rstrip('/'))}: {exc}")
+            continue
         bundles.append(bundle)
+
+    if not bundles:
+        print("___MEGqc___: QC multi report: no dataset could be loaded; nothing to compare.")
+        return None
+    if len(bundles) < 2:
+        print(f"___MEGqc___: QC multi report: only {len(bundles)} dataset loaded "
+              f"({len(skipped)} skipped); a multi-dataset comparison needs at least 2.")
+        return None
+    if skipped:
+        print(f"___MEGqc___: QC multi report: {len(bundles)} dataset(s) included, "
+              f"{len(skipped)} skipped: {'; '.join(skipped[:5])}"
+              f"{' ...' if len(skipped) > 5 else ''}")
 
     df_all = pd.concat([b.df for b in bundles], ignore_index=True)
     names = [b.dataset_name for b in bundles]
