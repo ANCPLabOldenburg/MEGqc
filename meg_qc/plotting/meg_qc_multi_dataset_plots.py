@@ -1415,8 +1415,36 @@ def _build_multi_megnet_provenance_section(
             continue
         rows.append(_row(bundle.sample_id, dff))
 
+    # MEGnet availability across the whole collection: without this a run where
+    # MEGnet failed everywhere looks the same as one where it was never on.
+    base_all = (df_all.drop_duplicates(subset=["run_key", "sample_id"])
+                if {"run_key", "sample_id"}.issubset(df_all.columns) else df_all)
+    n_total = int(base_all.shape[0])
+    megnet_used = 0
+    for c in ("ecg_signal_source", "eog_signal_source"):
+        if c in base_all.columns:
+            megnet_used = max(
+                megnet_used,
+                int(base_all[c].astype(str).isin(["megnet", "correlation_megnet"]).sum()))
+    pct = (100.0 * megnet_used / n_total) if n_total else 0.0
+    n_ds_with = 0
+    if "sample_id" in base_all.columns:
+        for _sid, g in base_all.groupby(base_all["sample_id"].astype(str)):
+            if any(c in g.columns and g[c].astype(str).isin(["megnet", "correlation_megnet"]).any()
+                   for c in ("ecg_signal_source", "eog_signal_source")):
+                n_ds_with += 1
+    avail = (f"<p><strong>MEGnet contribution:</strong> a MEGnet-derived signal was used for "
+             f"<strong>{megnet_used}</strong> of {n_total} recordings ({pct:.0f}%), across "
+             f"<strong>{n_ds_with}</strong> of {len(bundles)} datasets. "
+             + ("MEGnet produced nothing usable in this collection - either it was disabled, its "
+                "model weights are missing (run <code>megnet_init</code>), the recordings are "
+                "shorter than 60 s, or the systems have no magnetometers."
+                if megnet_used == 0 else
+                "Recordings without it fell back to a recorded channel or an MNE reconstruction.")
+             + "</p>")
+
     return (
-        "<section><h2>ECG/EOG signal provenance</h2>"
+        "<section><h2>ECG/EOG signal provenance</h2>" + avail +
         "<table class='meta-table'><thead><tr><th>Dataset</th>"
         "<th>ECG reference</th><th>EOG reference</th></tr></thead><tbody>"
         + "".join(rows) +
