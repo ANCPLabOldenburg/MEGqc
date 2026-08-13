@@ -2538,27 +2538,76 @@ def _plot_summary_distribution_recordings(
             showlegend=False,
         )
     )
+    # For ECG/EOG panels the value depends on which reference signal was used
+    # (a recorded channel, an MNE reconstruction, or a MEGnet synthetic
+    # component). Those are not directly comparable, so mark them with distinct
+    # symbols: a reader can then see at a glance whether the MEGnet-derived
+    # points sit in a different part of the distribution. Colour still encodes
+    # subject, as before, so nothing is lost.
+    _prov_col = None
+    if value_col.startswith("ecg_"):
+        _prov_col = "ecg_signal_source"
+    elif value_col.startswith("eog_"):
+        _prov_col = "eog_signal_source"
+
+    marker = {
+        "size": 8.0,
+        "color": subject_codes,
+        "colorscale": "Turbo",
+        "cmin": _sc_min,
+        "cmax": _sc_max,
+        "opacity": 0.76,
+        "line": {"width": 0.35, "color": "rgba(20,20,20,0.5)"},
+        "showscale": False,
+    }
+    prov_labels = None
+    if _prov_col is not None and _prov_col in data.columns:
+        sym_by_source = {
+            "recorded": "circle",
+            "mne_reconstructed": "diamond",
+            "megnet": "star",
+            "correlation_megnet": "star",
+        }
+        prov_labels = data[_prov_col].astype(str).to_numpy()
+        symbols = [sym_by_source.get(s, "x-thin") for s in prov_labels]
+        if len(set(symbols)) > 1 or symbols[:1] != ["circle"]:
+            marker["symbol"] = symbols
+
+    if prov_labels is not None:
+        customdata = np.stack([hover, prov_labels], axis=-1)
+        hovertemplate = ("%{customdata[0]}<br>value=%{y:.3g}"
+                         "<br>reference: %{customdata[1]}<extra></extra>")
+    else:
+        customdata = np.stack([hover], axis=-1)
+        hovertemplate = "%{customdata[0]}<br>value=%{y:.3g}<extra></extra>"
+
     fig.add_trace(
         go.Scattergl(
             x=x_jitter,
             y=vals,
             mode="markers",
-            marker={
-                "size": 8.0,
-                "color": subject_codes,
-                "colorscale": "Turbo",
-                "cmin": _sc_min,
-                "cmax": _sc_max,
-                "opacity": 0.76,
-                "line": {"width": 0.35, "color": "rgba(20,20,20,0.5)"},
-                "showscale": False,
-            },
-            customdata=np.stack([hover], axis=-1),
-            hovertemplate="%{customdata[0]}<br>value=%{y:.3g}<extra></extra>",
+            marker=marker,
+            customdata=customdata,
+            hovertemplate=hovertemplate,
             name="recordings",
             showlegend=False,
         )
     )
+    if prov_labels is not None:
+        seen = [s for s in ("recorded", "mne_reconstructed", "megnet")
+                if s in set(prov_labels)]
+        if len(seen) > 1:
+            nice = {"recorded": "recorded channel",
+                    "mne_reconstructed": "MNE reconstruction",
+                    "megnet": "MEGnet synthetic"}
+            sym = {"recorded": "circle", "mne_reconstructed": "diamond", "megnet": "star"}
+            for s in seen:
+                fig.add_trace(go.Scatter(
+                    x=[None], y=[None], mode="markers",
+                    marker={"size": 9, "symbol": sym[s], "color": "#555"},
+                    name=nice[s], showlegend=True))
+            fig.update_layout(legend={"orientation": "h", "yanchor": "bottom",
+                                      "y": 1.02, "x": 0, "font": {"size": 10}})
     fig.update_layout(
         title={"text": title, "x": 0.5},
         xaxis_title="Recordings",
@@ -2728,8 +2777,35 @@ def _megnet_provenance_html(df: pd.DataFrame, *, scope_label: str = "") -> str:
                     f"<td>{total}</td></tr>")
     if not rows:
         return ""
+
+    # MEGnet availability line: how many recordings ended up using a MEGnet
+    # component. Without this a run where MEGnet failed on every recording
+    # looks identical in the report to one where it was never enabled.
+    base = df.drop_duplicates(subset=["run_key"]) if "run_key" in df.columns else df
+    n_rec_total = int(base.shape[0])
+    megnet_used = 0
+    for col in ("ecg_signal_source", "eog_signal_source"):
+        if col in base.columns:
+            megnet_used = max(
+                megnet_used,
+                int(base[col].astype(str).isin(["megnet", "correlation_megnet"]).sum()),
+            )
+    if n_rec_total:
+        pct = 100.0 * megnet_used / n_rec_total
+        avail = (f"<p><strong>MEGnet contribution:</strong> a MEGnet-derived signal was used for "
+                 f"<strong>{megnet_used}</strong> of {n_rec_total} recordings ({pct:.0f}%). "
+                 + ("MEGnet produced nothing usable here - either it was disabled, its model "
+                    "weights are missing (run <code>megnet_init</code>), the recordings are "
+                    "shorter than 60 s, or the system has no magnetometers."
+                    if megnet_used == 0 else
+                    "Recordings without it fell back to a recorded channel or an MNE "
+                    "reconstruction.") + "</p>")
+    else:
+        avail = ""
+
     return (
         "<section><h2>ECG/EOG signal provenance" + (f" - {scope_label}" if scope_label else "") + "</h2>"
+        + avail +
         "<table class='meta-table'><thead><tr><th>Metric</th>"
         "<th>Where the reference signal came from</th><th>Recordings</th></tr></thead>"
         "<tbody>" + "".join(rows) + "</tbody></table>"
@@ -8061,12 +8137,43 @@ def _build_accumulators_for_runs(
     return acc_by_type
 
 
+def _resolve_dataset_report_path(
+    output_report_path: Optional[str],
+    reports_dir: Path,
+    modality: str,
+    default_name: str,
+) -> Path:
+    """Where a dataset-level report should be written.
+
+    Without ``output_report_path`` the report goes next to the derivatives it
+    was built from, as before. With it, the caller decides - which is what
+    allows a report to be produced without writing into the dataset's
+    derivatives tree (read-only inputs, shared results, interim runs).
+
+    A dataset can yield both a MEG and an EEG report, so a single explicit path
+    would collide. When both exist the modality is inserted before the suffix:
+    ``report.html`` becomes ``report_meg.html`` / ``report_eeg.html``. A path
+    ending in ``/`` (or an existing directory) is treated as a directory and
+    keeps the default BIDS-style filename.
+    """
+    if not output_report_path:
+        return reports_dir / modality / default_name
+
+    p = Path(output_report_path)
+    if str(output_report_path).endswith(("/", os.sep)) or p.is_dir():
+        return p / default_name
+    if p.suffix:
+        return p.with_name(f"{p.stem}_{modality}{p.suffix}")
+    return p / default_name
+
+
 def make_dataset_plots_meg_qc(
     dataset_path: str,
     derivatives_base: Optional[str] = None,
     n_jobs: int = 1,
     analysis_mode: str = "legacy",
     analysis_id: Optional[str] = None,
+    output_report_path: Optional[str] = None,
 ) -> Dict[str, Path]:
     """Build dataset-level QA reports from saved per-run derivatives.
 
@@ -8167,9 +8274,9 @@ def make_dataset_plots_meg_qc(
             tab_accumulators=meg_accs,
             settings_snapshot=settings_snapshot,
         )
-        meg_report_dir = reports_dir / "meg"
-        meg_report_dir.mkdir(parents=True, exist_ok=True)
-        meg_path = meg_report_dir / f"desc-datasetQaReport_meg.html"
+        meg_path = _resolve_dataset_report_path(
+            output_report_path, reports_dir, "meg", "desc-datasetQaReport_meg.html")
+        meg_path.parent.mkdir(parents=True, exist_ok=True)
         meg_path.write_text(meg_html, encoding="utf-8")
         print(f"___MEGqc___:   MEG report: {meg_path}")
 
@@ -8181,9 +8288,9 @@ def make_dataset_plots_meg_qc(
             tab_accumulators={"EEG": eeg_acc},
             settings_snapshot=settings_snapshot,
         )
-        eeg_report_dir = reports_dir / "eeg"
-        eeg_report_dir.mkdir(parents=True, exist_ok=True)
-        eeg_path = eeg_report_dir / f"desc-datasetQaReport_eeg.html"
+        eeg_path = _resolve_dataset_report_path(
+            output_report_path, reports_dir, "eeg", "desc-datasetQaReport_eeg.html")
+        eeg_path.parent.mkdir(parents=True, exist_ok=True)
         eeg_path.write_text(eeg_html, encoding="utf-8")
         print(f"___MEGqc___:   EEG report: {eeg_path}")
 
@@ -8191,8 +8298,10 @@ def make_dataset_plots_meg_qc(
     meg_accs_check = {k: v for k, v in tab_accumulators.items()
                       if k in ("Combined (mag+grad)", "MAG", "GRAD")}
     if any(acc.run_count > 0 for acc in meg_accs_check.values()):
-        primary_path = reports_dir / "meg" / f"desc-datasetQaReport_meg.html"
+        primary_path = _resolve_dataset_report_path(
+            output_report_path, reports_dir, "meg", "desc-datasetQaReport_meg.html")
     else:
-        primary_path = reports_dir / "eeg" / f"desc-datasetQaReport_eeg.html"
+        primary_path = _resolve_dataset_report_path(
+            output_report_path, reports_dir, "eeg", "desc-datasetQaReport_eeg.html")
 
     return {"report": primary_path}

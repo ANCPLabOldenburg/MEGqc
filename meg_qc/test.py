@@ -339,10 +339,16 @@ def validate_plot_request(
             raise ValueError(
                 "--output_report is only allowed when exactly one plotting mode is selected."
             )
-        if qa_subject or qa_dataset:
+        if qa_subject:
             raise ValueError(
-                "--output_report is not used by --qa-subject/--qa-dataset. "
-                "Use it with --qa-multi-dataset, --qc-dataset, or --qc-multi-dataset."
+                "--output_report is not used by --qa-subject, which writes one "
+                "report per subject. Use it with --qa-dataset, "
+                "--qa-multi-dataset, --qc-dataset, or --qc-multi-dataset."
+            )
+        if qa_dataset and n_datasets != 1:
+            raise ValueError(
+                "--output_report with --qa-dataset is only supported for a "
+                "single dataset; several datasets would write to one path."
             )
         if qc_dataset and n_datasets != 1:
             raise ValueError(
@@ -483,6 +489,7 @@ def run_plotting_dispatch(
                 n_jobs=njobs,
                 analysis_mode=effective_mode,
                 analysis_id=effective_id,
+                output_report_path=output_report,
             )
 
     if modes["qa_multi_dataset"]:
