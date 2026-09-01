@@ -158,3 +158,19 @@ def test_greyout_dims_label_not_just_field(settings_dialog, qapp):
     cmb.setCurrentText("events"); qapp.processEvents()
     assert dlg.widgets[("Epoching", "event_dur")][0].isEnabled()
     assert not dlg.widgets[("Epoching", "fixed_epoch_duration")][0].isEnabled()
+
+
+
+# ── parallelism ──────────────────────────────────────────────────────────
+# The old "Hungry jobs" checkbox is gone: parallelism is per recording, so
+# --n_jobs already spreads one subject's runs across workers and there is
+# nothing left to opt into.
+
+def test_no_hungry_job_control_remains(main_window):
+    assert not hasattr(main_window, "chk_hungry_job")
+
+
+def test_calc_jobs_control_still_present(main_window):
+    """--n_jobs is now the only parallelism control, so it must stay wired."""
+    assert hasattr(main_window, "jobs")
+    assert main_window.jobs.value() >= 1

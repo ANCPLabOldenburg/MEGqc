@@ -203,6 +203,9 @@ def run_calculation_dispatch(
     processed_subjects_policy: str = "skip",
     interactive_prompts: bool = False,
     keep_temp_on_error: bool = False,
+    mem_fraction: float = 0.5,
+    mem_reserve_gb: float = 32.0,
+    assume_expansion: float = 4.0,
     logger: Callable[[str], None] = print,
 ) -> None:
     """
@@ -257,6 +260,9 @@ def run_calculation_dispatch(
             analysis_id=calc_analysis_id,
             existing_config_policy=existing_config_policy,
             processed_subjects_policy=processed_subjects_policy,
+            mem_fraction=mem_fraction,
+            mem_reserve_gb=mem_reserve_gb,
+            assume_expansion=assume_expansion,
             interactive_prompts=interactive_prompts,
             keep_temp_on_error=keep_temp_on_error,
         )
@@ -563,7 +569,7 @@ def run_megqc():
             f"--inputdata (required): one or more BIDS dataset paths.\n"
             f"--config (optional): path to a config file.\n"
             f"--subs (optional): list of subject IDs (defaults to all).\n"
-            f"--n_jobs (optional): subject-level parallel workers.\n"
+            f"--n_jobs (optional): recordings processed in parallel.\n"
             f"--derivatives_output (optional): external derivatives parent folder."
         ),
         formatter_class=argparse.RawTextHelpFormatter,
@@ -635,7 +641,7 @@ def run_megqc():
         required=False,
         default=1,
         help=(
-            "Number of subject-level parallel jobs.\n"
+            "Number of recordings processed in parallel.\n"
             "Default is 1. Use -1 to utilize all available CPU cores.\n"
             "\n"
             "⚠️ Recommendation based on system memory:\n"
@@ -688,6 +694,31 @@ def run_megqc():
         help=(
             "Policy for subjects already processed in selected profile/config: "
             "skip (default), rerun, stop."
+        ),
+    )
+    dataset_path_parser.add_argument(
+        "--mem-fraction",
+        type=float,
+        default=0.5,
+        help=(
+            "Share of currently available RAM this run may use (default 0.5). "
+            "The memory guard is always on; this only tunes it."
+        ),
+    )
+    dataset_path_parser.add_argument(
+        "--mem-reserve-gb",
+        type=float,
+        default=32.0,
+        help="RAM headroom never claimed, in GB (default 32).",
+    )
+    dataset_path_parser.add_argument(
+        "--assume-expansion",
+        type=float,
+        default=4.0,
+        help=(
+            "Assumed RAM per recording divided by its on-disk size (default 4.0, "
+            "measured on MEG FIF: int32 becomes float64 plus filtered copies). "
+            "Raise it if the guard is letting runs grow too large for your data."
         ),
     )
     dataset_path_parser.add_argument(
@@ -788,6 +819,9 @@ def run_megqc():
             analysis_id=args.analysis_id,
             existing_config_policy=args.existing_config_policy,
             processed_subjects_policy=args.processed_subjects_policy,
+            mem_fraction=getattr(args, 'mem_fraction', 0.5),
+            mem_reserve_gb=getattr(args, 'mem_reserve_gb', 32.0),
+            assume_expansion=getattr(args, 'assume_expansion', 4.0),
             interactive_prompts=False,
             keep_temp_on_error=args.keep_temp_on_error,
             qa_subject=args.qa_subject,
@@ -817,6 +851,9 @@ def run_megqc():
         analysis_id=args.analysis_id,
         existing_config_policy=args.existing_config_policy,
         processed_subjects_policy=args.processed_subjects_policy,
+        mem_fraction=getattr(args, 'mem_fraction', 0.5),
+        mem_reserve_gb=getattr(args, 'mem_reserve_gb', 32.0),
+        assume_expansion=getattr(args, 'assume_expansion', 4.0),
         interactive_prompts=False,
         keep_temp_on_error=args.keep_temp_on_error,
         logger=print,

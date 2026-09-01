@@ -1,5 +1,6 @@
 import os
 import gc
+import threading
 import io
 import re
 import ancpbids
@@ -123,6 +124,11 @@ from typing import Union, Optional, Dict, Tuple
 from contextlib import contextmanager
 
 from meg_qc.calculation.metrics.summary_report_GQI import generate_gqi_summary
+from meg_qc.calculation.resource_budget import (
+    effective_jobs, recording_size_bytes,
+    DEFAULT_EXPANSION, DEFAULT_MEM_FRACTION, DEFAULT_MEM_RESERVE_GB,
+)
+from meg_qc.calculation.recording_progress import RecordingProgress, recording_id
 
 
 # Analysis-mode names. The top-level choice is "non-profile" (write straight to
@@ -790,6 +796,28 @@ def create_config_artifact(root_folder, config_file_path: str, f_name_to_save: s
     return
 
 
+def _release_derivative(dataset, derivative) -> None:
+    """Detach a written derivative from the dataset graph.
+
+    ``create_derivative`` ends with ``target_folder.folders.append(derivative)``
+    and never checks for an existing node, so every call leaves another
+    ``MEEGqc`` folder behind. ``del derivative`` only drops the local name - the
+    graph still references the node, and each node holds that subject's whole
+    artifact tree, including the pandas objects captured by the ``content``
+    writer closures. Under ``n_jobs=1`` joblib runs subjects in-process on one
+    shared dataset, so those trees accumulate for the entire run (measured at
+    ~64 MB per subject, linear).
+
+    The node must stay attached while ``write_derivative`` runs, because
+    artifact paths resolve by walking ``parent_object_``; it is removed only
+    afterwards.
+    """
+    try:
+        dataset.derivatives.folders.remove(derivative)
+    except (AttributeError, ValueError):
+        pass
+
+
 def _already_processed_subjects(megqc_root: str) -> set:
     """Subject labels that already have calculation outputs in this approach root.
 
@@ -801,6 +829,26 @@ def _already_processed_subjects(megqc_root: str) -> set:
     companion record of processed subjects, so ``skip`` never actually skipped.
     """
     done = set()
+
+    # Preferred source: the per-recording progress record, which knows the
+    # difference between "this subject has some output" and "this subject is
+    # finished". Since derivatives are written per recording, a run killed
+    # part-way leaves output for a subject that is not done, and the old
+    # "folder holds >= 1 file" test would skip the rest of its recordings.
+    have_progress = set()
+    progress_dir = os.path.join(megqc_root, ".progress")
+    if os.path.isdir(progress_dir):
+        for entry in os.listdir(progress_dir):
+            if not (entry.startswith("sub-") and entry.endswith(".jsonl")):
+                continue
+            label = entry[len("sub-"):-len(".jsonl")]
+            have_progress.add(label)
+            if RecordingProgress(megqc_root, label).subject_complete():
+                done.add(label)
+
+    # Fallback for results produced before the progress record existed: those
+    # subjects have no manifest, so the old filesystem test still decides for
+    # them and previously completed work is not recomputed.
     calc_root = os.path.join(megqc_root, "calculation")
     if not os.path.isdir(calc_root):
         return done
@@ -811,7 +859,9 @@ def _already_processed_subjects(megqc_root: str) -> set:
         for entry in os.listdir(mod_dir):
             sub_dir = os.path.join(mod_dir, entry)
             if entry.startswith("sub-") and os.path.isdir(sub_dir) and os.listdir(sub_dir):
-                done.add(entry.split("sub-")[1].split("_")[0])
+                label = entry.split("sub-")[1].split("_")[0]
+                if label not in have_progress:
+                    done.add(label)
     return done
 
 
@@ -1191,487 +1241,524 @@ def _run_metric_safe(metric_name: str, func, *args, n_outputs: int, empty_output
         return (*empty_outputs, error_info)
 
 
-def process_one_subject(
-        sub: str,
-        dataset,
-        dataset_path: str,
-        all_qc_params: dict,
-        internal_qc_params: dict,
-        derivatives_root: str,
-        output_root: str,
-        analysis_segments: Optional[List[str]] = None,
-):
+# ---------------------------------------------------------------------------
+# Recording-level parallelism
+#
+# The unit of work is one recording, not one subject. Subjects carry wildly
+# different numbers of runs, so subject-level workers finish at very different
+# times and the tail of a run leaves most of the machine idle. An earlier design
+# patched that with an opt-in flag that lent a subject the idle slots of its
+# finished siblings. Making the recording the unit removes the problem instead
+# of managing it: a worker simply takes the next recording until there are none
+# left, so no slot is ever idle while work remains.
+#
+# That deletes the slot registry, the idle-slot accounting and the cross-process
+# claim lock, along with the class of bug they produced (a whole-machine budget
+# handed independently to every subject). --n_jobs now means exactly what it
+# says: that many recordings at once.
+#
+# Workers are processes (joblib's loky backend), not threads. Threads would put
+# every concurrent recording's preloaded data in one heap; processes keep each
+# recording's memory separate and hand it back when the worker is recycled.
+# ---------------------------------------------------------------------------
+
+#: Per-worker caches. The ancpbids dataset object is ~72 MB for ds004078 and
+#: costs ~3 s to serialise, so passing it with every recording task would spend
+#: ~38 minutes moving 52 GB on a 720-recording dataset. These functions live at
+#: module level precisely so cloudpickle ships them *by reference*: the worker
+#: keeps its globals between tasks, so each process loads the dataset once.
+_WORKER_DATASET_CACHE: dict = {}
+_WORKER_FILES_CACHE: dict = {}
+
+
+def _worker_dataset(dataset_path: str):
+    """The ancpbids dataset for this path, loaded once per worker process."""
+    ds = _WORKER_DATASET_CACHE.get(dataset_path)
+    if ds is None:
+        # Same options as the parent: lazy loading keeps the initial index
+        # cheap, which matters when every worker pays for one.
+        ds = ancpbids.load_dataset(dataset_path, DatasetOptions(lazy_loading=True))
+        _WORKER_DATASET_CACHE[dataset_path] = ds
+    return ds
+
+
+def _worker_files(dataset_path: str, sub: str, m_or_g_chosen):
+    """``(list_of_files, entities_per_file)`` for a subject, cached per worker.
+
+    Recomputed in the worker rather than shipped with the task because
+    ``entities_per_file`` holds ancpbids objects that ``create_artifact``
+    needs; the file index is what travels, and the parent verifies it still
+    refers to the same recording.
     """
-    This function processes a single subject. It contains all the code that was
-    originally inside the 'for sub in sub_list:' loop in 'make_derivative_meg_qc'.
+    key = (dataset_path, sub)
+    cached = _WORKER_FILES_CACHE.get(key)
+    if cached is None:
+        cached = get_files_list(sub, dataset_path, _worker_dataset(dataset_path),
+                                m_or_g_chosen=m_or_g_chosen)
+        _WORKER_FILES_CACHE[key] = cached
+    return cached
 
-    Parameters
-    ----------
-    sub : str
-        Single subject ID string (e.g. '009').
-    dataset : ancpbids.dataset
-        BIDS-conform dataset loaded by ancpbids.
-    dataset_path : str
-        Path to the BIDS dataset.
-    all_qc_params : dict
-        QC parameters from user config file.
-    internal_qc_params : dict
-        Internal QC parameters that users do not change.
-    derivatives_root : str
-        Path to the derivatives directory where outputs should be written.
-    output_root : str
-        Base directory used when persisting derivatives (parent of the
-        derivatives folder), allowing redirection outside the BIDS dataset.
-    analysis_segments : list of str, optional
-        Extra folder segments inserted between ``MEEGqc`` and ``calculation``.
-        In legacy mode this is ``[]``; in profile mode this is
-        ``["profiles", <analysis_id>]``.
+
+def _compute_one_recording(file_ind, data_file, *, all_qc_params,
+                           internal_qc_params, derivatives_root):
+    """Compute every metric for one recording. No shared state, no I/O to the
+    derivative tree -- the caller writes the result.
+
+    Module level rather than a closure so it can be shipped to a worker process
+    by reference: parallelism is per recording now, and cloudpickle sends a
+    function defined in an importable module without dragging its enclosing
+    scope along.
+
+    Returns a dict. ok=False means the recording could not be loaded at
+    all, and skip carries why; the caller records it so a later run retries
+    it. avg_ecg/avg_eog used to accumulate across a subject via nonlocal,
+    but nothing has read them since the aggregation was commented out, so they
+    are plain locals here.
     """
+    avg_ecg, avg_eog = [], []
 
-    # We replicate everything that was inside the loop.
+    print('___MEGqc___: ', 'Processing file: ', data_file)
 
-    # CREATE DERIVATIVE FOR THIS SUBJECT
-    derivative = dataset.create_derivative(name="MEEGqc")
-    _ensure_derivative_dataset_description_filename(derivative)
-    derivative.dataset_description.GeneratedBy.Name = "MEG QC Pipeline"
+    # Preassign strings with notes for the user (just as in your code)
+    shielding_str, m_or_g_skipped_str, epoching_str = '', '', ''
+    ecg_str, eog_str, head_str, muscle_str = '', '', '', ''
+    pp_manual_str, std_str, psd_str = '', '', ''
 
-    print('___MEGqc___: ', 'Take SUB: ', sub)
+    print('___MEGqc___: ', 'Starting initial processing...')
+    start_time = time.time()
 
-    analysis_segments = analysis_segments or []
-    # Keep derivative naming stable (MEEGqc) and insert profile folder(s)
-    # underneath it so existing desc/suffix parsing remains unchanged.
-    root_folder = derivative
-    for seg in analysis_segments:
-        root_folder = root_folder.create_folder(name=str(seg))
-
-    calculation_folder = root_folder.create_folder(name='calculation')
-    # subject_folder is created per-file inside the loop, under a modality
-    # subfolder (meg/ or eeg/) to avoid filename collisions between modalities.
-    _modality_subject_folders = {}  # cache: modality -> subject_folder (sub-XXX)
-    # cache: (modality, ses_label) -> leaf folder where the derivatives land.
-    # When a recording carries a BIDS session entity a ses-<label> level is
-    # inserted (calculation/<mod>/sub-XXX/ses-YYY) so the derivative tree
-    # mirrors the raw BIDS hierarchy (issue #132).
-    _session_target_folders = {}
-
-    # GET FILE LIST FOR THIS SUBJECT
-    list_of_files, entities_per_file = get_files_list(
-        sub, dataset_path, dataset,
-        m_or_g_chosen=all_qc_params.get('default', {}).get('m_or_g_chosen')
-    )
-
-    if not list_of_files:
-        print('___MEGqc___: ',
-              'No files to work on. Check that given subjects are present in your data set.')
-        return  # Stop if no files exist for this subject
-
-    print('___MEGqc___: ', 'list_of_files to process:', list_of_files)
-    print('___MEGqc___: ', 'entities_per_file to process:', entities_per_file)
-    print('___MEGqc___: ', 'TOTAL files to process: ', len(list_of_files))
-
-    # Keep track of all raw files processed for this subject (optional)
-    all_taken_raw_files = [os.path.basename(f) for f in list_of_files]
-
-    # Preassign in case nothing is processed
-    raw = None
-
-    # Counters, accumulators
-    counter = 0
-    avg_ecg = []
-    avg_eog = []
-    # Files that could not be loaded at all; kept across the whole subject so
-    # they survive the per-file reset of metric_errors and can be reported.
-    skipped_files = []
-
-    # LOOP OVER FIF FILES FOR THIS SUBJECT
-    for file_ind, data_file in enumerate(list_of_files):  # e.g. [0:1] in your example
-
-        print('___MEGqc___: ', 'Processing file: ', data_file)
-
-        # Preassign strings with notes for the user (just as in your code)
-        shielding_str, m_or_g_skipped_str, epoching_str = '', '', ''
-        ecg_str, eog_str, head_str, muscle_str = '', '', '', ''
-        pp_manual_str, std_str, psd_str = '', '', ''
-
-        print('___MEGqc___: ', 'Starting initial processing...')
-        start_time = time.time()
-
-        # INITIAL PROCESSING
-        # One unreadable recording must not discard the whole subject: a
-        # subject can mix modalities (e.g. readable MEG .fif plus a broken
-        # EEG .set) and everything already computed for the earlier files
-        # would otherwise be thrown away. Record the file and move on.
-        try:
-            (meg_system,
-             dict_epochs_mg,
-             chs_by_lobe,
-             channels,
-             raw_cropped_filtered,
-             raw_cropped_filtered_resampled,
-             raw_cropped,
-             raw,
-             info_derivs,
-             stim_deriv,
-             event_summary_deriv,
-             shielding_str,
-             epoching_str,
-             sensors_derivs,
-             m_or_g_chosen,
-             m_or_g_skipped_str,
-             lobes_color_coding_str,
-             resample_str) = initial_processing(
-                default_settings=all_qc_params['default'],
-                filtering_settings=all_qc_params['Filtering'],
-                epoching_params=all_qc_params['Epoching'],
-                file_path=data_file,
-                derivatives_root=derivatives_root,
-                eeg_settings=all_qc_params.get('EEG_settings'),
-            )
-        except Exception as load_exc:
-            import traceback as _tb
-            print(f'___MEGqc___: SKIPPING file (could not be loaded): '
-                  f'{os.path.basename(data_file)} -- '
-                  f'{type(load_exc).__name__}: {load_exc}')
-            skipped_files.append({
+    # INITIAL PROCESSING
+    # One unreadable recording must not discard the whole subject: a
+    # subject can mix modalities (e.g. readable MEG .fif plus a broken
+    # EEG .set) and everything already computed for the earlier files
+    # would otherwise be thrown away. Record the file and move on.
+    try:
+        (meg_system,
+         dict_epochs_mg,
+         chs_by_lobe,
+         channels,
+         raw_cropped_filtered,
+         raw_cropped_filtered_resampled,
+         raw_cropped,
+         raw,
+         info_derivs,
+         stim_deriv,
+         event_summary_deriv,
+         shielding_str,
+         epoching_str,
+         sensors_derivs,
+         m_or_g_chosen,
+         m_or_g_skipped_str,
+         lobes_color_coding_str,
+         resample_str) = initial_processing(
+            default_settings=all_qc_params['default'],
+            filtering_settings=all_qc_params['Filtering'],
+            epoching_params=all_qc_params['Epoching'],
+            file_path=data_file,
+            derivatives_root=derivatives_root,
+            eeg_settings=all_qc_params.get('EEG_settings'),
+        )
+    except Exception as load_exc:
+        import traceback as _tb
+        print(f'___MEGqc___: SKIPPING file (could not be loaded): '
+              f'{os.path.basename(data_file)} -- '
+              f'{type(load_exc).__name__}: {load_exc}')
+        return {
+            'ok': False,
+            'file_ind': file_ind,
+            'skip': {
                 'metric': 'initial_processing',
                 'file': os.path.basename(data_file),
                 'error_type': type(load_exc).__name__,
                 'error_message': str(load_exc),
                 'traceback': _tb.format_exc(),
                 'timestamp': dt.datetime.now().isoformat(timespec="seconds"),
-            })
-            continue
+            },
+        }
 
+    print('___MEGqc___: ',
+          "Finished initial processing. --- Execution %s seconds ---"
+          % (time.time() - start_time))
+
+    # PREDEFINE VARIABLES FOR QC
+    noisy_freqs_global = None
+    std_derivs, psd_derivs = [], []
+    pp_manual_derivs = []
+    ecg_derivs, eog_derivs = [], []
+    head_derivs, muscle_derivs = [], []
+    simple_metrics_psd, simple_metrics_std = [], []
+    simple_metrics_pp_manual = []
+    simple_metrics_ecg, simple_metrics_eog = [], []
+    simple_metrics_head, simple_metrics_muscle = [], []
+
+    # Collects per-metric error dicts for this file; injected into the
+    # report so users can see exactly which metric failed and why.
+    metric_errors = []
+
+    # 1) STD
+    if all_qc_params['default']['run_STD'] is True:
+        print('___MEGqc___: ', 'Starting STD...')
+        start_time = time.time()
+        std_derivs, simple_metrics_std, std_str, _err = _run_metric_safe(
+            'STD',
+            STD_meg_qc,
+            all_qc_params['STD'],
+            channels,
+            chs_by_lobe,
+            dict_epochs_mg,
+            raw_cropped_filtered_resampled,
+            m_or_g_chosen,
+            n_outputs=3,
+            empty_outputs=[[], [], '⚠ STD metric failed — see excluded_subjects_errors.json for details.'],
+        )
+        if _err:
+            metric_errors.append(_err)
+            std_str = f"⚠ STD metric failed: {_err['error_type']}: {_err['error_message']}"
         print('___MEGqc___: ',
-              "Finished initial processing. --- Execution %s seconds ---"
+              "Finished STD. --- Execution %s seconds ---"
               % (time.time() - start_time))
 
-        # PREDEFINE VARIABLES FOR QC
-        noisy_freqs_global = None
-        std_derivs, psd_derivs = [], []
-        pp_manual_derivs = []
-        ecg_derivs, eog_derivs = [], []
-        head_derivs, muscle_derivs = [], []
-        simple_metrics_psd, simple_metrics_std = [], []
-        simple_metrics_pp_manual = []
-        simple_metrics_ecg, simple_metrics_eog = [], []
-        simple_metrics_head, simple_metrics_muscle = [], []
-
-        # Collects per-metric error dicts for this file; injected into the
-        # report so users can see exactly which metric failed and why.
-        metric_errors = []
-
-        # 1) STD
-        if all_qc_params['default']['run_STD'] is True:
-            print('___MEGqc___: ', 'Starting STD...')
-            start_time = time.time()
-            std_derivs, simple_metrics_std, std_str, _err = _run_metric_safe(
-                'STD',
-                STD_meg_qc,
-                all_qc_params['STD'],
-                channels,
-                chs_by_lobe,
-                dict_epochs_mg,
-                raw_cropped_filtered_resampled,
-                m_or_g_chosen,
-                n_outputs=3,
-                empty_outputs=[[], [], '⚠ STD metric failed — see excluded_subjects_errors.json for details.'],
-            )
-            if _err:
-                metric_errors.append(_err)
-                std_str = f"⚠ STD metric failed: {_err['error_type']}: {_err['error_message']}"
-            print('___MEGqc___: ',
-                  "Finished STD. --- Execution %s seconds ---"
-                  % (time.time() - start_time))
-
-        # 2) PSD
-        if all_qc_params['default']['run_PSD'] is True:
-            print('___MEGqc___: ', 'Starting PSD...')
-            start_time = time.time()
-            psd_derivs, simple_metrics_psd, psd_str, noisy_freqs_global, _err = _run_metric_safe(
-                'PSD',
-                PSD_meg_qc,
-                all_qc_params['PSD'],
-                internal_qc_params['PSD'],
-                channels,
-                chs_by_lobe,
-                raw_cropped_filtered,
-                m_or_g_chosen,
-                n_outputs=4,
-                empty_outputs=[[], [], '⚠ PSD metric failed — see excluded_subjects_errors.json for details.', None],
-                helper_plots=False,
-            )
-            if _err:
-                metric_errors.append(_err)
-                psd_str = f"⚠ PSD metric failed: {_err['error_type']}: {_err['error_message']}"
-            print('___MEGqc___: ',
-                  "Finished PSD. --- Execution %s seconds ---"
-                  % (time.time() - start_time))
-
-        # 3) Peak-to-Peak manual
-        if all_qc_params['default']['run_PTP_manual'] is True:
-            start_time = time.time()
-
-            # choose the implementation ----------------------------------
-            if all_qc_params['PTP_manual']['numba_version'] is True and HAS_NUMBA:
-                print('___MEGqc___: ', 'Starting Peak-to-Peak manual (Numba)...')
-                func = PP_manual_meg_qc_numba  #  accelerated version
-            else:
-                if all_qc_params['PTP_manual']['numba_version'] is True and not HAS_NUMBA:
-                    print('___MEGqc___: ', 'Numba not installed – falling back to standard PtP.')
-                print('___MEGqc___: ', 'Starting Peak-to-Peak manual...')
-                func = PP_manual_meg_qc  # standard version
-            # -------------------------------------------------------------
-
-            pp_manual_derivs, simple_metrics_pp_manual, pp_manual_str, _err = _run_metric_safe(
-                'PTP_manual',
-                func,
-                all_qc_params['PTP_manual'],
-                channels,
-                chs_by_lobe,
-                dict_epochs_mg,
-                raw_cropped_filtered_resampled,
-                m_or_g_chosen,
-                n_outputs=3,
-                empty_outputs=[[], [], '⚠ PTP manual metric failed — see excluded_subjects_errors.json for details.'],
-            )
-            if _err:
-                metric_errors.append(_err)
-                pp_manual_str = f"⚠ PTP manual metric failed: {_err['error_type']}: {_err['error_message']}"
-
-            print('___MEGqc___: ',
-                  "Finished Peak-to-Peak manual. --- Execution %s seconds ---"
-                  % (time.time() - start_time))
-
-        # 4) ECG
-        megnet_outputs_for_file = None
-        # MEGnet is an expensive extra step (ICA + inference per recording), so
-        # only run it when the ECG/EOG settings actually ask for it. Previously
-        # it ran whenever ECG or EOG was enabled, ignoring megnet_fallback,
-        # megnet_independent and megnet_optional_dependency entirely - which
-        # cost a full ICA per file even when the result was never consumed.
-        _ecg_p = all_qc_params.get('ECG', {})
-        _eog_p = all_qc_params.get('EOG', {})
-        _wants_megnet = bool(
-            (all_qc_params['default']['run_ECG'] is True
-             and (_ecg_p.get('megnet_fallback') or _ecg_p.get('megnet_independent')))
-            or (all_qc_params['default']['run_EOG'] is True
-                and (_eog_p.get('megnet_fallback') or _eog_p.get('megnet_independent')))
+    # 2) PSD
+    if all_qc_params['default']['run_PSD'] is True:
+        print('___MEGqc___: ', 'Starting PSD...')
+        start_time = time.time()
+        psd_derivs, simple_metrics_psd, psd_str, noisy_freqs_global, _err = _run_metric_safe(
+            'PSD',
+            PSD_meg_qc,
+            all_qc_params['PSD'],
+            internal_qc_params['PSD'],
+            channels,
+            chs_by_lobe,
+            raw_cropped_filtered,
+            m_or_g_chosen,
+            n_outputs=4,
+            empty_outputs=[[], [], '⚠ PSD metric failed — see excluded_subjects_errors.json for details.', None],
+            helper_plots=False,
         )
-        if not _wants_megnet:
-            print('___MEGqc___: MEGnet not requested by config '
-                  '(megnet_fallback/megnet_independent are off) - skipping.')
-        if _wants_megnet:
-            try:
-                megnet_outputs_for_file = compute_megnet_outputs_for_file(
-                    data_path=raw_cropped,
-                    megnet_params=all_qc_params.get('MEGNET', {}),
-                    raw=raw_cropped if hasattr(raw_cropped, 'info') else None,
-                    derivatives_root=derivatives_root,
+        if _err:
+            metric_errors.append(_err)
+            psd_str = f"⚠ PSD metric failed: {_err['error_type']}: {_err['error_message']}"
+        print('___MEGqc___: ',
+              "Finished PSD. --- Execution %s seconds ---"
+              % (time.time() - start_time))
+
+    # 3) Peak-to-Peak manual
+    if all_qc_params['default']['run_PTP_manual'] is True:
+        start_time = time.time()
+
+        # choose the implementation ----------------------------------
+        if all_qc_params['PTP_manual']['numba_version'] is True and HAS_NUMBA:
+            print('___MEGqc___: ', 'Starting Peak-to-Peak manual (Numba)...')
+            func = PP_manual_meg_qc_numba  #  accelerated version
+        else:
+            if all_qc_params['PTP_manual']['numba_version'] is True and not HAS_NUMBA:
+                print('___MEGqc___: ', 'Numba not installed – falling back to standard PtP.')
+            print('___MEGqc___: ', 'Starting Peak-to-Peak manual...')
+            func = PP_manual_meg_qc  # standard version
+        # -------------------------------------------------------------
+
+        pp_manual_derivs, simple_metrics_pp_manual, pp_manual_str, _err = _run_metric_safe(
+            'PTP_manual',
+            func,
+            all_qc_params['PTP_manual'],
+            channels,
+            chs_by_lobe,
+            dict_epochs_mg,
+            raw_cropped_filtered_resampled,
+            m_or_g_chosen,
+            n_outputs=3,
+            empty_outputs=[[], [], '⚠ PTP manual metric failed — see excluded_subjects_errors.json for details.'],
+        )
+        if _err:
+            metric_errors.append(_err)
+            pp_manual_str = f"⚠ PTP manual metric failed: {_err['error_type']}: {_err['error_message']}"
+
+        print('___MEGqc___: ',
+              "Finished Peak-to-Peak manual. --- Execution %s seconds ---"
+              % (time.time() - start_time))
+
+    # 4) ECG
+    megnet_outputs_for_file = None
+    # MEGnet is an expensive extra step (ICA + inference per recording), so
+    # only run it when the ECG/EOG settings actually ask for it. Previously
+    # it ran whenever ECG or EOG was enabled, ignoring megnet_fallback,
+    # megnet_independent and megnet_optional_dependency entirely - which
+    # cost a full ICA per file even when the result was never consumed.
+    _ecg_p = all_qc_params.get('ECG', {})
+    _eog_p = all_qc_params.get('EOG', {})
+    _wants_megnet = bool(
+        (all_qc_params['default']['run_ECG'] is True
+         and (_ecg_p.get('megnet_fallback') or _ecg_p.get('megnet_independent')))
+        or (all_qc_params['default']['run_EOG'] is True
+            and (_eog_p.get('megnet_fallback') or _eog_p.get('megnet_independent')))
+    )
+    if not _wants_megnet:
+        print('___MEGqc___: MEGnet not requested by config '
+              '(megnet_fallback/megnet_independent are off) - skipping.')
+    if _wants_megnet:
+        try:
+            megnet_outputs_for_file = compute_megnet_outputs_for_file(
+                data_path=raw_cropped,
+                megnet_params=all_qc_params.get('MEGNET', {}),
+                raw=raw_cropped if hasattr(raw_cropped, 'info') else None,
+                derivatives_root=derivatives_root,
+            )
+        except Exception as _megnet_exc:
+            print(f'___MEGqc___: MEGnet pre-computation failed: {_megnet_exc}')
+            megnet_outputs_for_file = None
+
+    if all_qc_params['default']['run_ECG'] is True:
+        print('___MEGqc___: ', 'Starting ECG...')
+        start_time = time.time()
+        ecg_derivs, simple_metrics_ecg, ecg_str, avg_objects_ecg, _err = _run_metric_safe(
+            'ECG',
+            ECG_meg_qc,
+            all_qc_params['ECG'],
+            all_qc_params.get('MEGNET', {}),
+            internal_qc_params['ECG'],
+            raw_cropped,
+            channels,
+            chs_by_lobe,
+            m_or_g_chosen,
+            megnet_outputs=megnet_outputs_for_file,
+            n_outputs=4,
+            empty_outputs=[[], [], '⚠ ECG metric failed — see excluded_subjects_errors.json for details.', []],
+        )
+        if _err:
+            metric_errors.append(_err)
+            ecg_str = f"⚠ ECG metric failed: {_err['error_type']}: {_err['error_message']}"
+        else:
+            avg_ecg += avg_objects_ecg
+        print('___MEGqc___: ',
+              "Finished ECG. --- Execution %s seconds ---"
+              % (time.time() - start_time))
+
+
+    # 5) EOG
+    if all_qc_params['default']['run_EOG'] is True:
+        print('___MEGqc___: ', 'Starting EOG...')
+        start_time = time.time()
+        eog_derivs, simple_metrics_eog, eog_str, avg_objects_eog, _err = _run_metric_safe(
+            'EOG',
+            EOG_meg_qc,
+            all_qc_params['EOG'],
+            all_qc_params.get('MEGNET', {}),
+            internal_qc_params['EOG'],
+            raw_cropped,
+            channels,
+            chs_by_lobe,
+            m_or_g_chosen,
+            megnet_outputs=megnet_outputs_for_file,
+            n_outputs=4,
+            empty_outputs=[[], [], '⚠ EOG metric failed — see excluded_subjects_errors.json for details.', []],
+        )
+        if _err:
+            metric_errors.append(_err)
+            eog_str = f"⚠ EOG metric failed: {_err['error_type']}: {_err['error_message']}"
+        else:
+            avg_eog += avg_objects_eog
+        print('___MEGqc___: ',
+              "Finished EOG. --- Execution %s seconds ---"
+              % (time.time() - start_time))
+
+
+    # 6) Head movement artifacts
+    if all_qc_params['default']['run_Head'] is True and meg_system != 'EEG':
+        print('___MEGqc___: ', 'Starting Head movement calculation...')
+        start_time = time.time()
+        head_derivs, simple_metrics_head, head_str, df_head_pos, head_pos, _err = _run_metric_safe(
+            'Head',
+            HEAD_movement_meg_qc,
+            raw_cropped,
+            n_outputs=5,
+            empty_outputs=[[], [], '⚠ Head metric failed — see excluded_subjects_errors.json for details.', None, None],
+        )
+        if _err:
+            metric_errors.append(_err)
+            head_str = f"⚠ Head metric failed: {_err['error_type']}: {_err['error_message']}"
+        print('___MEGqc___: ',
+              "Finished Head movement calculation. --- Execution %s seconds ---"
+              % (time.time() - start_time))
+    elif all_qc_params['default']['run_Head'] is True and meg_system == 'EEG':
+        head_str = 'Head motion metric is not available for EEG data (requires MEG cHPI coils).'
+        print(f'___MEGqc___: {head_str}')
+
+    # 7) Muscle artifacts
+    if all_qc_params['default']['run_Muscle'] is True:
+        print('___MEGqc___: ', 'Starting Muscle artifacts calculation...')
+        start_time = time.time()
+        muscle_derivs, simple_metrics_muscle, muscle_str, scores_muscle_all3, _err = _run_metric_safe(
+            'Muscle',
+            MUSCLE_meg_qc,
+            all_qc_params['Muscle'],
+            all_qc_params['PSD'],
+            internal_qc_params['PSD'],
+            channels,
+            raw_cropped_filtered,
+            noisy_freqs_global,
+            m_or_g_chosen,
+            derivatives_root,
+            n_outputs=4,
+            empty_outputs=[[], [], '⚠ Muscle metric failed — see excluded_subjects_errors.json for details.', None],
+            attach_dummy=True,
+            cut_dummy=True,
+        )
+        if _err:
+            metric_errors.append(_err)
+            muscle_str = f"⚠ Muscle metric failed: {_err['error_type']}: {_err['error_message']}"
+        else:
+            # Store the total number of events analyzed so we can later express
+            # the number of detected artifacts as a percentage.  The first
+            # derivative contains a TSV table where each row corresponds to one
+            # event that was evaluated during muscle detection.
+            if muscle_derivs:
+                total_events_for_muscle = muscle_derivs[0].content.shape[0]
+                simple_metrics_muscle["total_number_of_events"] = int(
+                    total_events_for_muscle
                 )
-            except Exception as _megnet_exc:
-                print(f'___MEGqc___: MEGnet pre-computation failed: {_megnet_exc}')
-                megnet_outputs_for_file = None
+        print('___MEGqc___: ',
+              "Finished Muscle artifacts calculation. --- Execution %s seconds ---"
+              % (time.time() - start_time))
 
-        if all_qc_params['default']['run_ECG'] is True:
-            print('___MEGqc___: ', 'Starting ECG...')
-            start_time = time.time()
-            ecg_derivs, simple_metrics_ecg, ecg_str, avg_objects_ecg, _err = _run_metric_safe(
-                'ECG',
-                ECG_meg_qc,
-                all_qc_params['ECG'],
-                all_qc_params.get('MEGNET', {}),
-                internal_qc_params['ECG'],
-                raw_cropped,
-                channels,
-                chs_by_lobe,
-                m_or_g_chosen,
-                megnet_outputs=megnet_outputs_for_file,
-                n_outputs=4,
-                empty_outputs=[[], [], '⚠ ECG metric failed — see excluded_subjects_errors.json for details.', []],
-            )
-            if _err:
-                metric_errors.append(_err)
-                ecg_str = f"⚠ ECG metric failed: {_err['error_type']}: {_err['error_message']}"
-            else:
-                avg_ecg += avg_objects_ecg
-            print('___MEGqc___: ',
-                  "Finished ECG. --- Execution %s seconds ---"
-                  % (time.time() - start_time))
+    # REPORT STRINGS
+    report_strings = {
+        'INITIAL_INFO': (m_or_g_skipped_str + resample_str + epoching_str +
+                         shielding_str + lobes_color_coding_str),
+        'STD': std_str,
+        'PSD': psd_str,
+        'PTP_MANUAL': pp_manual_str,
+        'ECG': ecg_str,
+        'EOG': eog_str,
+        'HEAD': head_str,
+        'MUSCLE': muscle_str,
+        'STIMULUS': epoching_str + ('<p>If the data was cropped for this calculation, '
+                    'the stimulus data is also cropped.</p>'
+                    if all_qc_params['default'].get('crop_tmax') else '')
+    }
+
+    # Embed per-metric error summaries into the report strings so that
+    # the HTML report clearly communicates which metrics failed and why,
+    # even when the subject overall succeeded (partial failure scenario).
+    if metric_errors:
+        failed_names = ', '.join(e['metric'] for e in metric_errors)
+        report_strings['METRIC_ERRORS'] = (
+            f"⚠ {len(metric_errors)} metric(s) failed for this recording "
+            f"({failed_names}). The subject report is partial. "
+            f"Full tracebacks are in excluded_subjects_errors.json."
+        )
+
+    report_str_derivs = [QC_derivative(report_strings, 'ReportStrings', 'json')]
+
+    # ORGANIZE QC DERIVATIVES
+    QC_derivs = {
+        'Raw info': info_derivs,
+        'Stimulus channels': stim_deriv,
+        'Event summary': event_summary_deriv,
+        'Report_strings': report_str_derivs,
+        'Sensors locations': sensors_derivs,
+        'Standard deviation of the data': std_derivs,
+        'Frequency spectrum': psd_derivs,
+        'Peak-to-Peak manual': pp_manual_derivs,
+        'ECG': ecg_derivs,
+        'EOG': eog_derivs,
+        'Head movement artifacts': head_derivs,
+        'High frequency (Muscle) artifacts': muscle_derivs
+    }
+
+    QC_simple = {
+        'STD': simple_metrics_std,
+        'PSD': simple_metrics_psd,
+        'PTP_MANUAL': simple_metrics_pp_manual,
+        'ECG': simple_metrics_ecg,
+        'EOG': simple_metrics_eog,
+        'HEAD': simple_metrics_head,
+        'MUSCLE': simple_metrics_muscle
+    }
+
+    QC_derivs['Simple_metrics'] = [QC_derivative(QC_simple, 'SimpleMetrics', 'json')]
+    # CLEAN UP TEMP FILES for this recording. These are the cropped/filtered/
+    # resampled copies written to disk by initial processing; they are dead
+    # once this recording's metrics are computed.
+    try:
+        remove_fif_and_splits(raw_cropped)
+        remove_fif_and_splits(raw_cropped_filtered)
+        remove_fif_and_splits(raw_cropped_filtered_resampled)
+        gc.collect()
+        print('REMOVING TRASH: SUCCEEDED')
+    except Exception:
+        print('REMOVING TRASH: FAILED')
+
+    return {
+        'ok': True,
+        'file_ind': file_ind,
+        'metric_errors': metric_errors,
+        'QC_derivs': QC_derivs,
+        'raw': raw,
+        'meg_system': meg_system,
+    }
 
 
-        # 5) EOG
-        if all_qc_params['default']['run_EOG'] is True:
-            print('___MEGqc___: ', 'Starting EOG...')
-            start_time = time.time()
-            eog_derivs, simple_metrics_eog, eog_str, avg_objects_eog, _err = _run_metric_safe(
-                'EOG',
-                EOG_meg_qc,
-                all_qc_params['EOG'],
-                all_qc_params.get('MEGNET', {}),
-                internal_qc_params['EOG'],
-                raw_cropped,
-                channels,
-                chs_by_lobe,
-                m_or_g_chosen,
-                megnet_outputs=megnet_outputs_for_file,
-                n_outputs=4,
-                empty_outputs=[[], [], '⚠ EOG metric failed — see excluded_subjects_errors.json for details.', []],
-            )
-            if _err:
-                metric_errors.append(_err)
-                eog_str = f"⚠ EOG metric failed: {_err['error_type']}: {_err['error_message']}"
-            else:
-                avg_eog += avg_objects_eog
-            print('___MEGqc___: ',
-                  "Finished EOG. --- Execution %s seconds ---"
-                  % (time.time() - start_time))
+def _register_and_write(_res, *, dataset, sub, entities_per_file,
+                        analysis_segments, output_root):
+    """Register one recording's artifacts and write them immediately.
 
+    Each recording gets its own derivative object rather than sharing the
+    subject's. ``ancpbids.write_derivative`` emits everything reachable from
+    the folder it is handed, so a shared object would re-emit every earlier
+    recording on every write -- and, if registration ever ran concurrently,
+    could emit a half-registered recording as though it were complete.
+    A private object per recording makes that impossible by construction.
 
-        # 6) Head movement artifacts
-        if all_qc_params['default']['run_Head'] is True and meg_system != 'EEG':
-            print('___MEGqc___: ', 'Starting Head movement calculation...')
-            start_time = time.time()
-            head_derivs, simple_metrics_head, head_str, df_head_pos, head_pos, _err = _run_metric_safe(
-                'Head',
-                HEAD_movement_meg_qc,
-                raw_cropped,
-                n_outputs=5,
-                empty_outputs=[[], [], '⚠ Head metric failed — see excluded_subjects_errors.json for details.', None, None],
-            )
-            if _err:
-                metric_errors.append(_err)
-                head_str = f"⚠ Head metric failed: {_err['error_type']}: {_err['error_message']}"
-            print('___MEGqc___: ',
-                  "Finished Head movement calculation. --- Execution %s seconds ---"
-                  % (time.time() - start_time))
-        elif all_qc_params['default']['run_Head'] is True and meg_system == 'EEG':
-            head_str = 'Head motion metric is not available for EEG data (requires MEG cHPI coils).'
-            print(f'___MEGqc___: {head_str}')
+    The object is attached to the dataset graph (artifact paths resolve by
+    walking ``parent_object_``) and detached immediately after the write, so
+    the nodes do not accumulate.
 
-        # 7) Muscle artifacts
-        if all_qc_params['default']['run_Muscle'] is True:
-            print('___MEGqc___: ', 'Starting Muscle artifacts calculation...')
-            start_time = time.time()
-            muscle_derivs, simple_metrics_muscle, muscle_str, scores_muscle_all3, _err = _run_metric_safe(
-                'Muscle',
-                MUSCLE_meg_qc,
-                all_qc_params['Muscle'],
-                all_qc_params['PSD'],
-                internal_qc_params['PSD'],
-                channels,
-                raw_cropped_filtered,
-                noisy_freqs_global,
-                m_or_g_chosen,
-                derivatives_root,
-                n_outputs=4,
-                empty_outputs=[[], [], '⚠ Muscle metric failed — see excluded_subjects_errors.json for details.', None],
-                attach_dummy=True,
-                cut_dummy=True,
-            )
-            if _err:
-                metric_errors.append(_err)
-                muscle_str = f"⚠ Muscle metric failed: {_err['error_type']}: {_err['error_message']}"
-            else:
-                # Store the total number of events analyzed so we can later express
-                # the number of detected artifacts as a percentage.  The first
-                # derivative contains a TSV table where each row corresponds to one
-                # event that was evaluated during muscle detection.
-                if muscle_derivs:
-                    total_events_for_muscle = muscle_derivs[0].content.shape[0]
-                    simple_metrics_muscle["total_number_of_events"] = int(
-                        total_events_for_muscle
-                    )
-            print('___MEGqc___: ',
-                  "Finished Muscle artifacts calculation. --- Execution %s seconds ---"
-                  % (time.time() - start_time))
+    Module level so it can run in a worker process: each recording is now its
+    own task, and the worker resolves dataset from its own cache rather
+    than receiving a 72 MB object with every task.
+    """
+    counter = 0
+    file_ind = _res['file_ind']
+    QC_derivs = _res['QC_derivs']
+    meg_system = _res['meg_system']
 
-        # REPORT STRINGS
-        report_strings = {
-            'INITIAL_INFO': (m_or_g_skipped_str + resample_str + epoching_str +
-                             shielding_str + lobes_color_coding_str),
-            'STD': std_str,
-            'PSD': psd_str,
-            'PTP_MANUAL': pp_manual_str,
-            'ECG': ecg_str,
-            'EOG': eog_str,
-            'HEAD': head_str,
-            'MUSCLE': muscle_str,
-            'STIMULUS': epoching_str + ('<p>If the data was cropped for this calculation, '
-                        'the stimulus data is also cropped.</p>'
-                        if all_qc_params['default'].get('crop_tmax') else '')
-        }
+    # Determine the BIDS suffix based on the modality of the current file
+    _bids_suffix = 'eeg' if meg_system == 'EEG' else 'meg'
 
-        # Embed per-metric error summaries into the report strings so that
-        # the HTML report clearly communicates which metrics failed and why,
-        # even when the subject overall succeeded (partial failure scenario).
-        if metric_errors:
-            failed_names = ', '.join(e['metric'] for e in metric_errors)
-            report_strings['METRIC_ERRORS'] = (
-                f"⚠ {len(metric_errors)} metric(s) failed for this recording "
-                f"({failed_names}). The subject report is partial. "
-                f"Full tracebacks are in excluded_subjects_errors.json."
-            )
+    _raw_entity = entities_per_file[file_ind]
+    _raw_ents = _raw_entities(_raw_entity.get('name') if hasattr(_raw_entity, 'get') else None)
+    ses_label = _raw_ents.get('ses')
 
-        report_str_derivs = [QC_derivative(report_strings, 'ReportStrings', 'json')]
+    derivative = dataset.create_derivative(name="MEEGqc")
+    try:
+        _ensure_derivative_dataset_description_filename(derivative)
+        derivative.dataset_description.GeneratedBy.Name = "MEG QC Pipeline"
 
-        # ORGANIZE QC DERIVATIVES
-        QC_derivs = {
-            'Raw info': info_derivs,
-            'Stimulus channels': stim_deriv,
-            'Event summary': event_summary_deriv,
-            'Report_strings': report_str_derivs,
-            'Sensors locations': sensors_derivs,
-            'Standard deviation of the data': std_derivs,
-            'Frequency spectrum': psd_derivs,
-            'Peak-to-Peak manual': pp_manual_derivs,
-            'ECG': ecg_derivs,
-            'EOG': eog_derivs,
-            'Head movement artifacts': head_derivs,
-            'High frequency (Muscle) artifacts': muscle_derivs
-        }
+        # Keep derivative naming stable (MEEGqc) and insert profile
+        # folder(s) underneath it so existing desc/suffix parsing is
+        # unchanged.
+        root_folder = derivative
+        for seg in analysis_segments:
+            root_folder = root_folder.create_folder(name=str(seg))
+        calculation_folder = root_folder.create_folder(name='calculation')
 
-        QC_simple = {
-            'STD': simple_metrics_std,
-            'PSD': simple_metrics_psd,
-            'PTP_MANUAL': simple_metrics_pp_manual,
-            'ECG': simple_metrics_ecg,
-            'EOG': simple_metrics_eog,
-            'HEAD': simple_metrics_head,
-            'MUSCLE': simple_metrics_muscle
-        }
+        # calculation/<modality>/sub-XXX keeps MEG and EEG derivatives
+        # apart. Rebuilt per recording rather than cached: the folders are
+        # directory nodes, makedirs is idempotent, and a cache shared
+        # across threads would be a check-then-create race.
+        modality_folder = calculation_folder.create_folder(name=_bids_suffix)
+        subject_folder = modality_folder.create_folder(
+            type_=dataset.get_schema().Subject,
+            name='sub-' + sub,
+        )
 
-        QC_derivs['Simple_metrics'] = [QC_derivative(QC_simple, 'SimpleMetrics', 'json')]
-
-        # SAVE DERIVATIVES (EXCEPT MATPLOTLIB, PLOTLY, REPORT)
-        # Determine the BIDS suffix based on the modality of the current file
-        _bids_suffix = 'eeg' if meg_system == 'EEG' else 'meg'
-
-        # Create (or reuse) a modality subfolder: calculation/meg/sub-XXX or
-        # calculation/eeg/sub-XXX to keep MEG and EEG derivatives separate.
-        if _bids_suffix not in _modality_subject_folders:
-            modality_folder = calculation_folder.create_folder(name=_bids_suffix)
-            _modality_subject_folders[_bids_suffix] = modality_folder.create_folder(
-                type_=dataset.get_schema().Subject,
-                name='sub-' + sub,
-            )
-        subject_folder = _modality_subject_folders[_bids_suffix]
-
-        # Nest under a ses-<label> level when the recording carries a BIDS
-        # session entity, so the derivative tree mirrors sub-XXX/ses-YYY/
-        # (issue #132). Non-session recordings keep the flat sub-XXX layout.
-        _raw_entity = entities_per_file[file_ind]
-        _raw_ents = _raw_entities(_raw_entity.get('name') if hasattr(_raw_entity, 'get') else None)
-        ses_label = _raw_ents.get('ses')
-        _target_key = (_bids_suffix, ses_label)
-        if _target_key not in _session_target_folders:
-            if ses_label:
-                _session_target_folders[_target_key] = subject_folder.create_folder(
-                    name='ses-' + ses_label,
-                )
-            else:
-                _session_target_folders[_target_key] = subject_folder
-        target_folder = _session_target_folders[_target_key]
+        # Nest under ses-<label> when the recording carries a BIDS session
+        # entity, so the derivative tree mirrors sub-XXX/ses-YYY
+        # (issue #132). Non-session recordings keep the flat layout.
+        if ses_label:
+            target_folder = subject_folder.create_folder(name='ses-' + ses_label)
+        else:
+            target_folder = subject_folder
 
         for section in (sec for sec in QC_derivs.values() if sec):
             for deriv in (
@@ -1679,15 +1766,16 @@ def process_one_subject(
                     if d.content_type not in ['matplotlib', 'plotly', 'report']
             ):
                 meg_artifact = target_folder.create_artifact(raw=entities_per_file[file_ind])
-                # Re-apply the raw filename labels so ancpbids keeps run-01 as
-                # run-01 (it types index entities as int, collapsing to run-1).
+                # Re-apply the raw filename labels so ancpbids keeps run-01
+                # as run-01 (it types index entities as int, collapsing to
+                # run-1).
                 for _k, _v in _raw_ents.items():
                     meg_artifact.add_entity(_k, _v)
                 counter += 1
-                print('___MEGqc___: ', 'counter of subject_folder.create_artifact', counter)
 
-                # The metric name is already a BIDS-valid (alphanumeric) desc
-                # label by construction, so it is used directly as the file name.
+                # The metric name is already a BIDS-valid (alphanumeric)
+                # desc label by construction, so it is used directly as the
+                # file name.
                 meg_artifact.add_entity('desc', deriv.name)  # file name
                 meg_artifact.suffix = _bids_suffix
                 meg_artifact.extension = '.html'
@@ -1715,9 +1803,11 @@ def process_one_subject(
 
                 elif deriv.content_type == 'info':
                     meg_artifact.extension = '.fif'
-                    # overwrite=True so an intentional recompute (processed_subjects_policy
-                    # ='rerun') overwrites the previous RawInfo sidecar instead of crashing
-                    # with FileExistsError. The TSV/JSON writers already overwrite in place.
+                    # overwrite=True so an intentional recompute
+                    # (processed_subjects_policy='rerun') overwrites the
+                    # previous RawInfo sidecar instead of crashing with
+                    # FileExistsError. The TSV/JSON writers already
+                    # overwrite in place.
                     meg_artifact.content = lambda file_path, cont=deriv.content: mne.io.write_info(
                         file_path, cont, overwrite=True
                     )
@@ -1726,154 +1816,136 @@ def process_one_subject(
                     meg_artifact.content = 'dummy text'
                     meg_artifact.extension = '.txt'
 
-        # CLEAN UP TEMP FILES
-        try:
-            remove_fif_and_splits(raw_cropped)
-            remove_fif_and_splits(raw_cropped_filtered)
-            remove_fif_and_splits(raw_cropped_filtered_resampled)
-
-            # Delete heavy objects to free memory between files.
-            # Use a safe approach: delete only variables that exist.
-            for _varname in ('meg_system', 'dict_epochs_mg', 'chs_by_lobe',
-                             'channels', 'raw_cropped_filtered',
-                             'raw_cropped_filtered_resampled', 'raw_cropped',
-                             'info_derivs', 'stim_deriv', 'event_summary_deriv',
-                             'shielding_str', 'epoching_str', 'sensors_derivs',
-                             'm_or_g_chosen', 'm_or_g_skipped_str',
-                             'lobes_color_coding_str', 'resample_str'):
-                locals().pop(_varname, None)
-            gc.collect()
-            print('REMOVING TRASH: SUCCEEDED')
-        except Exception:
-            print('REMOVING TRASH: FAILED')
-
-    # WRITE DERIVATIVE
-    with temporary_dataset_base(dataset, output_root):
-        ancpbids.write_derivative(dataset, derivative)
-
-    # Removes intermediate trash objects — guard against NameError when no
-    # files were processed (meg_artifact would never have been assigned).
-    try:
-        del meg_artifact
-    except NameError:
-        pass
-    del derivative
-    gc.collect()
-
-    # Files skipped because they could not be loaded are reported alongside the
-    # per-metric errors, so a subject that partly succeeded still says which
-    # recordings were dropped and why.
-    try:
-        metric_errors = list(metric_errors) + skipped_files
-    except NameError:
-        metric_errors = list(skipped_files)
-
-    if skipped_files:
-        print('___MEGqc___: %d file(s) skipped for subject %s: %s'
-              % (len(skipped_files), sub,
-                 ', '.join(f['file'] for f in skipped_files)))
-
-    # Check if raw is None => means we never processed a file
-    try:
-        if raw is None:
-            print('___MEGqc___: ', 'No data files could be processed for subject:', sub)
-            return None, metric_errors
-    except Exception:
-        print('___MEGqc___: ', 'No data files could be processed for subject:', sub)
-
-    # Return raw file list plus any per-metric errors collected during processing.
-    # metric_errors is [] when all metrics succeeded.
-    return all_taken_raw_files, metric_errors
+        with temporary_dataset_base(dataset, output_root):
+            ancpbids.write_derivative(dataset, derivative)
+    finally:
+        _release_derivative(dataset, derivative)
+    return counter
 
 
-def process_one_subject_safe(
+def process_one_recording(
         sub: str,
-        dataset,
+        file_ind: int,
+        expected_file: str,
         dataset_path: str,
         all_qc_params: dict,
         internal_qc_params: dict,
         derivatives_root: str,
         output_root: str,
-        analysis_segments: Optional[List[str]] = None):
-    """Wrapper around :func:`process_one_subject` that catches errors.
+        analysis_segments: Optional[List[str]] = None,
+):
+    """Compute one recording and write its derivatives. One unit of work.
 
-    Parameters are identical to :func:`process_one_subject`.
-
-    Returns
-    -------
-    tuple
-        ``(sub, files, error_info)`` where:
-
-        * ``files`` is the list of processed raw filenames on success, or
-          ``None`` when the subject failed entirely (initial processing or
-          an unexpected error).
-        * ``error_info`` is ``None`` when the subject completed without any
-          issue.  When the subject **failed entirely**, it is a dict with
-          keys ``error_type``, ``error_message``, ``traceback``, and
-          ``timestamp``.  When the subject **completed partially** (one or
-          more metrics failed but overall processing continued), it is a dict
-          with key ``metric_errors`` containing the list of per-metric error
-          dicts — each with keys ``metric``, ``error_type``,
-          ``error_message``, ``traceback``, and ``timestamp``.
+    Everything here is scoped to a single recording: its own derivative object,
+    its own write, its own line in the progress record. Nothing is shared with
+    other recordings, so this is safe to run in as many workers as memory
+    allows and a killed run loses at most the recordings in flight.
     """
-    import traceback as _traceback
+    analysis_segments = analysis_segments or []
+    m_or_g_chosen = all_qc_params.get('default', {}).get('m_or_g_chosen')
+    list_of_files, entities_per_file = _worker_files(dataset_path, sub, m_or_g_chosen)
+
+    # The index is what travelled; make sure the worker's file list agrees with
+    # the parent's before using it to address a recording.
+    if file_ind >= len(list_of_files) or list_of_files[file_ind] != expected_file:
+        try:
+            file_ind = list_of_files.index(expected_file)
+        except ValueError:
+            return {
+                'sub': sub, 'recording': recording_id(expected_file),
+                'file': os.path.basename(str(expected_file)), 'status': 'failed',
+                'errors': [{
+                    'metric': 'file_lookup',
+                    'error_type': 'LookupError',
+                    'error_message': (
+                        f'{expected_file} is no longer listed for sub-{sub}'),
+                    'traceback': '',
+                    'timestamp': dt.datetime.utcnow().isoformat(timespec='seconds') + 'Z',
+                }],
+            }
+
+    data_file = list_of_files[file_ind]
+    progress = RecordingProgress(derivatives_root, sub)
+
+    res = _compute_one_recording(
+        file_ind, data_file,
+        all_qc_params=all_qc_params,
+        internal_qc_params=internal_qc_params,
+        derivatives_root=derivatives_root)
+
+    if not res.get('ok'):
+        skip = res.get('skip') or {}
+        progress.record(data_file, 'skipped', [skip] if skip else [])
+        return {'sub': sub, 'recording': recording_id(data_file),
+                'file': os.path.basename(str(data_file)),
+                'status': 'skipped', 'errors': [skip] if skip else []}
+
+    errors = list(res.get('metric_errors') or [])
     try:
-        result = process_one_subject(
-            sub=sub,
-            dataset=dataset,
-            dataset_path=dataset_path,
-            all_qc_params=all_qc_params,
-            internal_qc_params=internal_qc_params,
-            derivatives_root=derivatives_root,
-            output_root=output_root,
-            analysis_segments=analysis_segments,
-        )
-        # process_one_subject now returns (files, metric_errors)
-        if result is None:
-            files, metric_errors = None, []
-        else:
-            files, metric_errors = result
+        n_artifacts = _register_and_write(
+            res, dataset=_worker_dataset(dataset_path), sub=sub,
+            entities_per_file=entities_per_file,
+            analysis_segments=analysis_segments, output_root=output_root)
+    except Exception as exc:
+        import traceback as _tb
+        errors.append({
+            'metric': 'write_derivative',
+            'error_type': type(exc).__qualname__,
+            'error_message': str(exc),
+            'traceback': _tb.format_exc(),
+            'timestamp': dt.datetime.utcnow().isoformat(timespec='seconds') + 'Z',
+        })
+        # Recorded as failed, never as written: a later run must retry it.
+        progress.record(data_file, 'failed', errors)
+        print(f'___MEGqc___: Failed to write derivatives for '
+              f'{os.path.basename(str(data_file))}: {type(exc).__name__}: {exc}')
+        return {'sub': sub, 'recording': recording_id(data_file),
+                'file': os.path.basename(str(data_file)),
+                'status': 'failed', 'errors': errors}
 
-        if metric_errors:
-            # Subject succeeded overall but some metrics failed — report as
-            # partial failure so the caller can write it to the error log.
-            failed_names = ', '.join(e['metric'] for e in metric_errors)
-            print(
-                f"___MEGqc___: Subject {sub} completed with "
-                f"{len(metric_errors)} metric failure(s): {failed_names}"
-            )
-            error_info = {"metric_errors": metric_errors}
-        else:
-            error_info = None
+    # Recorded only once the artifacts are on disk, so resume never counts a
+    # recording that was not actually written.
+    progress.record(data_file, 'partial' if errors else 'ok', errors)
+    print('___MEGqc___: wrote %d artifact(s) for %s'
+          % (n_artifacts, os.path.basename(str(data_file))))
+    return {'sub': sub, 'recording': recording_id(data_file),
+            'file': os.path.basename(str(data_file)),
+            'status': 'partial' if errors else 'ok', 'errors': errors}
 
-        return sub, files, error_info
 
-    except Exception as e:  # Catch any error so the parallel job continues
-        tb_str = _traceback.format_exc()
-        error_info = {
-            "error_type": type(e).__qualname__,
-            "error_message": str(e),
-            "traceback": tb_str,
-            "timestamp": dt.datetime.utcnow().isoformat(timespec="seconds") + "Z",
+def process_one_recording_safe(**kwargs):
+    """:func:`process_one_recording` with a catch-all, so one bad recording
+    cannot take down the pool."""
+    import traceback as _tb
+    sub = kwargs.get('sub')
+    expected = kwargs.get('expected_file')
+    try:
+        return process_one_recording(**kwargs)
+    except Exception as exc:
+        info = {
+            'metric': 'process_recording',
+            'error_type': type(exc).__qualname__,
+            'error_message': str(exc),
+            'traceback': _tb.format_exc(),
+            'timestamp': dt.datetime.utcnow().isoformat(timespec='seconds') + 'Z',
         }
         try:
-            msg = (
-                f"___MEGqc___: Error processing subject {sub}:\n"
-                f"  {type(e).__name__}: {e}\n"
-                f"{tb_str}"
-            )
-            # Guard against narrow terminal encodings (e.g. cp1252 on Windows)
-            # by replacing any un-encodable character rather than crashing.
+            msg = (f'___MEGqc___: Error processing {os.path.basename(str(expected))} '
+                   f'(sub-{sub}):\n  {type(exc).__name__}: {exc}\n{info["traceback"]}')
+            # Guard against narrow terminal encodings (e.g. cp1252 on Windows).
             enc = getattr(sys.stdout, 'encoding', 'utf-8') or 'utf-8'
             print(msg.encode(enc, errors='replace').decode(enc))
         except Exception:
-            # Last-resort fallback: strip all non-ASCII characters
-            print(
-                f"___MEGqc___: Error processing subject {sub} "
-                f"(message contained un-encodable characters): "
-                f"{type(e).__name__}"
-            )
-        return sub, None, error_info
+            print(f'___MEGqc___: Error processing a recording of sub-{sub}: '
+                  f'{type(exc).__name__}')
+        try:
+            RecordingProgress(kwargs.get('derivatives_root'), sub).record(
+                expected, 'failed', [info])
+        except Exception:
+            pass
+        return {'sub': sub, 'recording': recording_id(expected or ''),
+                'file': os.path.basename(str(expected or '')),
+                'status': 'failed', 'errors': [info]}
 
 
 def _parse_count_percent(val: str):
@@ -2000,6 +2072,9 @@ def make_derivative_meg_qc(
         processed_subjects_policy: str = "skip",
         interactive_prompts: bool = False,
         keep_temp_on_error: bool = False,
+        mem_fraction: float = DEFAULT_MEM_FRACTION,
+        mem_reserve_gb: float = DEFAULT_MEM_RESERVE_GB,
+        assume_expansion: float = DEFAULT_EXPANSION,
 ):
     """Run MEGqc calculation for one or more datasets.
 
@@ -2085,66 +2160,132 @@ def make_derivative_meg_qc(
                       'them, or analysis_mode="new-profile" for a fresh profile.')
                 continue
 
-            # Parallel execution over subjects
-            # Each subject is processed by process_one_subject_safe() in parallel
-            # with n_jobs specifying how many workers to run simultaneously
-            results = Parallel(n_jobs=n_jobs)(
-                delayed(process_one_subject_safe)(
-                    sub=sub,
-                    dataset=dataset,
-                    dataset_path=dataset_path,
-                    all_qc_params=all_qc_params,
-                    internal_qc_params=internal_qc_params,
-                    derivatives_root=megqc_root,
-                    output_root=output_root,
-                    analysis_segments=analysis_segments,
+            # ---------------------------------------------------------------
+            # Build the flat work list: one item per recording, across every
+            # subject. This is the whole point of recording-level parallelism --
+            # the pool draws from a single queue, so a worker that finishes a
+            # short recording immediately picks up the next one instead of
+            # sitting idle until its subject's slowest sibling is done.
+            # ---------------------------------------------------------------
+            _m_or_g = all_qc_params.get('default', {}).get('m_or_g_chosen')
+            _work = []
+            _subject_files = {}
+            for _s in dataset_sub_list:
+                try:
+                    _files, _ = get_files_list(_s, dataset_path, dataset,
+                                               m_or_g_chosen=_m_or_g)
+                except Exception as _exc:
+                    print(f'___MEGqc___: could not list files for sub-{_s}: '
+                          f'{type(_exc).__name__}: {_exc}')
+                    continue
+                if not _files:
+                    continue
+                _subject_files[_s] = _files
+                _prog = RecordingProgress(megqc_root, _s)
+                if str(processed_subjects_policy or 'skip').strip().lower() == 'rerun':
+                    # An explicit recompute must not inherit the previous run's
+                    # record, or every recording would be skipped as done.
+                    _prog.reset()
+                _done = _prog.completed()
+                for _i, _f in enumerate(_files):
+                    if recording_id(_f) not in _done:
+                        _work.append((_s, _i, _f))
+
+            _total_recordings = sum(len(v) for v in _subject_files.values())
+            if _total_recordings and len(_work) != _total_recordings:
+                print('___MEGqc___: %d of %d recording(s) already written; '
+                      'processing the remaining %d'
+                      % (_total_recordings - len(_work), _total_recordings,
+                         len(_work)))
+
+            if not _work:
+                print('___MEGqc___: ', 'Nothing left to process for this dataset.')
+                results = []
+            else:
+                # Memory guard. With one flat pool there is a single question --
+                # how many recordings fit in RAM at once -- asked once and
+                # answered once, against the recordings actually queued rather
+                # than a per-subject stand-in. Only ever reduces, and says so.
+                _eff_jobs, _guard_note = effective_jobs(
+                    n_jobs, [_f for _, _, _f in _work],
+                    mem_fraction=mem_fraction, mem_reserve_gb=mem_reserve_gb,
+                    expansion=assume_expansion)
+                if _guard_note:
+                    print(f'___MEGqc___: {_guard_note}')
+                print('___MEGqc___: %d recording(s) over %d worker(s)'
+                      % (len(_work), _eff_jobs))
+
+                # Processes, not threads: each concurrent recording keeps its
+                # memory in its own worker and gives it back on recycle.
+                results = Parallel(n_jobs=_eff_jobs)(
+                    delayed(process_one_recording_safe)(
+                        sub=_s,
+                        file_ind=_i,
+                        expected_file=_f,
+                        dataset_path=dataset_path,
+                        all_qc_params=all_qc_params,
+                        internal_qc_params=internal_qc_params,
+                        derivatives_root=megqc_root,
+                        output_root=output_root,
+                        analysis_segments=analysis_segments,
+                    )
+                    for _s, _i, _f in _work
                 )
-                for sub in dataset_sub_list
-            )
 
-        # for sub in sub_list:
-        #     process_one_subject(
-        #         sub=sub,
-        #         dataset=dataset,
-        #         dataset_path=dataset_path,
-        #         all_qc_params=all_qc_params,
-        #         internal_qc_params=internal_qc_params
-        #     )
-        # Optionally, you can handle the returned values here, e.g.,:
-        # global_all_taken_raw_files = []
-        # global_avg_ecg = []
-        # global_avg_eog = []
-        # for res in results:
-        #     if res is not None:
-        #         taken_files, ecg_data, eog_data, raw_obj = res
-        #         global_all_taken_raw_files += taken_files
-        #         global_avg_ecg += ecg_data
-        #         global_avg_eog += eog_data
+            # ---------------------------------------------------------------
+            # Aggregate per recording results back into the per-subject shape
+            # the reporting below expects.
+            # ---------------------------------------------------------------
+            _by_subject = {}
+            for _r in results:
+                if not _r:
+                    continue
+                _by_subject.setdefault(_r['sub'], []).append(_r)
 
-            # Collect results and log subjects that failed
-            # results is a list of (sub, files, error_info) 3-tuples.
-            # files is None for total failures; error_info carries either a
-            # whole-subject error dict or {"metric_errors": [...]} for partial
-            # failures where the subject completed but some metrics did not.
-            excluded_subjects = [sub for sub, files, _err in results if files is None]
-            failed_subjects_errors = {
-                sub: err
-                for sub, files, err in results
-                if files is None and err is not None
-            }
-            # Partial failures: subject succeeded overall but ≥1 metric failed
-            partial_subjects_errors = {
-                sub: err
-                for sub, files, err in results
-                if files is not None and err is not None and "metric_errors" in err
-            }
-
-            # Save config file used for this run as a derivative:
+            excluded_subjects = []
+            failed_subjects_errors = {}
+            partial_subjects_errors = {}
             all_subs_raw_files = []
-            for sub, files, _err in results:
-                if files is not None:
-                    all_subs_raw_files.extend(files)
 
+            for _s, _files in _subject_files.items():
+                _prog = RecordingProgress(megqc_root, _s)
+                _written = _prog.completed()
+                _errors = list(_prog.errors())
+
+                if _written:
+                    all_subs_raw_files.extend(
+                        os.path.basename(_f) for _f in _files
+                        if recording_id(_f) in _written)
+
+                # A subject counts as done only when every one of its recordings
+                # was written. Recordings that failed to load or to write stay
+                # out of the record so a later run retries them.
+                if _prog.is_complete(_files):
+                    _prog.mark_complete()
+
+                if not _written:
+                    # Nothing at all was written for this subject.
+                    excluded_subjects.append(_s)
+                    if _errors:
+                        failed_subjects_errors[_s] = {
+                            'error_type': _errors[-1].get('error_type', 'Error'),
+                            'error_message': _errors[-1].get('error_message', ''),
+                            'traceback': _errors[-1].get('traceback', ''),
+                            'timestamp': _errors[-1].get('timestamp', ''),
+                        }
+                elif _errors:
+                    # Some recordings landed, some did not: report which.
+                    partial_subjects_errors[_s] = {'metric_errors': _errors}
+
+            for _s, _rs in sorted(_by_subject.items()):
+                _n_ok = sum(1 for _r in _rs if _r['status'] in ('ok', 'partial'))
+                _n_bad = len(_rs) - _n_ok
+                print('___MEGqc___: sub-%s: %d recording(s) written, %d failed/skipped'
+                      % (_s, _n_ok, _n_bad))
+
+            # Save config file used for this run as a derivative.
+            # all_subs_raw_files was built above from the progress record, which
+            # knows which recordings actually reached disk.
             derivative = dataset.create_derivative(name="MEEGqc")
             _ensure_derivative_dataset_description_filename(derivative)
             derivative.dataset_description.GeneratedBy.Name = "MEG QC Pipeline"
@@ -2157,8 +2298,11 @@ def make_derivative_meg_qc(
             create_config_artifact(root_folder, config_file_path, 'UsedSettings', all_subs_raw_files)
 
             # Write the pipeline-level derivative to disk
-            with temporary_dataset_base(dataset, output_root):
-                ancpbids.write_derivative(dataset, derivative)
+            try:
+                with temporary_dataset_base(dataset, output_root):
+                    ancpbids.write_derivative(dataset, derivative)
+            finally:
+                _release_derivative(dataset, derivative)
 
             _write_profile_manifest(
                 megqc_root=megqc_root,
