@@ -359,6 +359,103 @@ def _resolve_input_paths(
     return derivatives_root, megqc_root, tsv_path, cfg_path, resolved_attempt, reports_dir
 
 
+_PROV_ENTITY_RE = re.compile(
+    r"sub-(?P<subject>[^_]+)"
+    r"(?:_ses-(?P<session>[^_]+))?"
+    r"(?:_task-(?P<task>[^_]+))?"
+    r"(?:_run-(?P<run>[^_]+))?"
+)
+
+
+def _read_first_signal_source(path: Path) -> str:
+    """First-row ``signal_source`` from a desc-ECGchannel/EOGchannel TSV."""
+    try:
+        with open(path, "r", encoding="utf-8", errors="replace") as fh:
+            header = fh.readline().rstrip("\n").split("\t")
+            first = fh.readline().rstrip("\n").split("\t")
+        for col in ("signal_source", "recorded_or_reconstructed"):
+            if col in header:
+                i = header.index(col)
+                if i < len(first) and first[i].strip():
+                    return first[i].strip()
+    except Exception:
+        pass
+    return "n/a"
+
+
+def _attach_signal_provenance(df: pd.DataFrame, megqc_root) -> pd.DataFrame:
+    """Add ecg_signal_source / eog_signal_source to a QC table.
+
+    The QC table comes from the GQI summaries, which do not record where the
+    ECG/EOG reference signal came from. The calculation module writes that per
+    recording into desc-ECGchannel / desc-EOGchannel TSVs, so those are matched
+    back on the BIDS entities (subject, session, task, run) parsed from their
+    filenames. Recordings with no match keep "n/a", which is also what older
+    outputs produce - the column is additive and never removes rows.
+    """
+    if df is None or df.empty:
+        return df
+    for col in ("ecg_signal_source", "eog_signal_source"):
+        if col not in df.columns:
+            df[col] = "n/a"
+    calc_dir = Path(megqc_root) / "calculation"
+    if not calc_dir.is_dir():
+        return df
+
+    found: Dict[Tuple[str, str, str, str], Dict[str, str]] = {}
+    for desc, col in (("ECGchannel", "ecg_signal_source"), ("EOGchannel", "eog_signal_source")):
+        for tsv in calc_dir.rglob(f"*desc-{desc}*.tsv"):
+            m = _PROV_ENTITY_RE.search(tsv.name)
+            if not m:
+                continue
+            key = (
+                str(m.group("subject") or "n/a"),
+                str(m.group("session") or ""),
+                str(m.group("task") or ""),
+                str(m.group("run") or ""),
+            )
+            found.setdefault(key, {})[col] = _read_first_signal_source(tsv)
+    if not found:
+        return df
+
+    # The QC table does not use the same shape as the BIDS filenames:
+    #   subject is "sub-02", not "02"
+    #   there is no run column - it is folded into task as "facerecognition (run-01)"
+    # so normalise both sides to (subject, session, task, run) before matching.
+    _run_in_task = re.compile(r"\s*\(run-([^)]+)\)\s*$")
+
+    def _blank(v) -> str:
+        s = str(v or "").strip()
+        return "" if s in ("n/a", "nan", "None", "unknown", "") else s
+
+    def _key_of(row) -> Tuple[str, str, str, str]:
+        subj = _blank(row.get("subject")).removeprefix("sub-")
+        sess = _blank(row.get("session")).removeprefix("ses-")
+        task = _blank(row.get("task"))
+        run = _blank(row.get("run"))
+        m = _run_in_task.search(task)
+        if m:
+            task = _run_in_task.sub("", task).strip()
+            if not run:
+                run = m.group(1)
+        return (subj or "n/a", sess, task, run.removeprefix("run-"))
+
+    keys = df.apply(_key_of, axis=1)
+    for col in ("ecg_signal_source", "eog_signal_source"):
+        values = []
+        for k in keys:
+            hit = found.get(k)
+            if hit is None:                      # ignore session if it differs
+                hit = next((v for kk, v in found.items()
+                            if kk[0] == k[0] and kk[2] == k[2] and kk[3] == k[3]), None)
+            if hit is None:                      # last resort: subject + task
+                hit = next((v for kk, v in found.items()
+                            if kk[0] == k[0] and kk[2] == k[2]), None)
+            values.append((hit or {}).get(col, "n/a"))
+        df[col] = values
+    return df
+
+
 def _load_one_dataset_bundle(
     dataset_path: str,
     *,
@@ -418,6 +515,11 @@ def _load_one_dataset_bundle(
     dataset_name = os.path.basename(os.path.normpath(dataset_path))
     df["dataset"] = dataset_name
     df["dataset_path"] = dataset_path
+    # The QC table is built from the GQI summaries, which do not carry the
+    # ECG/EOG provenance. Join it in from the calculation derivatives so the QC
+    # report can show whether a metric rests on a recorded channel, an MNE
+    # reconstruction, or a MEGnet synthetic component.
+    df = _attach_signal_provenance(df, megqc_root)
 
     return QCDatasetBundle(
         dataset_path=dataset_path,
@@ -545,6 +647,11 @@ def _component_frame(df: pd.DataFrame, spec: ComponentSpec, view: str) -> pd.Dat
     base_cols = ["subject", "task", "task_label", "recording_label"]
     if "dataset" in df.columns:
         base_cols.append("dataset")
+    # Keep ECG/EOG provenance so the per-recording panels can mark each dot by
+    # the reference signal that produced it.
+    for _prov in ("ecg_signal_source", "eog_signal_source"):
+        if _prov in df.columns:
+            base_cols.append(_prov)
     out = df[base_cols].copy()
     out["value"] = vals
     out = out.loc[np.isfinite(out["value"])].copy()
@@ -555,6 +662,11 @@ def _summary_component_frame(df: pd.DataFrame, values: pd.Series) -> pd.DataFram
     base_cols = ["subject", "task", "task_label", "recording_label"]
     if "dataset" in df.columns:
         base_cols.append("dataset")
+    # Keep ECG/EOG provenance so the per-recording panels can mark each dot by
+    # the reference signal that produced it.
+    for _prov in ("ecg_signal_source", "eog_signal_source"):
+        if _prov in df.columns:
+            base_cols.append(_prov)
     out = df[base_cols].copy()
     out["value"] = pd.to_numeric(values, errors="coerce")
     out = out.loc[np.isfinite(out["value"])].copy()
@@ -1547,6 +1659,238 @@ def plot_density_by_task(df: pd.DataFrame, title: str, x_label: str) -> Optional
     return fig
 
 
+_QC_PROV_SYMBOL = {
+    "recorded": "circle",
+    "mne_reconstructed": "diamond",
+    "megnet": "star",
+    "correlation_megnet": "star",
+}
+_QC_PROV_NICE = {
+    "recorded": "recorded channel",
+    "mne_reconstructed": "MNE reconstruction",
+    "megnet": "MEGnet synthetic",
+}
+
+
+def _qc_prov_column_for(title: str) -> Optional[str]:
+    """Which provenance column applies to a QC panel, if any."""
+    t = (title or "").strip().upper()
+    if t == "ECG":
+        return "ecg_signal_source"
+    if t == "EOG":
+        return "eog_signal_source"
+    return None
+
+
+def _qc_marker_with_provenance(data: pd.DataFrame, title: str, marker: dict) -> dict:
+    """Mark ECG/EOG dots by which reference signal produced them.
+
+    Colour keeps encoding subject; only the symbol changes, so a reader can see
+    whether MEGnet-derived points sit apart from recorded ones. Non-ECG/EOG
+    panels are returned untouched.
+    """
+    col = _qc_prov_column_for(title)
+    if col is None or col not in data.columns:
+        return marker
+    labels = data[col].astype(str).to_numpy()
+    if len({str(x) for x in labels}) <= 1 and str(labels[0] if len(labels) else "") in ("n/a", ""):
+        return marker
+    marker = dict(marker)
+    marker["symbol"] = [_QC_PROV_SYMBOL.get(str(s), "x-thin") for s in labels]
+    return marker
+
+
+def _qc_add_provenance_legend(fig, data: pd.DataFrame, title: str) -> None:
+    """Legend explaining the ECG/EOG marker symbols, when more than one is used."""
+    col = _qc_prov_column_for(title)
+    if col is None or col not in data.columns:
+        return
+    seen = [s for s in ("recorded", "mne_reconstructed", "megnet")
+            if s in set(data[col].astype(str))]
+    if len(seen) <= 1:
+        return
+    for s in seen:
+        fig.add_trace(go.Scatter(
+            x=[None], y=[None], mode="markers",
+            marker={"size": 9, "symbol": _QC_PROV_SYMBOL[s], "color": "#555"},
+            name=_QC_PROV_NICE[s], showlegend=True))
+    fig.update_layout(legend={"orientation": "h", "yanchor": "bottom",
+                              "y": 1.02, "x": 0, "font": {"size": 10}})
+
+
+def _qc_provenance_section_html(df: pd.DataFrame, *, multi: bool) -> str:
+    """ECG/EOG provenance for the QC report (dataset or multi-dataset)."""
+    if df is None or df.empty:
+        return ""
+    cols = [c for c in ("ecg_signal_source", "eog_signal_source") if c in df.columns]
+    if not cols:
+        return ""
+    base = df.drop_duplicates(subset=["recording_label", "dataset"]) \
+        if {"recording_label", "dataset"}.issubset(df.columns) else df
+    nice = {"recorded": "recorded channel",
+            "mne_reconstructed": "reconstructed by MNE",
+            "megnet": "MEGnet synthetic",
+            "correlation_megnet": "MEGnet synthetic"}
+
+    def _cells(dff: pd.DataFrame) -> str:
+        out = []
+        for col in ("ecg_signal_source", "eog_signal_source"):
+            if col not in dff.columns:
+                out.append("<td>n/a</td>")
+                continue
+            vals = dff[col].astype(str)
+            vals = vals[~vals.isin(["n/a", "", "None", "nan"])]
+            if vals.empty:
+                out.append("<td>n/a</td>")
+                continue
+            total = int(vals.shape[0])
+            parts = [f"{nice.get(str(s), str(s))} {int(n)} ({100.0*int(n)/total:.0f}%)"
+                     for s, n in vals.value_counts().items()]
+            out.append("<td>" + " &nbsp;·&nbsp; ".join(parts) + f" <em>[n={total}]</em></td>")
+        return "".join(out)
+
+    rows = [f"<tr><td><strong>{'All datasets' if multi else 'This dataset'}</strong></td>{_cells(base)}</tr>"]
+    if multi and "dataset" in base.columns:
+        for ds in sorted(base["dataset"].astype(str).unique()):
+            rows.append(f"<tr><td>{ds}</td>{_cells(base.loc[base['dataset'].astype(str) == ds])}</tr>")
+
+    n_total = int(base.shape[0])
+    megnet_used = 0
+    for col in cols:
+        megnet_used = max(megnet_used,
+                          int(base[col].astype(str).isin(["megnet", "correlation_megnet"]).sum()))
+    pct = (100.0 * megnet_used / n_total) if n_total else 0.0
+    avail = (f"<p><strong>MEGnet contribution:</strong> a MEGnet-derived signal was used for "
+             f"<strong>{megnet_used}</strong> of {n_total} recordings ({pct:.0f}%). "
+             + ("MEGnet produced nothing usable here - either it was disabled, its model weights "
+                "are missing (run <code>megnet_init</code>), the recordings are shorter than 60 s, "
+                "or the system has no magnetometers."
+                if megnet_used == 0 else
+                "Recordings without it fell back to a recorded channel or an MNE reconstruction.")
+             + "</p>")
+
+    return (
+        "<section><h2>ECG/EOG signal provenance</h2>" + avail +
+        "<table class='meta-table'><thead><tr><th>Scope</th><th>ECG reference</th>"
+        "<th>EOG reference</th></tr></thead><tbody>" + "".join(rows) + "</tbody></table>"
+        "<p class='summary-shared-note'><strong>How to read this:</strong> ECG and EOG QC values are "
+        "computed against a reference signal - ideally a recorded channel, otherwise a reconstruction "
+        "MNE derives from the MEG sensors or a synthetic component from MEGnet. Values from different "
+        "provenances are not directly comparable, so check that datasets share a provenance before "
+        "reading anything into a difference between them.</p></section>"
+    )
+
+
+def _plot_summary_distribution_datasets_qc(
+    df_value: pd.DataFrame,
+    *,
+    title: str,
+    y_label: str,
+    color: str = "#2A6FBB",
+) -> Optional[go.Figure]:
+    """One-panel QC distribution where each dot is one *dataset*.
+
+    The dot sits at the mean of that dataset's recording-level values, so
+    datasets compare on equal footing no matter how many recordings each
+    contributes. Mirrors the QA report's "Dataset means" tab.
+    """
+    if df_value.empty or "value" not in df_value.columns or "dataset" not in df_value.columns:
+        return None
+    work = df_value[["dataset", "value"]].copy()
+    work["value"] = pd.to_numeric(work["value"], errors="coerce")
+    work = work.loc[np.isfinite(work["value"].to_numpy(dtype=float))]
+    if work.empty:
+        return None
+
+    stats = (work.groupby(work["dataset"].astype(str))["value"]
+             .agg(["mean", "std", "count", "min", "max"]).reset_index()
+             .rename(columns={"dataset": "ds"}).sort_values("ds"))
+    vals = stats["mean"].to_numpy(dtype=float)
+    if vals.size == 0:
+        return None
+
+    hover = [
+        f"dataset={r.ds}<br>mean={r.mean:.4g}"
+        + (f"<br>sd={r.std:.4g}" if np.isfinite(r.std) else "")
+        + f"<br>n recordings={int(r.count)}<br>range=[{r.min:.4g}, {r.max:.4g}]"
+        for r in stats.itertuples()
+    ]
+    x0 = np.zeros(vals.size, dtype=float)
+    rng = np.random.default_rng(17)
+    xj = x0 + rng.uniform(-0.10, 0.10, size=vals.size)
+    codes = np.arange(vals.size, dtype=float)
+
+    fig = go.Figure()
+    if vals.size > 1:
+        fig.add_trace(go.Violin(
+            x=x0, y=vals, name=f"all datasets (n={vals.size})", box_visible=False,
+            meanline_visible=False, points=False, line={"width": 2.2, "color": color},
+            fillcolor=_hex_to_rgba(color, 0.22), opacity=0.70, width=0.78,
+            spanmode="hard", showlegend=False))
+        fig.add_trace(go.Box(
+            x=x0, y=vals, name="box", boxpoints=False,
+            line={"width": 2.2, "color": color}, marker={"color": color},
+            fillcolor="rgba(0,0,0,0)", opacity=1.0, whiskerwidth=0.95,
+            width=0.22, showlegend=False))
+    fig.add_trace(go.Scattergl(
+        x=xj, y=vals, mode="markers",
+        marker={"size": 11.0, "color": codes, "colorscale": "Turbo",
+                "cmin": float(codes.min()),
+                "cmax": float(codes.max()) if codes.size > 1 else float(codes.min()) + 1.0,
+                "opacity": 0.85, "line": {"width": 0.6, "color": "rgba(20,20,20,0.6)"},
+                "showscale": False},
+        customdata=np.stack([np.asarray(hover, dtype=object)], axis=-1),
+        hovertemplate="%{customdata[0]}<extra></extra>",
+        name="datasets", showlegend=False))
+    fig.update_layout(
+        title={"text": title, "x": 0.5}, xaxis_title="Datasets", yaxis_title=y_label,
+        template="plotly_white", margin={"l": 50, "r": 12, "t": 72, "b": 48}, height=410)
+    fig.update_xaxes(tickmode="array", tickvals=[0.0], ticktext=["all datasets"], range=[-0.55, 0.55])
+    fig.add_annotation(xref="paper", yref="paper", x=0.98, y=0.98, xanchor="right",
+                       yanchor="top", showarrow=False, text=f"N={vals.size} datasets",
+                       font={"size": 11, "color": "#2f4a68"})
+    return fig
+
+
+def _summary_distribution_dataset_grid_html(
+    df_view: pd.DataFrame,
+    *,
+    view: str,
+    summary_group_id: str,
+) -> str:
+    """Cards for the QC 'Dataset means' tab: one dot per dataset."""
+    metric_colors = {
+        "GQI": "#2A6FBB", "STD": "#2B9348", "PtP": "#E07A00",
+        "PSD": "#C23B22", "ECG": "#7B5CC4", "EOG": "#0B8F8C", "Muscle": "#8D6E63",
+    }
+    cards: List[str] = []
+    for metric_name, y_label, frame in _summary_distribution_components(df_view, view=view):
+        fig = _plot_summary_distribution_datasets_qc(
+            frame, title=metric_name, y_label=y_label,
+            color=metric_colors.get(metric_name, "#2A6FBB"))
+        if fig is None:
+            n_ds, body = 0, "<p>No dataset-level values available for this metric.</p>"
+        else:
+            n_ds = int(frame["dataset"].astype(str).nunique()) if "dataset" in frame.columns else 0
+            body = ("<div class='fig summary-strip-fig'>"
+                    + _figure_to_div(fig, include_axis_size_control=False, include_plot_controls=False)
+                    + "</div>")
+        cards.append("<div class='summary-dist-card'>"
+                     + f"<div class='summary-card-meta'>N datasets={n_ds}</div>"
+                     + body + "</div>")
+    return (
+        f"<div class='summary-dist-grid' data-summary-group='{summary_group_id}'>"
+        + "".join(cards) + "</div>"
+        + "<div class='summary-shared-note'><strong>How to interpret:</strong> "
+        "Each panel is one QC metric and <strong>one dot is one dataset</strong>: the mean over "
+        "all of that dataset's recording-level values. Hover shows the dataset id, its recording "
+        "count, the standard deviation across its recordings and their range. Violin and box "
+        "describe the spread <em>between</em> datasets, so a dot far from the bulk marks a dataset "
+        "that is unusual relative to the rest of the collection rather than to individual recordings."
+        "</div>"
+    )
+
+
 def _plot_summary_distribution_recordings_qc(
     df_value: pd.DataFrame,
     *,
@@ -1623,22 +1967,26 @@ def _plot_summary_distribution_recordings_qc(
             x=xj,
             y=vals,
             mode="markers",
-            marker={
-                "size": 8.0,
-                "color": subj_codes,
-                "colorscale": "Turbo",
-                "cmin": _c_min,
-                "cmax": _c_max,
-                "opacity": 0.76,
-                "line": {"width": 0.35, "color": "rgba(20,20,20,0.5)"},
-                "showscale": False,
-            },
+            marker=_qc_marker_with_provenance(
+                data, title,
+                {
+                    "size": 8.0,
+                    "color": subj_codes,
+                    "colorscale": "Turbo",
+                    "cmin": _c_min,
+                    "cmax": _c_max,
+                    "opacity": 0.76,
+                    "line": {"width": 0.35, "color": "rgba(20,20,20,0.5)"},
+                    "showscale": False,
+                },
+            ),
             customdata=np.stack([hover], axis=-1),
             hovertemplate="%{customdata[0]}<extra></extra>",
             name="recordings",
             showlegend=False,
         )
     )
+    _qc_add_provenance_legend(fig, data, title)
     fig.update_layout(
         title={"text": title, "x": 0.5},
         xaxis_title="Recordings",
@@ -2499,6 +2847,18 @@ def _build_summary_distributions_section_qc(df: pd.DataFrame, *, view: str, view
                 ),
             )
         ]
+        # One dot per dataset (mean of that dataset's recordings), so the whole
+        # collection can be compared at a glance instead of dataset-by-dataset.
+        tabs.append(
+            (
+                "Dataset means",
+                _summary_distribution_dataset_grid_html(
+                    df,
+                    view=view,
+                    summary_group_id=f"qc-summary-strip-{re.sub(r'[^a-z0-9]+','-',view_label.lower())}-datasetmeans",
+                ),
+            )
+        )
         for ds in sorted(df["dataset"].astype(str).unique()):
             ds_df = df.loc[df["dataset"].astype(str) == ds].copy()
             tabs.append(
@@ -2595,7 +2955,12 @@ def _tab_content(
             ("Summary distributions", _build_summary_distributions_section_qc(df, view=view, view_label=top_tab)),
             ("Cohort QC overview", overview_html),
             ("QC metrics details", metrics_html),
-        ],
+        ] + (
+            [("ECG/EOG signal provenance", _prov)]
+            if (_prov := _qc_provenance_section_html(
+                df, multi=("dataset" in df.columns and df["dataset"].astype(str).nunique() > 1)))
+            else []
+        ),
         level=1,
     )
 
@@ -3371,6 +3736,31 @@ def _build_report_html(
 # ---------------------------------------------------------------------------
 
 
+def _resolve_qc_report_path(
+    output_html: Optional[str],
+    reports_dir: Path,
+    modality: str,
+    default_name: str,
+) -> Path:
+    """Where a per-modality QC dataset report should be written.
+
+    Without ``output_html`` it goes next to the derivatives, as before. With it
+    the caller decides, so a report can be produced from derivatives that are
+    read-only or shared. A dataset can yield both a MEG and an EEG report, so
+    the modality is inserted before the suffix to avoid one overwriting the
+    other; a path ending in a separator (or an existing directory) is treated
+    as a directory and keeps the default BIDS-style filename.
+    """
+    if not output_html:
+        return reports_dir / modality / default_name
+    p = Path(output_html)
+    if str(output_html).endswith(("/", os.sep)) or p.is_dir():
+        return p / default_name
+    if p.suffix:
+        return p.with_name(f"{p.stem}_{modality}{p.suffix}")
+    return p / default_name
+
+
 def make_dataset_qc_plots_meg_qc(
     dataset_path: str,
     input_tsv: Optional[str] = None,
@@ -3475,9 +3865,9 @@ def make_dataset_qc_plots_meg_qc(
             report_name=bundle.dataset_name, df=meg_df, source_rows=_common_src,
             allowed_tabs=["Combined (mag+grad)", "MAG", "GRAD"], **_common_kw,
         )
-        meg_dir = bundle.reports_dir / "meg"
-        meg_dir.mkdir(parents=True, exist_ok=True)
-        meg_path = meg_dir / f"desc-datasetQcReport{_sfx}_meg.html"
+        meg_path = _resolve_qc_report_path(
+            output_html, bundle.reports_dir, "meg", f"desc-datasetQcReport{_sfx}_meg.html")
+        meg_path.parent.mkdir(parents=True, exist_ok=True)
         meg_path.write_text(meg_html, encoding="utf-8")
         print(f"___MEGqc___:   MEG QC report: {meg_path}")
 
@@ -3489,9 +3879,9 @@ def make_dataset_qc_plots_meg_qc(
             report_name=bundle.dataset_name, df=eeg_df, source_rows=_common_src,
             allowed_tabs=["EEG"], **_common_kw,
         )
-        eeg_dir = bundle.reports_dir / "eeg"
-        eeg_dir.mkdir(parents=True, exist_ok=True)
-        eeg_path = eeg_dir / f"desc-datasetQcReport{_sfx}_eeg.html"
+        eeg_path = _resolve_qc_report_path(
+            output_html, bundle.reports_dir, "eeg", f"desc-datasetQcReport{_sfx}_eeg.html")
+        eeg_path.parent.mkdir(parents=True, exist_ok=True)
         eeg_path.write_text(eeg_html, encoding="utf-8")
         print(f"___MEGqc___:   EEG QC report: {eeg_path}")
 
@@ -3519,6 +3909,7 @@ def make_dataset_qc_plots_multi_meg_qc(
         return None
 
     bundles: List[QCDatasetBundle] = []
+    skipped: List[str] = []
     for ds in dataset_paths:
         try:
             bundle = _load_one_dataset_bundle(
@@ -3530,9 +3921,25 @@ def make_dataset_qc_plots_multi_meg_qc(
                 analysis_id=analysis_id,
             )
         except Exception as exc:
-            print(f"___MEGqc___: QC multi report: failed to load dataset '{ds}': {exc}")
-            return None
+            # One dataset without QC output (calculation still running, timed
+            # out, or failed) must not discard the whole comparison. Skip it,
+            # record it, and report on the rest.
+            print(f"___MEGqc___: QC multi report: skipping dataset '{ds}': {exc}")
+            skipped.append(f"{os.path.basename(str(ds).rstrip('/'))}: {exc}")
+            continue
         bundles.append(bundle)
+
+    if not bundles:
+        print("___MEGqc___: QC multi report: no dataset could be loaded; nothing to compare.")
+        return None
+    if len(bundles) < 2:
+        print(f"___MEGqc___: QC multi report: only {len(bundles)} dataset loaded "
+              f"({len(skipped)} skipped); a multi-dataset comparison needs at least 2.")
+        return None
+    if skipped:
+        print(f"___MEGqc___: QC multi report: {len(bundles)} dataset(s) included, "
+              f"{len(skipped)} skipped: {'; '.join(skipped[:5])}"
+              f"{' ...' if len(skipped) > 5 else ''}")
 
     df_all = pd.concat([b.df for b in bundles], ignore_index=True)
     names = [b.dataset_name for b in bundles]
@@ -3571,7 +3978,15 @@ def make_dataset_qc_plots_multi_meg_qc(
             print(f"___MEGqc___:   {b.dataset_name} -> {b.tsv_path}")
 
     # ── Per-modality separate HTML reports ──────────────────────────────
-    base_dir = bundles[0].reports_dir
+    # Per-modality reports go beside the first dataset's derivatives by default,
+    # but must follow output_report_path when the caller gave one - otherwise a
+    # run against read-only or shared derivatives still writes into them.
+    if output_report_path:
+        _orp = Path(output_report_path)
+        base_dir = _orp if (str(output_report_path).endswith(("/", os.sep)) or _orp.is_dir()) \
+            else _orp.parent
+    else:
+        base_dir = bundles[0].reports_dir
     # Generic filename (no dataset list — long names break some file systems)
     # plus the GQI attempt and a unique run id so repeated runs never collide
     # and names are identical across operating systems.

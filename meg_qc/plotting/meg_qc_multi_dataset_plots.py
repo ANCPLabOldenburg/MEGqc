@@ -44,6 +44,7 @@ from meg_qc.plotting.meg_qc_dataset_plots import (
     _figure_block,
     _finite_array,
     _heatmap_variants_by_condition_from_acc,
+    _hex_to_rgba,
     _lazy_payload_script_tags_html,
     _load_settings_snapshot,
     _make_ecdf_figure,
@@ -1172,6 +1173,292 @@ def _summary_distribution_cards_html(
     )
 
 
+def _plot_summary_distribution_datasets(
+    df: pd.DataFrame,
+    value_col: str,
+    *,
+    title: str,
+    y_label: str,
+    color: str = "#2A6FBB",
+) -> Optional["go.Figure"]:
+    """One-panel distribution where each dot is one *dataset*.
+
+    The dot is the mean of that dataset's recording-level values, so datasets
+    are comparable regardless of how many recordings each contributes. Hover
+    shows the dataset id, its recording count and the spread of its values.
+    """
+    if df.empty or value_col not in df.columns or "sample_id" not in df.columns:
+        return None
+
+    work = df[["sample_id", value_col]].copy()
+    work[value_col] = pd.to_numeric(work[value_col], errors="coerce")
+    work = work.loc[np.isfinite(work[value_col].to_numpy(dtype=float))]
+    if work.empty:
+        return None
+
+    grouped = work.groupby(work["sample_id"].astype(str))[value_col]
+    stats = grouped.agg(["mean", "std", "count", "min", "max"]).reset_index()
+    stats = stats.rename(columns={"sample_id": "dataset"}).sort_values("dataset")
+    vals = stats["mean"].to_numpy(dtype=float)
+    if vals.size == 0:
+        return None
+
+    hover = [
+        f"dataset={row.dataset}"
+        f"<br>mean={row.mean:.4g}"
+        + (f"<br>sd={row.std:.4g}" if np.isfinite(row.std) else "")
+        + f"<br>n recordings={int(row.count)}"
+        f"<br>range=[{row.min:.4g}, {row.max:.4g}]"
+        for row in stats.itertuples()
+    ]
+
+    x_center = np.zeros(vals.size, dtype=float)
+    rng = np.random.default_rng(17)
+    x_jitter = x_center + rng.uniform(-0.10, 0.10, size=vals.size)
+    ds_codes = np.arange(vals.size, dtype=float)
+    _cmin = float(ds_codes.min())
+    _cmax = float(ds_codes.max()) if ds_codes.size > 1 else _cmin + 1.0
+
+    fig = go.Figure()
+    if vals.size > 1:
+        fig.add_trace(
+            go.Violin(
+                x=x_center,
+                y=vals,
+                name=f"all datasets (n={vals.size})",
+                box_visible=False,
+                meanline_visible=False,
+                points=False,
+                line={"width": 2.2, "color": color},
+                fillcolor=_hex_to_rgba(color, 0.22),
+                opacity=0.70,
+                width=0.78,
+                spanmode="hard",
+                showlegend=False,
+            )
+        )
+        fig.add_trace(
+            go.Box(
+                x=x_center,
+                y=vals,
+                name="box",
+                boxpoints=False,
+                line={"width": 2.2, "color": color},
+                marker={"color": color},
+                fillcolor="rgba(0,0,0,0)",
+                opacity=1.0,
+                whiskerwidth=0.95,
+                width=0.22,
+                showlegend=False,
+            )
+        )
+    fig.add_trace(
+        go.Scattergl(
+            x=x_jitter,
+            y=vals,
+            mode="markers",
+            marker={
+                "size": 11.0,
+                "color": ds_codes,
+                "colorscale": "Turbo",
+                "cmin": _cmin,
+                "cmax": _cmax,
+                "opacity": 0.85,
+                "line": {"width": 0.6, "color": "rgba(20,20,20,0.6)"},
+                "showscale": False,
+            },
+            customdata=np.stack([np.asarray(hover, dtype=object)], axis=-1),
+            hovertemplate="%{customdata[0]}<extra></extra>",
+            name="datasets",
+            showlegend=False,
+        )
+    )
+    fig.update_layout(
+        title={"text": title, "x": 0.5},
+        xaxis_title="Datasets",
+        yaxis_title=y_label,
+        template="plotly_white",
+        margin={"l": 50, "r": 12, "t": 72, "b": 48},
+        height=410,
+    )
+    fig.update_xaxes(tickmode="array", tickvals=[0.0], ticktext=["all datasets"], range=[-0.55, 0.55])
+    fig.add_annotation(
+        xref="paper",
+        yref="paper",
+        x=0.98,
+        y=0.98,
+        xanchor="right",
+        yanchor="top",
+        showarrow=False,
+        text=f"N={vals.size} datasets",
+        font={"size": 11, "color": "#2f4a68"},
+    )
+    return fig
+
+
+def _summary_distribution_dataset_cards_html(
+    df: pd.DataFrame,
+    *,
+    amplitude_unit: str,
+    summary_group_id: str,
+) -> str:
+    """Cards for the 'Dataset means' tab: one dot per dataset."""
+    metric_defs = [
+        ("STD", "std_mean", f"STD ({amplitude_unit})", "#2A6FBB"),
+        ("PtP", "ptp_mean", f"PtP ({amplitude_unit})", "#2B9348"),
+        ("PSD", "mains_ratio", "Mains relative power", "#E07A00"),
+        ("ECG", "ecg_mean_abs_corr", "ECG |r| mean", "#C23B22"),
+        ("EOG", "eog_mean_abs_corr", "EOG |r| mean", "#7B5CC4"),
+        ("Muscle", "muscle_mean", "Muscle mean score", "#0B8F8C"),
+    ]
+
+    def _cards_for(defs: Sequence[Tuple[str, str, str, str]]) -> str:
+        cards: List[str] = []
+        for metric_name, col, y_label, color in defs:
+            fig = _plot_summary_distribution_datasets(
+                df, col, title=metric_name, y_label=y_label, color=color
+            )
+            if fig is None:
+                n_ds = 0
+                body = "<p>No dataset-level values available for this metric.</p>"
+            else:
+                sub = df[["sample_id", col]].copy() if col in df.columns else pd.DataFrame()
+                if sub.empty:
+                    n_ds = 0
+                else:
+                    sub[col] = pd.to_numeric(sub[col], errors="coerce")
+                    sub = sub.loc[np.isfinite(sub[col].to_numpy(dtype=float))]
+                    n_ds = int(sub["sample_id"].astype(str).nunique())
+                body = (
+                    "<div class='fig summary-strip-fig'>"
+                    + _figure_to_div(fig, include_axis_size_control=False, include_plot_controls=False)
+                    + "</div>"
+                )
+            cards.append(
+                "<div class='summary-dist-card'>"
+                + f"<div class='summary-card-meta'>N datasets={n_ds}</div>"
+                + body
+                + "</div>"
+            )
+        return f"<div class='summary-dist-grid' data-summary-group='{summary_group_id}'>" + "".join(cards) + "</div>"
+
+    return (
+        "<div class='summary-category-block'>"
+        "<h3>Environmental/Hardware noise</h3>"
+        + _cards_for(metric_defs[:3])
+        + "</div>"
+        "<div class='summary-category-block'>"
+        "<h3>Physiological noise</h3>"
+        + _cards_for(metric_defs[3:])
+        + "</div>"
+        + (
+            "<div class='summary-shared-note'><strong>How to interpret:</strong> "
+            "Each panel is one metric and <strong>one dot is one dataset</strong>: the mean over all of that "
+            "dataset's recording-level summaries. Hover shows the dataset id, its recording count, the "
+            "standard deviation across its recordings and their range. Violin + box describe the spread "
+            "<em>between</em> datasets, so a dataset sitting far from the bulk is an outlier relative to the "
+            "rest of the collection rather than to individual recordings. "
+            "Units: STD/PtP use amplitude units shown on each y-axis, PSD is mains relative power, "
+            "ECG/EOG are |r| magnitudes, and Muscle is score."
+            "</div>"
+        )
+    )
+
+
+def _build_multi_megnet_provenance_section(
+    bundles: Sequence[SampleBundle],
+    tab_name: str,
+) -> str:
+    """Per-dataset + pooled ECG/EOG provenance for the multi-dataset report."""
+    df_all = _tab_dataframe(bundles, tab_name)
+    if df_all.empty:
+        return ""
+    if not any(c in df_all.columns for c in ("ecg_signal_source", "eog_signal_source")):
+        return ""
+
+    nice = {
+        "recorded": "recorded channel",
+        "mne_reconstructed": "reconstructed by MNE",
+        "megnet": "MEGnet synthetic",
+        "correlation_megnet": "MEGnet synthetic",
+    }
+    sources = sorted(
+        {str(v) for c in ("ecg_signal_source", "eog_signal_source") if c in df_all.columns
+         for v in df_all[c].astype(str).unique() if str(v) not in ("n/a", "", "None")}
+    )
+    if not sources:
+        return ""
+
+    def _row(label: str, dff: pd.DataFrame) -> str:
+        cells = [f"<td>{label}</td>"]
+        base = dff.drop_duplicates(subset=["run_key"]) if "run_key" in dff.columns else dff
+        for metric, col in (("ECG", "ecg_signal_source"), ("EOG", "eog_signal_source")):
+            if col not in base.columns:
+                cells.append("<td>n/a</td>")
+                continue
+            vals = base[col].astype(str)
+            vals = vals[~vals.isin(["n/a", "", "None"])]
+            total = int(vals.shape[0])
+            if total == 0:
+                cells.append("<td>n/a</td>")
+                continue
+            counts = vals.value_counts()
+            parts = [f"{nice.get(str(s), str(s))} {int(n)} ({100.0*int(n)/total:.0f}%)"
+                     for s, n in counts.items()]
+            cells.append("<td>" + " &nbsp;·&nbsp; ".join(parts) + f" <em>[n={total}]</em></td>")
+        return "<tr>" + "".join(cells) + "</tr>"
+
+    rows = [_row("<strong>All datasets</strong>", df_all)]
+    for bundle in bundles:
+        dff = df_all.loc[df_all["sample_id"].astype(str) == bundle.sample_id]
+        if dff.empty:
+            continue
+        rows.append(_row(bundle.sample_id, dff))
+
+    # MEGnet availability across the whole collection: without this a run where
+    # MEGnet failed everywhere looks the same as one where it was never on.
+    base_all = (df_all.drop_duplicates(subset=["run_key", "sample_id"])
+                if {"run_key", "sample_id"}.issubset(df_all.columns) else df_all)
+    n_total = int(base_all.shape[0])
+    megnet_used = 0
+    for c in ("ecg_signal_source", "eog_signal_source"):
+        if c in base_all.columns:
+            megnet_used = max(
+                megnet_used,
+                int(base_all[c].astype(str).isin(["megnet", "correlation_megnet"]).sum()))
+    pct = (100.0 * megnet_used / n_total) if n_total else 0.0
+    n_ds_with = 0
+    if "sample_id" in base_all.columns:
+        for _sid, g in base_all.groupby(base_all["sample_id"].astype(str)):
+            if any(c in g.columns and g[c].astype(str).isin(["megnet", "correlation_megnet"]).any()
+                   for c in ("ecg_signal_source", "eog_signal_source")):
+                n_ds_with += 1
+    avail = (f"<p><strong>MEGnet contribution:</strong> a MEGnet-derived signal was used for "
+             f"<strong>{megnet_used}</strong> of {n_total} recordings ({pct:.0f}%), across "
+             f"<strong>{n_ds_with}</strong> of {len(bundles)} datasets. "
+             + ("MEGnet produced nothing usable in this collection - either it was disabled, its "
+                "model weights are missing (run <code>megnet_init</code>), the recordings are "
+                "shorter than 60 s, or the systems have no magnetometers."
+                if megnet_used == 0 else
+                "Recordings without it fell back to a recorded channel or an MNE reconstruction.")
+             + "</p>")
+
+    return (
+        "<section><h2>ECG/EOG signal provenance</h2>" + avail +
+        "<table class='meta-table'><thead><tr><th>Dataset</th>"
+        "<th>ECG reference</th><th>EOG reference</th></tr></thead><tbody>"
+        + "".join(rows) +
+        "</tbody></table>"
+        "<p class='summary-shared-note'><strong>How to read this:</strong> ECG and EOG metrics are "
+        "computed against a reference signal. Ideally that is a recorded channel; when none exists "
+        "MEEGqc reconstructs one from the MEG sensors, and MEGnet can supply a synthetic component "
+        "instead. Values computed against reconstructed or synthetic references are not directly "
+        "comparable with those from a recorded channel, so when comparing datasets check that they "
+        "share a provenance before reading anything into a difference in their ECG/EOG dots."
+        "</p></section>"
+    )
+
+
 def _build_multi_summary_distributions_section(
     bundles: Sequence[SampleBundle],
     tab_name: str,
@@ -1230,6 +1517,18 @@ def _build_multi_summary_distributions_section(
                 amplitude_unit=amplitude_unit,
                 summary_group_id=f"{base_group_token}-pooled",
                 channels_by_metric=pooled_channels_by_metric,
+            ),
+        )
+    )
+    # One dot per dataset (mean of that dataset's recordings), so the whole
+    # collection can be compared at a glance instead of dataset-by-dataset.
+    dist_tabs.append(
+        (
+            "Dataset means",
+            _summary_distribution_dataset_cards_html(
+                df_all,
+                amplitude_unit=amplitude_unit,
+                summary_group_id=f"{base_group_token}-datasetmeans",
             ),
         )
     )
@@ -1430,6 +1729,15 @@ def _build_tab_content(
         ("QA metrics details", details_section),
         ("Cummulative distributions", cumulative_section),
     ]
+
+    # ECG/EOG provenance: how many recordings used a real channel, an MNE
+    # reconstruction, or a MEGnet synthetic component - per dataset and pooled.
+    # Without this, MEGnet is invisible above the single-recording report even
+    # though the calculation module records it for every recording.
+    prov_html = _build_multi_megnet_provenance_section(bundles, tab_name)
+    if prov_html:
+        sections.append(("ECG/EOG signal provenance", prov_html))
+
     return _build_subtabs_html(f"multi-main-{tab_token}", sections, level=1)
 
 

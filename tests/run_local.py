@@ -10,12 +10,17 @@ This is a convenience runner (not a pytest test module). It:
      downloaded data and all test output stay at this directory's level and
      never pollute the repo or your datasets folder.
 
+Included test modules
+---------------------
+  tests/realdata/test_megnet.py   - MEGnet pipeline integration (ECG/EOG)
+  tests/realdata/test_calculation.py, test_output_completeness.py, etc.
+
 Usage
 -----
-    python tests/run_local.py                    # the whole suite (~10-15 min)
-    python tests/run_local.py tests/gui -v       # forward any args to pytest
-    python tests/run_local.py -k ds007338        # pick tests by id
-    python tests/run_local.py tests/realdata/test_parallel.py
+    python tests/run_local.py                              # the whole suite
+    python tests/run_local.py tests/realdata/test_megnet.py  # MEGnet only
+    python tests/run_local.py tests/gui -v                 # forward to pytest
+    python tests/run_local.py -k ds007338                  # pick tests by id
 
 Override the bundle URL with the MEEGQC_FIXTURES_URL environment variable.
 Run it with the Python interpreter that has MEEGqc installed (``pip install -e .``).

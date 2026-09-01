@@ -1165,6 +1165,196 @@ def _plot_block_from_derivative(deriv: QC_derivative, *, display_title: Optional
     )
 
 
+def _infer_metric_source_from_path(path: str) -> str:
+    """Infer whether a metric artifact belongs to MEGqc or MEGnet."""
+    return "MEGnet" if "megnet" in str(path or "").lower() else "MEGqc"
+
+
+def _infer_metric_source_from_tsv(path: str) -> str:
+    """Infer source from TSV content when filename/entity parsing is unreliable."""
+    path_str = str(path or "")
+    if "megnet" in path_str.lower():
+        return "MEGnet"
+    try:
+        df = pd.read_csv(path_str, sep="\t", nrows=3)
+    except Exception:
+        return "MEGqc"
+
+    text_bits: List[str] = []
+    for col in ("signal_source", "recorded_or_reconstructed", "synthetic_component_ids", "synthetic_component_probs"):
+        if col in df.columns:
+            vals = [str(v) for v in df[col].dropna().tolist()[:3]]
+            text_bits.extend(vals)
+    joined = " ".join(text_bits).lower()
+    if "megnet" in joined:
+        return "MEGnet"
+    if "synthetic" in joined:
+        return "MEGnet"
+    return "MEGqc"
+
+
+def _build_megnet_reference_info_html(metric_key: str, source_paths: Sequence[str]) -> str:
+    """Render MEGnet channel/reference metadata extracted from TSV artifacts."""
+    candidate_paths = [
+        str(p) for p in source_paths
+        if "megnet" in str(p).lower()
+        and f"{str(metric_key).lower()[:-1]}channelmegnet" in os.path.basename(str(p)).lower()
+    ]
+    if not candidate_paths:
+        return ""
+
+    rows: List[str] = []
+    seen_paths = set()
+    for path in candidate_paths:
+        if path in seen_paths:
+            continue
+        seen_paths.add(path)
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                reader = csv.DictReader(f, delimiter="\t")
+                first_row = next(reader, None)
+        except Exception:
+            first_row = None
+        if not first_row:
+            continue
+
+        channel_col = next(
+            (col for col in first_row.keys() if str(col).lower().startswith(("ecg", "eog"))),
+            "",
+        )
+        info_pairs = [
+            ("Reference channel", first_row.get(channel_col, channel_col or "-")),
+            ("Source", first_row.get("signal_source") or first_row.get("recorded_or_reconstructed") or "megnet"),
+            ("Component IDs", first_row.get("synthetic_component_ids") or "-"),
+            ("Component probabilities", first_row.get("synthetic_component_probs") or "-"),
+            ("Detected events", first_row.get("n_events") or "-"),
+            ("Events per minute", first_row.get("events_rate_per_min") or "-"),
+            ("Sampling frequency", first_row.get("fs") or "-"),
+        ]
+        body = "".join(
+            "<tr>"
+            f"<td>{html.escape(str(label))}</td>"
+            f"<td><code>{html.escape(str(value))}</code></td>"
+            "</tr>"
+            for label, value in info_pairs
+        )
+        rows.append(
+            "<div class='overview-card'>"
+            "<h4>MEGnet reference info</h4>"
+            "<table>"
+            "<thead><tr><th>Field</th><th>Value</th></tr></thead>"
+            f"<tbody>{body}</tbody>"
+            "</table>"
+            f"<details><summary>Source TSV</summary><ul><li><code>{html.escape(path)}</code></li></ul></details>"
+            "</div>"
+        )
+
+    return "".join(rows)
+
+
+def _build_channel_tabs_from_derivatives(
+    *,
+    metric_key: str,
+    run_label: str,
+    group_prefix: str,
+    derivatives: Sequence[QC_derivative],
+) -> str:
+    """Group derivative plots into channel-type subtabs."""
+    ch_groups: Dict[str, List[QC_derivative]] = defaultdict(list)
+    for deriv in derivatives:
+        ch_groups[_infer_derivative_channel_type(deriv)].append(deriv)
+
+    ch_tabs: List[Tuple[str, str]] = []
+    order = [("MAG", "MAG"), ("GRAD", "GRAD"), ("EEG", "EEG"), ("ALL", "General")]
+    for key, label in order:
+        items = ch_groups.get(key, [])
+        if not items:
+            continue
+        ch_tabs.append(
+            (
+                label,
+                _build_derivative_plot_tabs(
+                    group_id=f"{group_prefix}-{_sanitize_token(metric_key)}-{_sanitize_token(run_label)}-{key.lower()}",
+                    metric_key=metric_key,
+                    derivatives=items,
+                    level=4,
+                ),
+            )
+        )
+
+    if not ch_tabs:
+        return "<p>No figures were generated for this source.</p>"
+    if len(ch_tabs) == 1:
+        return ch_tabs[0][1]
+    return _build_subtabs_html(
+        group_id=f"{group_prefix}-chtype-{_sanitize_token(metric_key)}-{_sanitize_token(run_label)}",
+        tabs=ch_tabs,
+        level=3,
+    )
+
+
+def _augment_with_megnet_metric_files(
+    *,
+    metric: str,
+    tsv_paths: List[str],
+    entities_obj: List[dict],
+    calculated_derivs_folder: str,
+    query_base: Optional[str] = None,
+) -> Tuple[List[str], List[dict]]:
+    """Augment ECG/EOG discovery with direct filesystem matches for MEGnet files.
+
+    ANCPBIDS indexing is strict about entity formatting and may miss files whose
+    desc token uses a compound name (e.g. ``ECGsmegnet``). We therefore add those
+    files directly from disk for plotting/report assembly.
+    """
+    metric_l = str(metric).lower()
+    if metric_l not in {"ecgs", "eogs"}:
+        return tsv_paths, entities_obj
+
+    metric_tokens = {
+        "ecgs": ("ecg",),
+        "eogs": ("eog",),
+    }[metric_l]
+
+    calc_root = Path(calculated_derivs_folder)
+    if not calc_root.is_absolute() and query_base:
+        calc_root = Path(query_base) / calc_root
+    calc_root = calc_root.resolve()
+    if not calc_root.exists():
+        return tsv_paths, entities_obj
+    existing_paths = {str(p) for p in tsv_paths}
+    extra_pairs: List[Tuple[str, dict]] = []
+
+    for path_obj in calc_root.rglob("*.tsv"):
+        name_l = path_obj.name.lower()
+        if "megnet" not in name_l:
+            continue
+        if not any(tok in name_l for tok in metric_tokens):
+            continue
+        path_str = str(path_obj)
+        if path_str in existing_paths:
+            continue
+        existing_paths.add(path_str)
+        extra_pairs.append(
+            (
+                path_str,
+                {
+                    "name": path_obj.name,
+                    "extension": path_obj.suffix,
+                },
+            )
+        )
+
+    if not extra_pairs:
+        return tsv_paths, entities_obj
+
+    merged_pairs = list(zip(tsv_paths, entities_obj)) + extra_pairs
+    merged_pairs.sort(key=lambda pair: os.path.basename(str(pair[0])))
+    merged_paths = [pair[0] for pair in merged_pairs]
+    merged_entities = [pair[1] for pair in merged_pairs]
+    return merged_paths, merged_entities
+
+
 def _infer_derivative_channel_type(deriv: QC_derivative) -> str:
     """Infer channel type bucket from derivative metadata.
 
@@ -1273,42 +1463,93 @@ def _build_metric_run_panel(
         blocks.append(f"<details><summary>Machine-readable inputs</summary><ul>{src_items}</ul></details>")
 
     if derivatives:
-        ch_groups: Dict[str, List[QC_derivative]] = defaultdict(list)
+        # Group derivatives by metric source (MEGqc vs MEGnet)
+        source_groups: Dict[str, List[QC_derivative]] = defaultdict(list)
         for deriv in derivatives:
-            ch_groups[_infer_derivative_channel_type(deriv)].append(deriv)
+            source_label = _infer_metric_source_from_path(deriv.name)
+            source_groups[source_label].append(deriv)
 
-        # Channel-type organization:
-        # - MAG tab when magnetometer-specific figures exist
-        # - GRAD tab when gradiometer-specific figures exist
-        # - EEG tab when EEG-specific figures exist
-        # - General tab for non-specific figures
-        ch_tabs: List[Tuple[str, str]] = []
-        order = [("MAG", "MAG"), ("GRAD", "GRAD"), ("EEG", "EEG"), ("ALL", "General")]
-        for key, label in order:
-            items = ch_groups.get(key, [])
-            if not items:
-                continue
-            ch_tabs.append(
-                (
-                    label,
-                    _build_derivative_plot_tabs(
-                        group_id=f"figs-{_sanitize_token(metric_key)}-{_sanitize_token(run_label)}-{key.lower()}",
-                        metric_key=metric_key,
-                        derivatives=items,
-                        level=4,
-                    ),
+        def _build_deriv_channel_tabs(
+            derivs: Sequence[QC_derivative],
+            group_prefix: str,
+        ) -> str:
+            """Build channel-type subtabs for a set of derivatives."""
+            ch_groups: Dict[str, List[QC_derivative]] = defaultdict(list)
+            for deriv in derivs:
+                ch_groups[_infer_derivative_channel_type(deriv)].append(deriv)
+            ch_tabs: List[Tuple[str, str]] = []
+            order = [("MAG", "MAG"), ("GRAD", "GRAD"), ("EEG", "EEG"), ("ALL", "General")]
+            for key, label in order:
+                items = ch_groups.get(key, [])
+                if not items:
+                    continue
+                ch_tabs.append(
+                    (
+                        label,
+                        _build_derivative_plot_tabs(
+                            group_id=f"{group_prefix}-{key.lower()}",
+                            metric_key=metric_key,
+                            derivatives=items,
+                            level=4,
+                        ),
+                    )
                 )
+            if not ch_tabs:
+                return "<p>No figures were generated for this source.</p>"
+            if len(ch_tabs) == 1:
+                return ch_tabs[0][1]
+            return _build_subtabs_html(
+                group_id=f"{group_prefix}-chtype",
+                tabs=ch_tabs,
+                level=3,
             )
-        if len(ch_tabs) > 1:
-            blocks.append(
-                _build_subtabs_html(
-                    group_id=f"chtype-{_sanitize_token(metric_key)}-{_sanitize_token(run_label)}",
-                    tabs=ch_tabs,
-                    level=3,
+
+        if len(source_groups) > 1:
+            # Multiple sources: wrap each source in a subtab
+            source_tabs: List[Tuple[str, str]] = []
+            megnet_info_blocks = []
+            for source_label in ["MEGqc", "MEGnet"]:
+                derivs_for_source = source_groups.get(source_label, [])
+                if not derivs_for_source:
+                    continue
+                source_tabs.append(
+                    (
+                        source_label,
+                        _build_deriv_channel_tabs(
+                            derivs_for_source,
+                            group_prefix=f"figs-{_sanitize_token(metric_key)}-{_sanitize_token(run_label)}-{source_label.lower()}",
+                        ),
+                    )
                 )
-            )
+                if source_label == "MEGnet":
+                    megnet_info_blocks.append(
+                        _build_megnet_reference_info_html(metric_key, source_paths)
+                    )
+            if source_tabs:
+                blocks.append(
+                    _build_subtabs_html(
+                        group_id=f"source-{_sanitize_token(metric_key)}-{_sanitize_token(run_label)}",
+                        tabs=source_tabs,
+                        level=3,
+                    )
+                )
+            for info_block in megnet_info_blocks:
+                if info_block:
+                    blocks.append(info_block)
         else:
-            blocks.append(ch_tabs[0][1])
+            # Single source: direct channel-type tabs (original behavior)
+            (single_source_label,) = source_groups.keys()
+            derivs_for_source = source_groups[single_source_label]
+            blocks.append(
+                _build_deriv_channel_tabs(
+                    derivs_for_source,
+                    group_prefix=f"figs-{_sanitize_token(metric_key)}-{_sanitize_token(run_label)}",
+                )
+            )
+            if single_source_label == "MEGnet":
+                megnet_info = _build_megnet_reference_info_html(metric_key, source_paths)
+                if megnet_info:
+                    blocks.append(megnet_info)
     else:
         blocks.append("<p>No figures were generated for this metric/run combination.</p>")
 
@@ -3780,9 +4021,9 @@ def make_plots_meg_qc(
                 query_args['desc'] = ['PSDs', 'PSDnoiseMag', 'PSDnoiseGrad', 'PSDnoiseEeg',
                                       'PSDwavesMag', 'PSDwavesGrad', 'PSDwavesEeg']
             elif metric == 'ECGs':
-                query_args['desc'] = ['ECGchannel', 'ECGs']
+                query_args['desc'] = ['ECGchannel', 'ECGs', 'ECGchannelmegnet', 'ECGsmegnet']
             elif metric == 'EOGs':
-                query_args['desc'] = ['EOGchannel', 'EOGs']
+                query_args['desc'] = ['EOGchannel', 'EOGs', 'EOGchannelmegnet', 'EOGsmegnet']
             else:
                 query_args['desc'] = [metric]
 
@@ -3792,6 +4033,14 @@ def make_plots_meg_qc(
 
             with temporary_dataset_base(query_dataset, query_base):
                 tsv_paths = list(query_dataset.query(**query_args))
+            # Augment with MEGnet files that ANCPBIDS may have missed
+            tsv_paths, entities_obj_augment = _augment_with_megnet_metric_files(
+                metric=metric,
+                tsv_paths=tsv_paths,
+                entities_obj=[],
+                calculated_derivs_folder=calculated_derivs_folder,
+                query_base=query_base,
+            )
             # Sort by basename so the order matches entity-object sorting
             # (which sorts by k['name'], also a basename). Using full-path
             # sort can cause mismatches in multimodal datasets where

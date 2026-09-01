@@ -1,0 +1,48 @@
+# Plan: Apply MEGnet Implementation from Backup to Main Project
+
+## Status: ALL STEPS COMPLETE
+
+## Context
+
+The `MEGqc_backup/` directory contains a complete MEGnet integration that allows using MEGnet's ICA-based classification to generate synthetic ECG/EOG reference signals. This is useful when no physical ECG/EOG channels are available, or as a fallback when recorded/reconstructed signals are poor. The main project (`meg_qc/`) currently has no MEGnet support. This plan ports all megnet-related changes from the backup into the main project, preserving the main project's newer features (epoching_strategy, session handling, settings panel, 2D sensor support, etc.).
+
+---
+
+## Step 1: Copy the `easy_megnet` module — DONE
+- `meg_qc/miscellaneous/easy_megnet/__init__.py` — copied from backup
+- `meg_qc/miscellaneous/easy_megnet/easy_megnet.py` — copied from backup (~1445 lines)
+
+## Step 2: Add `megnet-neuro` dependency — DONE
+- Added to `pyproject.toml` between `mne` and `pandas`
+
+## Step 3: Add megnet settings to `settings.ini` — DONE
+- Added 4 megnet keys to `[ECG]` section
+- Added 4 megnet keys to `[EOG]` section
+- Added new `[MEGNET]` section with 9 settings
+
+## Step 4: Add megnet config parsing to `initial_meg_qc.py` — DONE
+- Added megnet keys to ECG/EOG params dicts
+- Added full `[MEGNET]` section parsing block
+- Fixed pre-existing bug: EOG `gaussian_sigma` reading from wrong section
+
+## Step 5: Add megnet functions and modify ECG/EOG in `ECG_EOG_meg_qc.py` — DONE
+- Added 8 new helper functions
+- Modified `ECG_meg_qc()` with megnet fallback/signals
+- Modified `EOG_meg_qc()` with megnet fallback/signals
+- Modified `get_ECG_data_choose_method()` for `drop_bad_ch`
+
+## Step 6: Update pipeline to call MEGnet — DONE
+- Added `compute_megnet_outputs_for_file` import
+- Added megnet pre-computation block before ECG/EOG
+- Updated `ECG_meg_qc` and `EOG_meg_qc` calls
+
+## Step 7: Add megnet plotting support — DONE
+- Added 5 new functions: `_infer_metric_source_from_path`, `_infer_metric_source_from_tsv`, `_build_megnet_reference_info_html`, `_build_channel_tabs_from_derivatives`, `_augment_with_megnet_metric_files`
+- Expanded ECG/EOG query descriptors to include `_megnet` variants
+- Added `_augment_with_megnet_metric_files` call after ANCPBIDS query
+- Updated `_build_metric_run_panel` with MEGqc/MEGnet source grouping
+
+## Verification
+- All 4 modified Python files pass syntax validation
+- Tests cannot be run (no pytest in available Python envs)
+- Manual verification needed with actual MEG data

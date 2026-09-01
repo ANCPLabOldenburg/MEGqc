@@ -4299,6 +4299,7 @@ def build_metric_derivatives_from_tsv(metric: str, tsv_paths: List[str], m_or_g_
 
     for tsv_path in tsv_paths:
         basename = os.path.basename(tsv_path)
+        is_megnet_tsv = 'megnet' in basename.lower()
 
         def _extend_safe(target: list, func, *args, **kwargs) -> None:
             """Run one plotting builder safely; keep other figures on failure."""
@@ -4308,6 +4309,10 @@ def build_metric_derivatives_from_tsv(metric: str, tsv_paths: List[str], m_or_g_
                 print(f"___MEGqc___: Skipping plot '{func.__name__}' for '{basename}': {exc}")
                 return
             if out:
+                if is_megnet_tsv:
+                    for d in out:
+                        if not d.name.endswith('-megnet'):
+                            d.name = d.name + '-megnet'
                 target += out
 
         if 'desc-stimulus' in basename:

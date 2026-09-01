@@ -143,6 +143,15 @@ def one_meg():
 
 
 @pytest.fixture(scope="session")
+def megnet_meg_dataset():
+    """MEGnet tests require ds_meg_example_1_complete (long enough for 60 s chunks)."""
+    for name, path in ALL_DATASETS:
+        if name == "ds_meg_example_1_complete":
+            return (name, path)
+    pytest.skip("ds_meg_example_1_complete not in the MEEGQC_TEST_DATA bundle")
+
+
+@pytest.fixture(scope="session")
 def one_eeg():
     if not EEG_DATASETS:
         pytest.skip("no EEG dataset in bundle")
@@ -205,6 +214,24 @@ def run_cli(args, timeout=1800):
         pytest.skip(f"{args[0]} not on PATH (package not installed?)")
     return subprocess.run([exe, *args[1:]], capture_output=True, text=True,
                           encoding="utf-8", errors="replace", timeout=timeout)
+
+
+@pytest.fixture(scope="session")
+def _megnet_config_factory(tmp_path_factory):
+    """settings.ini with ECG + EOG + MEGnet enabled, rest minimal for speed."""
+    import re as _re
+
+    ini_src = _package_settings_ini()
+    text = ini_src.read_text()
+
+    for key in ("STD", "PSD", "PTP_manual", "ECG", "EOG"):
+        text = _re.sub(rf"(?m)^{key}\s*=.*$", f"{key} = True", text)
+    for key in ("Head", "Muscle"):
+        text = _re.sub(rf"(?m)^{key}\s*=.*$", f"{key} = False", text)
+
+    out = tmp_path_factory.mktemp("cfg_megnet") / "settings.ini"
+    out.write_text(text)
+    return out
 
 
 @pytest.fixture
